@@ -25,3 +25,4 @@ __pycache__/
 # HPC logs
 slurm-*.out
 slurm-*.err
+*temp*
