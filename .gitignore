@@ -1,0 +1,27 @@
+# data artifacts
+*.npy
+*.npz
+*.nii
+*.nii.gz
+*.mat
+*.h5
+data/
+results/
+checkpoints/
+logs/
+figures/
+
+# python cruft
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# editors & notebooks
+.vscode/
+.ipynb_checkpoints/
+.DS_Store
+
+# HPC logs
+slurm-*.out
+slurm-*.err
