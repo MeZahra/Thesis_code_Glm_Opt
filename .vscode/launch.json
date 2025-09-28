@@ -1,0 +1,21 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    
+    {
+      "name": "Python: main_glm",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/GLMsingle/main_glm.py",
+      "cwd": "${workspaceFolder}/Optim_fMRI",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "env": {
+        "PYTHONUNBUFFERED": "1",
+        "MPLBACKEND": "Agg",
+        "QT_QPA_PLATFORM": "offscreen"
+      }
+    }
+  ]
+}
+
