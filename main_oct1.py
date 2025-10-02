@@ -75,7 +75,7 @@ print('bold_data masked shape:', masked_bold.shape)
 # Load Beta values, Mask it, Find threshold to determine and delete outlier voxels
 
 # %%
-glm_dict = np.load(f'TYPED_FITHRF_GLMDENOISE_RR.npy', allow_pickle=True).item()
+glm_dict = np.load(f'TYPED_FITHRF_GLMDENOISE_RR_sub{sub}.npy', allow_pickle=True).item()
 beta_glm = glm_dict['betasmd']
 beta_run1, beta_run2 = beta_glm[:,0,0,:90], beta_glm[:,0,0,90:]
 
