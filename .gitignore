@@ -5,6 +5,7 @@
 *.nii.gz
 *.mat
 *.h5
+*.html
 data/
 results/
 checkpoints/
