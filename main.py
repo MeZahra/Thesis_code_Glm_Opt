@@ -81,6 +81,15 @@ else:
     beta = beta_run2[keep_voxels]
 print("Beta Range:[", np.nanmin(beta), np.nanmax(beta), "], Mean: ", np.nanmean(beta))
 
+# detect outlier beta after normalization
+med = np.nanmedian(beta, keepdims=True)
+mad = np.nanmedian(np.abs(beta - med), keepdims=True)
+scale = 1.4826 * np.maximum(mad, 1e-9)    
+beta_norm = (beta - med) / scale      
+thr = np.nanpercentile(np.abs(beta_norm), 99.9)
+outlier_mask = np.abs(beta_norm) > thr      
+print(f"{np.sum(np.any(outlier_mask, axis=1))/beta.shape[0]*100:.2f}% voxels with at least one outlier beta")
+
 # %%
 clean_beta = beta.copy()
 voxel_outlier_fraction = np.mean(outlier_mask, axis=1)
@@ -177,7 +186,7 @@ def hampel_filter_image(image, window_size, threshold_factor, return_stats=False
     return filtered
 
 
-beta_volume_filter, hampel_stats = hampel_filter_image(beta_volume, window_size=5, threshold_factor=3, return_stats=True)
+beta_volume_filter, hampel_stats = hampel_filter_image(clean_active_volume, window_size=5, threshold_factor=3, return_stats=True)
 print('Insufficient neighbours per frame:', hampel_stats['insufficient_counts'], flush=True)
 print('Total voxels with <3 neighbours:', hampel_stats['insufficient_total'], flush=True)
 print('Total corrected voxels:', hampel_stats['corrected_total'], flush=True)
