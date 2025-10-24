@@ -20,6 +20,7 @@ from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
 from scipy.stats import zscore
 from scipy.io import loadmat
 from scipy import ndimage
+from typing import Optional, Sequence, Tuple, Dict, Any
 
 # %%
 ses = 1
@@ -328,11 +329,152 @@ print("begin empca...", flush=True)
 m = empca(Yc.astype(np.float32, copy=False), W.astype(np.float32, copy=False), nvec=700, niter=15)
 np.save(f'empca_model_sub{sub}_ses{ses}_run{run}.npy', m)
 
-
+# I will define beta_pca, bold_pca, behave_pca
 # %%
 
-pca_model = np.load('empca_model_sub04_ses1_run1.npy', allow_pickle=True).item()
-pca_model.__dict__.keys()
-for i in range(pca_model.nvec):
-    print(pca_model.R2vec(i))
+# pca_model = np.load('empca_model_sub04_ses1_run1.npy', allow_pickle=True).item()
+# # pca_model.__dict__.keys()
+# # for i in range(pca_model.nvec):
+# #     print(pca_model.R2vec(i))
 
+# def matrices_func(beta_pca, bold_pca, behave_mat, trial_indices=None, trial_len=trial_len, num_trials=90):
+#     # reshape beta_pca, bold_pca, behave_pca if it is necessary
+#     bold_pca_reshape = bold_pca.reshape(bold_pca.shape[0], num_trials, trial_len)
+
+#     trial_idx = np.arange(num_trials) if trial_indices is None else np.unique(np.asarray(trial_indices, int).ravel())
+
+#     # select trials
+#     behavior_selected = behave_mat[trial_idx, 1]  #1/RT
+#     beta_selected = beta_pca[:, trial_idx]
+
+#     # ----- L_task (same idea as yours) -----
+#     print("L_task...", flush=True)
+#     counts = np.count_nonzero(np.isfinite(beta_selected), axis=-1)
+#     sums = np.nansum(np.abs(beta_selected), axis=-1, dtype=np.float32)
+#     mean_beta = np.zeros(beta_selected.shape[0], dtype=np.float32)
+#     m = counts > 0
+#     mean_beta[m] = (sums[m] / counts[m]).astype(np.float32)
+
+#     C_task = np.zeros_like(mean_beta, dtype=np.float32)
+#     v = np.abs(mean_beta) > 0 # avoid division by zero
+#     C_task[v] = (1.0 / mean_beta[v]).astype(np.float32)
+
+#     # ----- L_var_bold: variance of trial differences, as sparse diagonal -----
+#     print("L_var...", flush=True)
+#     C_bold = np.zeros((bold_pca_reshape.shape[0], bold_pca_reshape.shape[0]), dtype=np.float32)
+
+#     for i in range(num_trials-1):
+#         x1 = bold_pca_reshape[:, i, :]
+#         x2 = bold_pca_reshape[:, i+1, :]
+#         C_bold += (x1-x2) @ (x1-x2).T
+#     C_bold /= (num_trials - 1)
+
+#     # ----- L_var_beta: variance of trial differences, as sparse diagonal -----
+#     print("L_var...", flush=True)
+#     C_beta = np.zeros((beta_selected.shape[0], beta_selected.shape[0]), dtype=np.float32)
+#     for i in range(num_trials-1):
+#         x1 = beta_selected[:, i]
+#         x2 = beta_selected[:, i+1]
+#         diff = x1 - x2
+#         C_beta += np.outer(diff, diff)  
+#     C_beta /= (num_trials - 1)
+
+#     return C_task, C_bold, C_beta, behavior_selected, beta_selected
+
+
+# # define objective function
+# # X_beta = beta_valume_clean_2d
+# # W_pca = Weight matrix of PCA components (transfer W from pca space to original space)
+
+
+# def get_empca_projection(model, n_components) -> np.ndarray:
+#     coeff = model.coeff
+#     if n_components is not None:
+#         coeff = coeff[:, :n_components]
+#     return np.asarray(coeff).T
+
+
+# def build_cost_matrices_and_optimize(C_task, C_bold, C_beta, X_behave, X_beta, rho, alpha_bold, alpha_beta, alpha_task,
+#                                      regularization = 1e-6, solver_name = "OSQP", W_pca = None):
+
+#     X_behave = X_behave.ravel()
+#     n_features = X_beta.shape[0]
+
+#     # Based on your input, correct this part
+#     X_beta = X_beta - np.mean(X_beta, axis=1, keepdims=True)
+#     valid_beh = np.isfinite(X_behave)
+#     mean_beh = np.nanmean(X_behave[valid_beh])
+#     X_behave = X_behave - mean_beh
+#     #####
+
+#     behave_norm = np.linalg.norm(X_behave)
+
+#     C_total = alpha_task * C_task + alpha_bold * C_bold + alpha_beta * C_beta
+#     C_total = 0.5 * (C_total + C_total.T)
+#     C_total += regularization * np.eye(n_features, dtype=np.float64)
+
+#     solver_const = getattr(cp, solver_name, None)
+#     w_var = cp.Variable(n_features)
+
+#     constraints = []
+#     constraints.append(w_var >= 0)
+#     constraints.append(cp.sum(w_var) == 1)
+
+#     numerator_vector = X_beta @ X_behave
+#     if np.linalg.norm(numerator_vector) < 1e-12:
+#         raise ValueError("Beta/behaviour cross-term is zero; correlation constraint is infeasible.")
+
+#     constraints.append(numerator_vector @ w_var >= rho * behave_norm * cp.norm(X_beta.T @ w_var, 2))
+
+#     objective = cp.Minimize(cp.quad_form(w_var, cp.psd_wrap(C_total)))
+#     problem = cp.Problem(objective, constraints)
+
+#     try:
+#         problem.solve(solver=solver_const, warm_start=True)
+#     except cp.error.SolverError as exc:
+#         raise RuntimeError(f"Solver '{solver_name}' failed: {exc}") from exc
+
+#     if w_var.value is None:
+#         raise RuntimeError(f"Optimisation failed with status '{problem.status}'.")
+
+#     weights = np.array(w_var.value, dtype=np.float64).ravel()
+#     W_prime = None
+#     if W_pca is not None:
+#         if W_pca.shape[1] != n_features:
+#             raise ValueError("W_pca must have shape (n_voxels, n_features).")
+#         W_prime = W_pca.T @ weights
+
+#     fitted_beta = X_beta.T @ weights
+#     fitted_norm = np.linalg.norm(fitted_beta)
+#     achieved_corr = 0.0
+#     if fitted_norm > 1e-10:
+#         achieved_corr = float((fitted_beta @ X_behave) / (fitted_norm * behave_norm))
+
+#     return {
+#         "C_total": C_total,
+#         "X_behave": X_behave,
+#         "X_beta": X_beta,
+#         "weights": weights,
+#         "W_prime": W_prime,
+#         "status": problem.status,
+#         "objective": problem.value,
+#         "achieved_corr": achieved_corr,
+#     }
+
+# # Example usage (commented out) once the relevant arrays have been prepared:
+# # voxel_idx = np.flatnonzero(active_keep_mask)
+# # W_empca = get_empca_projection(pca_model, voxel_indices=voxel_idx, n_components=100)
+# # C_task, C_bold, C_beta, X_behave, X_beta = matrices_func(
+# #     beta_pca, bold_pca, behavior_matrix, mask_2d, trial_indices=None
+# # )
+# # optimisation = build_cost_matrices_and_optimize(
+# #     C_task,
+# #     C_bold,
+# #     C_beta,
+# #     X_behave,
+# #     X_beta,
+# #     rho=0.3,
+# #     alpha_bold=1.0,
+# #     alpha_beta=1.0,
+# #     W_pca=W_empca,
+# # )
