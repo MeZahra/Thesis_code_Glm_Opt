@@ -6,11 +6,19 @@
 *.mat
 *.h5
 *.html
+<<<<<<< HEAD
 empca/
 GLMsingle/
 gray_matter_data/
 *.txt
 
+=======
+data/
+results/
+checkpoints/
+logs/
+figures/
+>>>>>>> 64d46063863f82c3f1fb0f36f2af63a7e5f0f324
 
 # python cruft
 __pycache__/

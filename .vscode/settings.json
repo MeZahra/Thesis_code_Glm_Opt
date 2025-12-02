@@ -1,0 +1,8 @@
+{
+  "python.defaultInterpreterPath": "/home/zkavian/.venvs/workspace/bin/python",
+  "python.terminal.activateEnvironment": true,
+  "terminal.integrated.env.linux": {
+    "VIRTUAL_ENV": "${workspaceFolder}/.venv",
+    "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}"
+  }
+}

@@ -1,0 +1,9 @@
+nibabel
+numpy
+matplotlib
+scipy
+statsmodels
+nilearn
+cvxpy
+scikit-learn
+h5py
