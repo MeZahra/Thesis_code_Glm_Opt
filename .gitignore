@@ -6,8 +6,6 @@
 *.mat
 *.h5
 *.html
-empca/
-GLMsingle/
 gray_matter_data/
 *.txt
 
@@ -32,3 +30,10 @@ __pycache__/
 slurm-*.out
 slurm-*.err
 *temp*
+# External libraries
+*.png
+*.csv
+*.json
+
+GLMsingle/glmsingle/
+tmp/

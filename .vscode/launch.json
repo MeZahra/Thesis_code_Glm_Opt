@@ -3,11 +3,11 @@
   "configurations": [
     
     {
-      "name": "Python: main_glm",
+      "name": "Python: test code",
       "type": "python",
       "request": "launch",
-      "program": "${workspaceFolder}/GLMsingle/main_glm.py",
-      "cwd": "${workspaceFolder}/Optim_fMRI",
+      "program": "${workspaceFolder}/GLMsingle/main_glm_copy.py",
+      "cwd": "${workspaceFolder}/",
       "console": "integratedTerminal",
       "justMyCode": false,
       "env": {
