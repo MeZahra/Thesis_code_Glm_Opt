@@ -34,66 +34,22 @@ def _extract_trial_segments(masked_bold, trial_len, num_trials, rest_every = 30,
             start += rest_len
     return segments
 
-def _save_beta_overlay(
-    mean_abs_beta: np.ndarray,
-    anat_img: nib.Nifti1Image,
-    out_html: str,
-    threshold_pct: float,
-    vmax_pct: float,
-    cut_coords=None,
-    snapshot_path: str | None = None,
-):
+def _save_beta_overlay(mean_abs_beta, anat_img, out_html, threshold_pct, vmax_pct, cut_coords, snapshot_path):
     finite = mean_abs_beta[np.isfinite(mean_abs_beta)]
-    if finite.size == 0:
-        raise ValueError('No finite beta values to visualize.')
-
     thr = float(np.percentile(finite, threshold_pct))
     vmax = float(np.percentile(finite, vmax_pct))
     img = nib.Nifti1Image(mean_abs_beta.astype(np.float32), anat_img.affine, anat_img.header)
-    view = plotting.view_img(
-        img,
-        bg_img=anat_img,
-        cmap='inferno',
-        symmetric_cmap=False,
-        threshold=thr,
-        vmax=vmax,
-        colorbar=True,
-        title=f'Mean |beta| (thr p{threshold_pct}={thr:.2f}, vmax p{vmax_pct}={vmax:.2f})',
-        cut_coords=cut_coords,
-    )
+    view = plotting.view_img(img, bg_img=anat_img, cmap='inferno', symmetric_cmap=False, threshold=thr, vmax=vmax, colorbar=True,
+                             title=f'Mean |beta| (thr p{threshold_pct}={thr:.2f}, vmax p{vmax_pct}={vmax:.2f})', cut_coords=cut_coords)
     view.save_as_html(out_html)
     print(f'Saved overlay: {out_html}', flush=True)
 
     if snapshot_path:
-        try:
-            display = plotting.plot_stat_map(
-                img,
-                bg_img=anat_img,
-                cmap='inferno',
-                symmetric_cmap=False,
-                threshold=thr,
-                vmax=vmax,
-                colorbar=True,
-                title=f'Mean |beta| (thr p{threshold_pct}, vmax p{vmax_pct})',
-                cut_coords=cut_coords,
-            )
-        except (TypeError, AttributeError) as exc:
-            if 'symmetric_cmap' not in str(exc):
-                raise
-            display = plotting.plot_stat_map(
-                img,
-                bg_img=anat_img,
-                cmap='inferno',
-                threshold=thr,
-                vmax=vmax,
-                colorbar=True,
-                title=f'Mean |beta| (thr p{threshold_pct}, vmax p{vmax_pct})',
-                cut_coords=cut_coords,
-            )
+        display = plotting.plot_stat_map(img, bg_img=anat_img, cmap='inferno', symmetric_cmap=False, threshold=thr, vmax=vmax, colorbar=True, 
+                                         title=f'Mean |beta| (thr p{threshold_pct}, vmax p{vmax_pct})',cut_coords=cut_coords)
         display.savefig(snapshot_path)
         display.close()
         print(f'Saved snapshot: {snapshot_path}', flush=True)
-
 
 def _save_overlay_html(data, anat_img, out_html, title, threshold, vmax, threshold_pct, vmax_pct, cmap='jet', symmetric_cmap = False, cut_coords=None):
     img = nib.Nifti1Image(data.astype(np.float32), anat_img.affine, anat_img.header)
@@ -108,25 +64,12 @@ def _save_overlay_html(data, anat_img, out_html, title, threshold, vmax, thresho
     view.save_as_html(out_html)
     print(f'Saved overlay: {out_html}', flush=True)
 
-
-def _compute_beta_summary(beta_volume_filter):
-    with np.errstate(invalid='ignore'):
-        summary = np.nanmean(np.abs(beta_volume_filter), axis=-1)
-
-    return summary
-
-
 def _mean_abs_beta_volume(beta, coords, volume_shape):
     with np.errstate(invalid='ignore'):
         mean_abs = np.nanmean(np.abs(beta), axis=1)
     volume = np.full(volume_shape, np.nan, dtype=np.float32)
     volume[coords] = mean_abs.astype(np.float32)
     return volume
-
-
-def _find_flirt():
-    return shutil.which("flirt")
-
 
 def _default_mni_template():
     fsl_dir = os.environ.get("FSLDIR")
@@ -139,51 +82,22 @@ def _default_mni_template():
             return candidate
     return None
 
-
 def _run_flirt(cmd):
     env = os.environ.copy()
     env.setdefault("FSLOUTPUTTYPE", "NIFTI_GZ")
     subprocess.run(cmd, check=True, env=env)
 
-
 def _compute_mni_to_anat(mni_template, anat_path, out_dir, flirt_path):
     out_dir = Path(out_dir)
     mat_path = out_dir / "mni_to_anat_flirt.mat"
     warped_path = out_dir / "mni_template_in_anat.nii.gz"
-    cmd = [
-        flirt_path,
-        "-in",
-        str(mni_template),
-        "-ref",
-        str(anat_path),
-        "-omat",
-        str(mat_path),
-        "-out",
-        str(warped_path),
-        "-dof",
-        "12",
-    ]
+    cmd = [flirt_path, "-in", str(mni_template), "-ref", str(anat_path), "-omat", str(mat_path), "-out", str(warped_path), "-dof", "12"]
     _run_flirt(cmd)
     return mat_path, warped_path
 
-
 def _apply_flirt(in_path, ref_path, mat_path, out_path, flirt_path, interp="nearestneighbour"):
-    cmd = [
-        flirt_path,
-        "-in",
-        str(in_path),
-        "-ref",
-        str(ref_path),
-        "-applyxfm",
-        "-init",
-        str(mat_path),
-        "-interp",
-        interp,
-        "-out",
-        str(out_path),
-    ]
+    cmd = [flirt_path, "-in", str(in_path), "-ref", str(ref_path), "-applyxfm", "-init", str(mat_path), "-interp", interp,"-out", str(out_path)]
     _run_flirt(cmd)
-
 
 def _select_roi_indices(labels, label_patterns):
     patterns = []
@@ -201,36 +115,19 @@ def _select_roi_indices(labels, label_patterns):
             indices.append(idx)
     return indices
 
-
-def _align_atlas_to_reference(
-    atlas_img,
-    anat_img,
-    anat_path,
-    ref_img,
-    out_dir,
-    assume_mni=False,
-):
+def _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_dir, assume_mni=False):
     use_flirt = False
     flirt_path = None
     mni_template_img = None
     if not assume_mni:
-        flirt_path = _find_flirt()
+        flirt_path = shutil.which("flirt")
         mni_template = _default_mni_template()
         if flirt_path and mni_template and mni_template.exists():
-            try:
                 _compute_mni_to_anat(mni_template, anat_path, out_dir, flirt_path)
                 use_flirt = True
                 print("Registered MNI template to anatomy with FLIRT.", flush=True)
-            except subprocess.CalledProcessError:
-                print(
-                    "Warning: FLIRT registration failed; falling back to header-based resampling.",
-                    flush=True,
-                )
         else:
-            print(
-                "Warning: FLIRT or MNI template not available; falling back to header-based resampling.",
-                flush=True,
-            )
+            print("Warning: FLIRT or MNI template not available; falling back to header-based resampling.", flush=True)
 
     if use_flirt:
         if mni_template_img is None:
@@ -240,80 +137,30 @@ def _align_atlas_to_reference(
             tmpdir = Path(tmpdir)
             atlas_mni_path = tmpdir / "atlas_mni.nii.gz"
             atlas_anat_path = tmpdir / "atlas_in_anat.nii.gz"
-            atlas_mni_img = image.resample_to_img(
-                atlas_img,
-                mni_template_img,
-                interpolation="nearest",
-                force_resample=True,
-                copy_header=True,
-            )
+            atlas_mni_img = image.resample_to_img(atlas_img, mni_template_img, interpolation="nearest", force_resample=True, copy_header=True)
             atlas_mni_img.to_filename(str(atlas_mni_path))
             _apply_flirt(atlas_mni_path, anat_path, mat_path, atlas_anat_path, flirt_path)
             atlas_in_anat_img = nib.load(str(atlas_anat_path))
             # Detach from temp file path before the temp dir is removed.
-            atlas_in_anat = nib.Nifti1Image(
-                atlas_in_anat_img.get_fdata(dtype=np.float32),
-                atlas_in_anat_img.affine,
-                atlas_in_anat_img.header,
-            )
+            atlas_in_anat = nib.Nifti1Image(atlas_in_anat_img.get_fdata(dtype=np.float32), atlas_in_anat_img.affine, atlas_in_anat_img.header)
     else:
-        atlas_in_anat = image.resample_to_img(
-            atlas_img,
-            anat_img,
-            interpolation="nearest",
-            force_resample=True,
-            copy_header=True,
-        )
+        atlas_in_anat = image.resample_to_img(atlas_img, anat_img, interpolation="nearest", force_resample=True, copy_header=True)
 
-    if (
-        atlas_in_anat.shape[:3] != ref_img.shape[:3]
-        or not np.allclose(atlas_in_anat.affine, ref_img.affine)
-    ):
-        atlas_in_ref = image.resample_to_img(
-            atlas_in_anat,
-            ref_img,
-            interpolation="nearest",
-            force_resample=True,
-            copy_header=True,
-        )
+    if (atlas_in_anat.shape[:3] != ref_img.shape[:3] or not np.allclose(atlas_in_anat.affine, ref_img.affine)):
+        atlas_in_ref = image.resample_to_img(atlas_in_anat, ref_img, interpolation="nearest", force_resample=True, copy_header=True)
         return atlas_in_ref
 
     return atlas_in_anat
 
-
-def _rank_rois_by_beta(
-    summary: np.ndarray,
-    anat_img: nib.Nifti1Image,
-    anat_path: Path,
-    ref_img: nib.Nifti1Image,
-    out_path: Path,
-    atlas_threshold: int,
-    label_patterns: str | None,
-    assume_mni: bool,
-):
+def _rank_rois_by_beta(summary, anat_img, anat_path, ref_img, out_path, atlas_threshold, label_patterns, assume_mni):
     atlas = datasets.fetch_atlas_harvard_oxford(f"cort-maxprob-thr{atlas_threshold}-2mm")
     atlas_img = atlas.maps if isinstance(atlas.maps, nib.Nifti1Image) else nib.load(atlas.maps)
-    labels = [
-        lbl.decode("utf-8", errors="replace") if isinstance(lbl, bytes) else str(lbl)
-        for lbl in atlas.labels
-    ]
-
+    labels = [lbl.decode("utf-8", errors="replace") if isinstance(lbl, bytes) else str(lbl) for lbl in atlas.labels]
     if summary.shape != ref_img.shape[:3]:
-        raise ValueError(
-            "Summary shape does not match ROI reference image; "
-            f"summary shape={summary.shape}, ref shape={ref_img.shape[:3]}."
-        )
+        raise ValueError("Summary shape does not match ROI reference image; summary shape={summary.shape}, ref shape={ref_img.shape[:3]}.")
 
-    atlas_in_ref = _align_atlas_to_reference(
-        atlas_img,
-        anat_img,
-        anat_path,
-        ref_img,
-        out_path.parent,
-        assume_mni=assume_mni,
-    )
+    atlas_in_ref = _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_path.parent, assume_mni=assume_mni)
     atlas_data = np.rint(atlas_in_ref.get_fdata(dtype=np.float32)).astype(int)
-
     indices = _select_roi_indices(labels, label_patterns)
     if not indices:
         raise ValueError("No atlas labels matched the requested ROI label patterns.")
@@ -331,15 +178,7 @@ def _rank_rois_by_beta(
             valid_voxels = int(finite.size)
             mean_beta = float(np.nanmean(finite)) if finite.size else np.nan
 
-        results.append(
-            {
-                "label_index": idx,
-                "label": labels[idx],
-                "mean_beta": mean_beta,
-                "voxel_count": voxel_count,
-                "valid_voxel_count": valid_voxels,
-            }
-        )
+        results.append({"label_index": idx, "label": labels[idx], "mean_beta": mean_beta, "voxel_count": voxel_count, "valid_voxel_count": valid_voxels})
 
     def _sort_key(row):
         mean_beta = row["mean_beta"]
@@ -395,7 +234,6 @@ def hampel_filter_image(image, window_size, threshold_factor, return_stats=False
 
     return image
 
-
 def _parse_args():
     parser = argparse.ArgumentParser(description='Beta preprocessing for GLMsingle outputs.')
     parser.add_argument('--gray-threshold', type=float, default=0.5)
@@ -427,12 +265,13 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     beta_overlay_html_path = output_dir / f'beta_overlay_sub{sub}_ses{ses}_run{run}.html'
     clean_beta_overlay_html_path = output_dir / f'clean_beta_overlay_sub{sub}_ses{ses}_run{run}.html'
+    ttest_beta_overlay_html_path = output_dir / f'ttest_beta_overlay_sub{sub}_ses{ses}_run{run}.html'
     overlay_html_path = output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{run}.html'
     overlay_snapshot_path = overlay_html_path.with_suffix(".png")
     cached_beta_path = output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy'
     if cached_beta_path.exists():
         beta_volume_filter = np.load(cached_beta_path)
-        mean_clean_active = _compute_beta_summary(beta_volume_filter)
+        mean_clean_active = np.nanmean(np.abs(beta_volume_filter), axis=-1)
         _save_beta_overlay(mean_clean_active, anat_img=anat_img, out_html=str(overlay_html_path),threshold_pct=overlay_threshold_pct,
                             vmax_pct=overlay_vmax_pct, cut_coords=cut_coords, snapshot_path=str(overlay_snapshot_path))
         if not skip_roi_ranking:
@@ -535,6 +374,10 @@ def main():
         clean_active_idx = keeped_indices[reject]
         clean_active_bold = bold_data_reshape[reject]
         print(f"After ttest: Beta Shape: {clean_active_beta.shape}, Bold shape: {clean_active_bold.shape}")
+        ttest_coords = tuple(coord[clean_active_idx] for coord in masked_coords)
+        ttest_beta_overlay = _mean_abs_beta_volume(clean_active_beta, ttest_coords, bold_data.shape[:3])
+        _save_overlay_html(ttest_beta_overlay, anat_img=anat_img, out_html=str(ttest_beta_overlay_html_path),
+                           title='Mean |beta| (post-ttest)', threshold_pct=overlay_threshold_pct, vmax_pct=overlay_vmax_pct, cut_coords=cut_coords)
 
     num_trials = clean_active_beta.shape[1]
     clean_active_volume = np.full(bold_data.shape[:3] + (num_trials,), np.nan)
@@ -545,8 +388,7 @@ def main():
     if args.skip_hampel:
         beta_volume_filter = clean_active_volume
     else:
-        beta_volume_filter, hampel_stats = hampel_filter_image(clean_active_volume.astype(np.float32), window_size=hampel_window,
-                                                               threshold_factor=hampel_threshold, return_stats=True)
+        beta_volume_filter, hampel_stats = hampel_filter_image(clean_active_volume.astype(np.float32), window_size=hampel_window, threshold_factor=hampel_threshold, return_stats=True)
         print('Total voxels with <3 neighbours:', hampel_stats['insufficient_total'], flush=True)
         print('Total corrected voxels:', hampel_stats['corrected_total'], flush=True)
 
@@ -576,29 +418,13 @@ def main():
     active_coords = tuple(coord[keep_mask] for coord in active_coords)
     np.save(output_dir / f"active_coords_sub{sub}_ses{ses}_run{run}.npy", active_coords)
 
-    mean_clean_active = _compute_beta_summary(beta_volume_filter)
-
-    _save_beta_overlay(
-        mean_clean_active,
-        anat_img=anat_img,
-        out_html=str(overlay_html_path),
-        threshold_pct=overlay_threshold_pct,
-        vmax_pct=overlay_vmax_pct,
-        cut_coords=cut_coords,
-        snapshot_path=str(overlay_snapshot_path),
-    )
+    mean_clean_active = np.nanmean(np.abs(beta_volume_filter), axis=-1)
+    _save_beta_overlay(mean_clean_active, anat_img=anat_img, out_html=str(overlay_html_path), threshold_pct=overlay_threshold_pct, 
+                       vmax_pct=overlay_vmax_pct, cut_coords=cut_coords, snapshot_path=str(overlay_snapshot_path))
     if not skip_roi_ranking:
         roi_rank_path = output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run}.csv'
-        _rank_rois_by_beta(
-            mean_clean_active,
-            anat_img=anat_img,
-            anat_path=data_paths['anat'],
-            ref_img=anat_img,
-            out_path=roi_rank_path,
-            atlas_threshold=roi_atlas_threshold,
-            label_patterns=roi_label_patterns,
-            assume_mni=False,
-        )
+        _rank_rois_by_beta(mean_clean_active, anat_img=anat_img, anat_path=data_paths['anat'], ref_img=anat_img, out_path=roi_rank_path, 
+                           atlas_threshold=roi_atlas_threshold, label_patterns=roi_label_patterns, assume_mni=False)
 
 
 if __name__ == '__main__':
