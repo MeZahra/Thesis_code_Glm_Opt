@@ -170,22 +170,16 @@ def _trial_counts(total_trials: int, num_runs: int, trial_keep: list[np.ndarray 
     counts[-1] = total_trials - base * (num_runs - 1)
     return counts
 
-def _extract_trial_segments(masked_bold: np.ndarray, onsets: np.ndarray, trial_len: int) -> np.ndarray:
+def _extract_trial_segments(masked_bold, trial_len, num_trials, rest_every = 30, rest_len = 20):
     num_voxels, num_timepoints = masked_bold.shape
-    segments = np.full((num_voxels, len(onsets), trial_len), np.nan, dtype=np.float32)
-    truncated = 0
-    for i, onset in enumerate(onsets):
-        start = int(onset) - 1
+    segments = np.full((num_voxels, num_trials, trial_len), np.nan, dtype=np.float32)
+    start = 0
+    for i in range(num_trials):
         end = start + trial_len
-        if end > num_timepoints:
-            truncated += 1
-            if start < num_timepoints:
-                available = masked_bold[:, start:num_timepoints]
-                segments[:, i, : available.shape[1]] = available
-            continue
         segments[:, i, :] = masked_bold[:, start:end]
-    if truncated:
-        print(f'Warning: truncated {truncated} trial segments beyond BOLD length.', flush=True)
+        start = end
+        if rest_every and (i + 1) % rest_every == 0:
+            start += rest_len
     return segments
 
 def _save_beta_overlay(
@@ -710,28 +704,17 @@ def main():
 
     beta = beta_glm[:, 0, 0, start_idx:end_idx]
 
-    if go_times is not None:
-        run_onsets = go_times[run_index]
-        keep = trial_keep[run_index]
-        if keep is not None:
-            run_onsets = run_onsets[keep]
-        if len(run_onsets) > beta.shape[-1]:
-            run_onsets = run_onsets[: beta.shape[-1]]
-        bold_data_reshape = _extract_trial_segments(masked_bold, run_onsets, args.trial_len)
-    else:
-        num_trials = beta.shape[-1]
-        num_voxels, num_timepoints = masked_bold.shape
-        bold_data_reshape = np.full((num_voxels, num_trials, args.trial_len), np.nan, dtype=np.float32)
-
-        start = 0
-        for i in range(num_trials):
-            end = start + args.trial_len
-            if end > num_timepoints:
-                raise ValueError("Masked BOLD data does not contain enough timepoints for all trials")
-            bold_data_reshape[:, i, :] = masked_bold[:, start:end]
-            start += args.trial_len
-            if start in (270, 560):
-                start += 20
+    keep = trial_keep[run_index]
+    num_trials = int(keep.shape[0]) if keep is not None else beta.shape[-1]
+    bold_data_reshape = _extract_trial_segments(
+        masked_bold,
+        trial_len=args.trial_len,
+        num_trials=num_trials,
+        rest_every=30,
+        rest_len=20
+    )
+    if bold_data_reshape.shape[1] > beta.shape[-1]:
+        bold_data_reshape = bold_data_reshape[:, : beta.shape[-1], :]
 
     print(2, flush=True)
 
