@@ -23,6 +23,26 @@ TRIALS_PER_RUN = 90
 
 # %%
 def _extract_trial_segments(masked_bold, trial_len, num_trials, rest_every = 30, rest_len = 20):
+    """Split masked BOLD time series into trial-length segments.
+
+    Parameters
+    ----------
+    masked_bold : ndarray, shape (n_voxels, n_timepoints)
+        Masked BOLD time series data.
+    trial_len : int
+        Number of timepoints per trial.
+    num_trials : int
+        Number of trials to extract.
+    rest_every : int or None, optional
+        Insert a rest gap after every this many trials; set to 0/None to disable.
+    rest_len : int, optional
+        Number of timepoints to skip for each rest period.
+
+    Returns
+    -------
+    segments : ndarray, shape (n_voxels, num_trials, trial_len)
+        Trial segments; values without data remain NaN (float32).
+    """
     num_voxels, num_timepoints = masked_bold.shape
     segments = np.full((num_voxels, num_trials, trial_len), np.nan, dtype=np.float32)
     start = 0
@@ -35,6 +55,26 @@ def _extract_trial_segments(masked_bold, trial_len, num_trials, rest_every = 30,
     return segments
 
 def _save_beta_overlay(mean_abs_beta, anat_img, out_html, threshold_pct, vmax_pct, cut_coords, snapshot_path):
+    """Save HTML (and optional PNG) overlay for mean |beta| volume.
+
+    Parameters
+    ----------
+    mean_abs_beta : ndarray, shape (X, Y, Z)
+        Volume of mean absolute beta values.
+    anat_img : nib.Nifti1Image
+        Anatomical image used for affine/header and background.
+    out_html : str or Path
+        Output HTML file path.
+    threshold_pct : float
+        Percentile for display threshold.
+    vmax_pct : float
+        Percentile for display vmax.
+    cut_coords : sequence[float] or None
+        Slice coordinates for the overlay view.
+    snapshot_path : str or Path or None
+        Optional PNG snapshot path; if None, no snapshot is saved.
+
+    """
     finite = mean_abs_beta[np.isfinite(mean_abs_beta)]
     thr = float(np.percentile(finite, threshold_pct))
     vmax = float(np.percentile(finite, vmax_pct))
@@ -51,20 +91,56 @@ def _save_beta_overlay(mean_abs_beta, anat_img, out_html, threshold_pct, vmax_pc
         display.close()
         print(f'Saved snapshot: {snapshot_path}', flush=True)
 
-def _save_overlay_html(data, anat_img, out_html, title, threshold, vmax, threshold_pct, vmax_pct, cmap='jet', symmetric_cmap = False, cut_coords=None):
+def _save_overlay_html(data, anat_img, out_html, title, threshold_pct, vmax_pct, cmap='jet', symmetric_cmap = False, cut_coords=None):
+    """Save an HTML overlay for a 3D volume.
+
+    Parameters
+    ----------
+    data : ndarray, shape (X, Y, Z)
+        Volume to display.
+    anat_img : nib.Nifti1Image
+        Anatomical image used for affine/header and background.
+    out_html : str or Path
+        Output HTML file path.
+    title : str
+        Title for the overlay.
+    threshold_pct : float or None
+        Percentile for threshold when threshold is None.
+    vmax_pct : float or None
+        Percentile for vmax when vmax is None.
+    cmap : str, optional
+        Matplotlib colormap name.
+    symmetric_cmap : bool, optional
+        Whether to use a symmetric colormap.
+    cut_coords : sequence[float] or None, optional
+        Slice coordinates for the overlay view.
+    """
     img = nib.Nifti1Image(data.astype(np.float32), anat_img.affine, anat_img.header)
     finite = data[np.isfinite(data)]
-
-    if threshold is None and threshold_pct is not None:
-        threshold = float(np.percentile(finite, threshold_pct))
-    if vmax is None and vmax_pct is not None:
-        vmax = float(np.percentile(finite, vmax_pct))
+    threshold = float(np.percentile(finite, threshold_pct))
+    vmax = float(np.percentile(finite, vmax_pct))
 
     view = plotting.view_img(img, bg_img=anat_img, cmap=cmap, symmetric_cmap=symmetric_cmap, threshold=threshold, vmax=vmax, colorbar=True, title=title, cut_coords=cut_coords)
     view.save_as_html(out_html)
     print(f'Saved overlay: {out_html}', flush=True)
 
 def _mean_abs_beta_volume(beta, coords, volume_shape):
+    """Project per-voxel beta values into a 3D volume by mean |beta|.
+
+    Parameters
+    ----------
+    beta : ndarray, shape (n_voxels, n_trials)
+        Beta values per voxel and trial.
+    coords : tuple of ndarray
+        Tuple of (x_idx, y_idx, z_idx), each shape (n_voxels,).
+    volume_shape : tuple of int
+        Target 3D volume shape (X, Y, Z).
+
+    Returns
+    -------
+    volume : ndarray, shape volume_shape
+        3D volume filled with mean absolute beta; NaN elsewhere.
+    """
     with np.errstate(invalid='ignore'):
         mean_abs = np.nanmean(np.abs(beta), axis=1)
     volume = np.full(volume_shape, np.nan, dtype=np.float32)
@@ -72,6 +148,13 @@ def _mean_abs_beta_volume(beta, coords, volume_shape):
     return volume
 
 def _default_mni_template():
+    """Return an MNI template path from FSLDIR if available.
+
+    Returns
+    -------
+    Path or None
+        Existing template path, or None if not found.
+    """
     fsl_dir = os.environ.get("FSLDIR")
     if not fsl_dir:
         return None
@@ -83,11 +166,42 @@ def _default_mni_template():
     return None
 
 def _run_flirt(cmd):
+    """Run FSL FLIRT with NIFTI_GZ output.
+
+    Parameters
+    ----------
+    cmd : list[str]
+        Command argument list for FLIRT.
+
+    Returns
+    -------
+    None
+    """
     env = os.environ.copy()
     env.setdefault("FSLOUTPUTTYPE", "NIFTI_GZ")
     subprocess.run(cmd, check=True, env=env)
 
 def _compute_mni_to_anat(mni_template, anat_path, out_dir, flirt_path):
+    """Compute FLIRT transform from MNI template to anatomy.
+
+    Parameters
+    ----------
+    mni_template : str or Path
+        MNI template image path.
+    anat_path : str or Path
+        Anatomical reference image path.
+    out_dir : str or Path
+        Output directory for transform files.
+    flirt_path : str or Path
+        Path to the FLIRT executable.
+
+    Returns
+    -------
+    mat_path : Path
+        Transform matrix file path.
+    warped_path : Path
+        Warped MNI template in anatomical space.
+    """
     out_dir = Path(out_dir)
     mat_path = out_dir / "mni_to_anat_flirt.mat"
     warped_path = out_dir / "mni_template_in_anat.nii.gz"
@@ -96,10 +210,45 @@ def _compute_mni_to_anat(mni_template, anat_path, out_dir, flirt_path):
     return mat_path, warped_path
 
 def _apply_flirt(in_path, ref_path, mat_path, out_path, flirt_path, interp="nearestneighbour"):
+    """Apply an existing FLIRT transform to an image.
+
+    Parameters
+    ----------
+    in_path : str or Path
+        Input image path.
+    ref_path : str or Path
+        Reference image path.
+    mat_path : str or Path
+        Transform matrix path.
+    out_path : str or Path
+        Output image path.
+    flirt_path : str or Path
+        Path to the FLIRT executable.
+    interp : str, optional
+        FLIRT interpolation mode.
+
+    Returns
+    -------
+    None
+    """
     cmd = [flirt_path, "-in", str(in_path), "-ref", str(ref_path), "-applyxfm", "-init", str(mat_path), "-interp", interp,"-out", str(out_path)]
     _run_flirt(cmd)
 
 def _select_roi_indices(labels, label_patterns):
+    """Select atlas label indices matching requested patterns.
+
+    Parameters
+    ----------
+    labels : sequence of str
+        Atlas label names; index 0 is assumed to be background.
+    label_patterns : str or None
+        Comma-separated substrings to match (case-insensitive); None selects all.
+
+    Returns
+    -------
+    indices : list of int
+        Label indices that match requested patterns.
+    """
     patterns = []
     if label_patterns:
         patterns = [p.strip().lower() for p in label_patterns.split(",") if p.strip()]
@@ -116,6 +265,28 @@ def _select_roi_indices(labels, label_patterns):
     return indices
 
 def _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_dir, assume_mni=False):
+    """Resample atlas to the reference image space.
+
+    Parameters
+    ----------
+    atlas_img : nib.Nifti1Image
+        Atlas image in MNI or anatomical space.
+    anat_img : nib.Nifti1Image
+        Anatomical image for header-based resampling.
+    anat_path : str or Path
+        Anatomical image path for FLIRT registration.
+    ref_img : nib.Nifti1Image
+        Reference image defining target shape/affine.
+    out_dir : str or Path
+        Directory for FLIRT outputs and temporary files.
+    assume_mni : bool, optional
+        If True, skip MNI-to-anat registration and only resample.
+
+    Returns
+    -------
+    atlas_in_ref : nib.Nifti1Image
+        Atlas resampled to ref_img space (shape ref_img.shape[:3]).
+    """
     use_flirt = False
     flirt_path = None
     mni_template_img = None
@@ -153,11 +324,36 @@ def _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_dir, 
     return atlas_in_anat
 
 def _rank_rois_by_beta(summary, anat_img, anat_path, ref_img, out_path, atlas_threshold, label_patterns, assume_mni):
+    """Rank atlas ROIs by mean beta and write a CSV report.
+
+    Parameters
+    ----------
+    summary : ndarray, shape (X, Y, Z)
+        Summary volume; must match ref_img.shape[:3].
+    anat_img : nib.Nifti1Image
+        Anatomical image used for resampling.
+    anat_path : str or Path
+        Anatomical image path for FLIRT registration.
+    ref_img : nib.Nifti1Image
+        Reference image defining target shape/affine.
+    out_path : str or Path
+        Output CSV file path.
+    atlas_threshold : int
+        Harvard-Oxford atlas threshold value.
+    label_patterns : str or None
+        Comma-separated substrings to match ROI labels.
+    assume_mni : bool
+        If True, assume atlas is already in MNI space.
+
+    Returns
+    -------
+    None
+    """
     atlas = datasets.fetch_atlas_harvard_oxford(f"cort-maxprob-thr{atlas_threshold}-2mm")
     atlas_img = atlas.maps if isinstance(atlas.maps, nib.Nifti1Image) else nib.load(atlas.maps)
     labels = [lbl.decode("utf-8", errors="replace") if isinstance(lbl, bytes) else str(lbl) for lbl in atlas.labels]
     if summary.shape != ref_img.shape[:3]:
-        raise ValueError("Summary shape does not match ROI reference image; summary shape={summary.shape}, ref shape={ref_img.shape[:3]}.")
+        raise ValueError(f"Summary shape does not match ROI reference image; summary shape={summary.shape}, ref shape={ref_img.shape[:3]}.")
 
     atlas_in_ref = _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_path.parent, assume_mni=assume_mni)
     atlas_data = np.rint(atlas_in_ref.get_fdata(dtype=np.float32)).astype(int)
@@ -200,6 +396,26 @@ def _rank_rois_by_beta(summary, anat_img, anat_path, ref_img, out_path, atlas_th
 
 # %%
 def hampel_filter_image(image, window_size, threshold_factor, return_stats=False):
+    """Apply a 3D Hampel filter to each volume in a 4D image.
+
+    Parameters
+    ----------
+    image : ndarray, shape (X, Y, Z, T)
+        4D image to filter; modified in place.
+    window_size : int
+        Size of the cubic neighborhood window.
+    threshold_factor : float
+        MAD multiplier used to flag outliers.
+    return_stats : bool, optional
+        If True, also return a dict of summary counts.
+
+    Returns
+    -------
+    image : ndarray, shape (X, Y, Z, T)
+        Filtered image.
+    stats : dict, optional
+        Only returned when return_stats is True. Keys: insufficient_total, corrected_total.
+    """
     footprint = np.ones((window_size,) * 3, dtype=bool)
     insufficient_any = np.zeros(image.shape[:3], dtype=bool)
     corrected_any = np.zeros(image.shape[:3], dtype=bool)
@@ -242,6 +458,10 @@ def _parse_args():
     return parser.parse_args()
 
 def main():
+    """Run the beta preprocessing pipeline.
+    Inputs are loaded from disk based on hard-coded subject/session/run values.
+    Outputs are written to the current working directory.
+    """
     args = _parse_args()
     data_root = (Path.cwd() / DATA_DIRNAME).resolve()
     
@@ -269,6 +489,21 @@ def main():
     overlay_html_path = output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{run}.html'
     overlay_snapshot_path = overlay_html_path.with_suffix(".png")
     cached_beta_path = output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy'
+
+    print("Loading Files ...")
+    sub_label = f'sub-pd0{sub}'
+    data_paths = {'bold': data_root / f'{sub_label}_ses-{ses}_run-{run}_task-mv_bold_corrected_smoothed_reg.nii.gz', 'anat': data_root / f'{sub_label}_ses-{ses}_T1w_brain.nii.gz',
+        'brain': data_root / f'{sub_label}_ses-{ses}_T1w_brain_mask.nii.gz', 'csf': data_root / f'{sub_label}_ses-{ses}_T1w_brain_pve_0.nii.gz', 'gray': data_root / f'{sub_label}_ses-{ses}_T1w_brain_pve_1.nii.gz'}
+    anat_img = nib.load(str(data_paths['anat']))
+    bold_img = nib.load(str(data_paths['bold']))
+    bold_data = bold_img.get_fdata()
+    glmsingle_file = data_root / 'TYPED_FITHRF_GLMDENOISE_RR.npy'
+    glm_dict = np.load(str(glmsingle_file), allow_pickle=True).item()
+    beta_glm = glm_dict['betasmd']
+    back_mask = nib.load(str(data_paths['brain'])).get_fdata(dtype=np.float32)
+    csf_mask = nib.load(str(data_paths['csf'])).get_fdata(dtype=np.float32)
+    gray_mask = nib.load(str(data_paths['gray'])).get_fdata(dtype=np.float32)
+
     if cached_beta_path.exists():
         beta_volume_filter = np.load(cached_beta_path)
         mean_clean_active = np.nanmean(np.abs(beta_volume_filter), axis=-1)
@@ -279,23 +514,6 @@ def main():
             _rank_rois_by_beta(mean_clean_active, anat_img=anat_img, anat_path=data_paths['anat'], ref_img=anat_img, out_path=roi_rank_path, 
                                 atlas_threshold=roi_atlas_threshold, label_patterns=roi_label_patterns, assume_mni=False)
         return
-
-    print("Loading Files ...")
-    sub_label = f'sub-pd0{sub}'
-    data_paths = {'bold': data_root / f'{sub_label}_ses-{ses}_run-{run}_task-mv_bold_corrected_smoothed_reg.nii.gz',
-        'brain': data_root / f'{sub_label}_ses-{ses}_T1w_brain_mask.nii.gz',
-        'csf': data_root / f'{sub_label}_ses-{ses}_T1w_brain_pve_0.nii.gz',
-        'gray': data_root / f'{sub_label}_ses-{ses}_T1w_brain_pve_1.nii.gz',
-        'anat': data_root / f'{sub_label}_ses-{ses}_T1w_brain.nii.gz'}
-    anat_img = nib.load(str(data_paths['anat']))
-    bold_img = nib.load(str(data_paths['bold']))
-    bold_data = bold_img.get_fdata()
-    glmsingle_file = data_root / 'TYPED_FITHRF_GLMDENOISE_RR.npy'
-    glm_dict = np.load(str(glmsingle_file), allow_pickle=True).item()
-    beta_glm = glm_dict['betasmd']
-    back_mask = nib.load(str(data_paths['brain'])).get_fdata(dtype=np.float32)
-    csf_mask = nib.load(str(data_paths['csf'])).get_fdata(dtype=np.float32)
-    gray_mask = nib.load(str(data_paths['gray'])).get_fdata(dtype=np.float32)
 
     print("Apply Masking on Bold data...")
     csf_mask_data = csf_mask > 0
