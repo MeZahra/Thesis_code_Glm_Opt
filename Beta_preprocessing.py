@@ -411,15 +411,17 @@ def main():
     args = _parse_args()
     data_root = (Path.cwd() / DATA_DIRNAME).resolve()
     
+    print("Define Parameters ....")
     fdr_alpha = 0.05   # FDR alpha for voxelwise t-tests.
     hampel_window = 5      # Hampel filter window size (voxels).
     hampel_threshold = 3.0   # Hampel MAD multiplier for outliers.
     outlier_percentile = 99.9      # Percentile cutoff for beta outliers.
     max_outlier_fraction = 0.5     # Max outlier fraction per voxel.
-    apply_gray_mask = True      # Restrict analysis to gray mask.
     overlay_threshold_pct = 90.0      # Overlay threshold percentile.
     overlay_vmax_pct = 99.0      # Overlay vmax percentile.
     cut_coords = None      # Slice coords for overlay; None uses default cuts.
+    cut_coords = tuple(cut_coords) if cut_coords else None
+    roi_tag = 'mean_abs'
     skip_roi_ranking = False      # Skip ROI ranking output.
     roi_atlas_threshold = 25      # Harvard-Oxford atlas threshold.
     roi_label_patterns = None      # ROI label filter patterns.
@@ -430,7 +432,18 @@ def main():
     overlay_html_path = output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{run}.html'
     overlay_snapshot_path = overlay_html_path.with_suffix(".png")
     cached_beta_path = output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy'
+    if cached_beta_path.exists():
+        beta_volume_filter = np.load(cached_beta_path)
+        mean_clean_active = _compute_beta_summary(beta_volume_filter)
+        _save_beta_overlay(mean_clean_active, anat_img=anat_img, out_html=str(overlay_html_path),threshold_pct=overlay_threshold_pct,
+                            vmax_pct=overlay_vmax_pct, cut_coords=cut_coords, snapshot_path=str(overlay_snapshot_path))
+        if not skip_roi_ranking:
+            roi_rank_path = output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run}.csv'
+            _rank_rois_by_beta(mean_clean_active, anat_img=anat_img, anat_path=data_paths['anat'], ref_img=anat_img, out_path=roi_rank_path, 
+                                atlas_threshold=roi_atlas_threshold, label_patterns=roi_label_patterns, assume_mni=False)
+        return
 
+    print("Loading Files ...")
     sub_label = f'sub-pd0{sub}'
     data_paths = {'bold': data_root / f'{sub_label}_ses-{ses}_run-{run}_task-mv_bold_corrected_smoothed_reg.nii.gz',
         'brain': data_root / f'{sub_label}_ses-{ses}_T1w_brain_mask.nii.gz',
@@ -439,66 +452,24 @@ def main():
         'anat': data_root / f'{sub_label}_ses-{ses}_T1w_brain.nii.gz'}
     anat_img = nib.load(str(data_paths['anat']))
     bold_img = nib.load(str(data_paths['bold']))
-
-    cut_coords = tuple(cut_coords) if cut_coords else None
-    roi_tag = 'mean_abs'
-
-    if cached_beta_path.exists():
-        beta_volume_filter = np.load(cached_beta_path)
-        mean_clean_active = _compute_beta_summary(beta_volume_filter)
-        _save_beta_overlay(
-            mean_clean_active,
-            anat_img=anat_img,
-            out_html=str(overlay_html_path),
-            threshold_pct=overlay_threshold_pct,
-            vmax_pct=overlay_vmax_pct,
-            cut_coords=cut_coords,
-            snapshot_path=str(overlay_snapshot_path),
-        )
-        if not skip_roi_ranking:
-            roi_rank_path = output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run}.csv'
-            _rank_rois_by_beta(
-                mean_clean_active,
-                anat_img=anat_img,
-                anat_path=data_paths['anat'],
-                ref_img=anat_img,
-                out_path=roi_rank_path,
-                atlas_threshold=roi_atlas_threshold,
-                label_patterns=roi_label_patterns,
-                assume_mni=False,
-            )
-        return
-
     bold_data = bold_img.get_fdata()
-
+    glmsingle_file = data_root / 'TYPED_FITHRF_GLMDENOISE_RR.npy'
+    glm_dict = np.load(str(glmsingle_file), allow_pickle=True).item()
+    beta_glm = glm_dict['betasmd']
     back_mask = nib.load(str(data_paths['brain'])).get_fdata(dtype=np.float32)
     csf_mask = nib.load(str(data_paths['csf'])).get_fdata(dtype=np.float32)
     gray_mask = nib.load(str(data_paths['gray'])).get_fdata(dtype=np.float32)
 
-    print(1, flush=True)
-
+    print("Apply Masking on Bold data")
+    csf_mask_data = csf_mask > 0
     back_mask_data = back_mask > 0
-    gray_mask_data = gray_mask > args.gray_threshold
-
-    glmsingle_file = data_root / 'TYPED_FITHRF_GLMDENOISE_RR.npy'
-    print(f'Loading GLMsingle output: {glmsingle_file}', flush=True)
-    glm_dict = np.load(str(glmsingle_file), allow_pickle=True).item()
-    beta_glm = glm_dict['betasmd']
-    csf_thr = 0.0
-    print(f'Using csf_threshold={csf_thr}', flush=True)
-
-    mask = np.logical_and(back_mask_data, ~(csf_mask > csf_thr))
+    mask = np.logical_and(back_mask_data, ~csf_mask_data)
     nonzero_mask = np.where(mask)
-    if apply_gray_mask:
-        keep_voxels = gray_mask_data[nonzero_mask]
-    else:
-        keep_voxels = np.ones(nonzero_mask[0].shape[0], dtype=bool)
-
+    gray_mask_data = gray_mask > args.gray_threshold
+    keep_voxels = gray_mask_data[nonzero_mask]
     bold_flat = bold_data[nonzero_mask]
-    masked_bold = bold_flat[keep_voxels]
+    masked_bold = bold_flat[keep_voxels].astype(np.float32)
     masked_coords = tuple(ax[keep_voxels] for ax in nonzero_mask)
-
-    masked_bold = masked_bold.astype(np.float32)
 
     num_runs = 2
 
