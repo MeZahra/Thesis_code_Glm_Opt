@@ -399,7 +399,13 @@ def _align_atlas_to_reference(
             )
             atlas_mni_img.to_filename(str(atlas_mni_path))
             _apply_flirt(atlas_mni_path, anat_path, mat_path, atlas_anat_path, flirt_path)
-            atlas_in_anat = nib.load(str(atlas_anat_path))
+            atlas_in_anat_img = nib.load(str(atlas_anat_path))
+            # Detach from temp file path before the temp dir is removed.
+            atlas_in_anat = nib.Nifti1Image(
+                atlas_in_anat_img.get_fdata(dtype=np.float32),
+                atlas_in_anat_img.affine,
+                atlas_in_anat_img.header,
+            )
     else:
         atlas_in_anat = image.resample_to_img(
             atlas_img,
