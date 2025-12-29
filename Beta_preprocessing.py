@@ -79,13 +79,13 @@ def _save_beta_overlay(mean_abs_beta, anat_img, out_html, threshold_pct, vmax_pc
     thr = float(np.percentile(finite, threshold_pct))
     vmax = float(np.percentile(finite, vmax_pct))
     img = nib.Nifti1Image(mean_abs_beta.astype(np.float32), anat_img.affine, anat_img.header)
-    view = plotting.view_img(img, bg_img=anat_img, cmap='inferno', symmetric_cmap=False, threshold=thr, vmax=vmax, colorbar=True,
+    view = plotting.view_img(img, bg_img=anat_img, cmap='jet', symmetric_cmap=False, threshold=thr, vmax=vmax, colorbar=True,
                              title=f'Mean |beta| (thr p{threshold_pct}={thr:.2f}, vmax p{vmax_pct}={vmax:.2f})', cut_coords=cut_coords)
     view.save_as_html(out_html)
     print(f'Saved overlay: {out_html}', flush=True)
 
     if snapshot_path:
-        display = plotting.plot_stat_map(img, bg_img=anat_img, cmap='inferno', symmetric_cbar=False, threshold=thr, vmax=vmax, colorbar=True, 
+        display = plotting.plot_stat_map(img, bg_img=anat_img, cmap='jet', symmetric_cbar=False, threshold=thr, vmax=vmax, colorbar=True, 
                                          title=f'Mean |beta| (thr p{threshold_pct}, vmax p{vmax_pct})',cut_coords=cut_coords)
         display.savefig(snapshot_path)
         display.close()
@@ -471,8 +471,8 @@ def main():
     hampel_threshold = 3.0   # Hampel MAD multiplier for outliers.
     outlier_percentile = 99.9      # Percentile cutoff for beta outliers.
     max_outlier_fraction = 0.5     # Max outlier fraction per voxel.
-    overlay_threshold_pct = 90.0      # Overlay threshold percentile.
-    overlay_vmax_pct = 99.0      # Overlay vmax percentile.
+    overlay_threshold_pct = 10      # Overlay threshold percentile.
+    overlay_vmax_pct = 99.9      # Overlay vmax percentile.
     cut_coords = None      # Slice coords for overlay; None uses default cuts.
     cut_coords = tuple(cut_coords) if cut_coords else None
     roi_tag = 'mean_abs'
@@ -614,27 +614,27 @@ def main():
     nan_voxels = np.all(np.isnan(beta_volume_filter), axis=-1)
     mask_2d = nan_voxels.reshape(-1)
 
-    np.save(output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy', beta_volume_filter)
-    np.save(output_dir / f'mask_all_nan_sub{sub}_ses{ses}_run{run}.npy', mask_2d)
+    # np.save(output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy', beta_volume_filter)
+    # np.save(output_dir / f'mask_all_nan_sub{sub}_ses{ses}_run{run}.npy', mask_2d)
 
-    beta_volume_filter = np.load(output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy')
-    nan_voxels = np.all(np.isnan(beta_volume_filter), axis=-1)
-    mask_2d = np.load(output_dir / f'mask_all_nan_sub{sub}_ses{ses}_run{run}.npy')
-    np.save(output_dir / f"nan_mask_flat_sub{sub}_ses{ses}_run{run}.npy", mask_2d)
-    beta_volume_clean_2d = beta_volume_filter[~nan_voxels]
-    np.save(output_dir / f"beta_volume_filter_sub{sub}_ses{ses}_run{run}.npy", beta_volume_clean_2d)
+    # beta_volume_filter = np.load(output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy')
+    # nan_voxels = np.all(np.isnan(beta_volume_filter), axis=-1)
+    # mask_2d = np.load(output_dir / f'mask_all_nan_sub{sub}_ses{ses}_run{run}.npy')
+    # np.save(output_dir / f"nan_mask_flat_sub{sub}_ses{ses}_run{run}.npy", mask_2d)
+    # beta_volume_clean_2d = beta_volume_filter[~nan_voxels]
+    # np.save(output_dir / f"beta_volume_filter_sub{sub}_ses{ses}_run{run}.npy", beta_volume_clean_2d)
 
-    active_flat_idx = np.ravel_multi_index(active_coords, nan_voxels.shape)
-    np.save(output_dir / f"active_flat_indices__sub{sub}_ses{ses}_run{run}.npy", active_flat_idx)
-    keep_mask = ~mask_2d[active_flat_idx]
-    clean_active_bold = clean_active_bold[keep_mask, ...]
-    np.save(output_dir / f"active_bold_sub{sub}_ses{ses}_run{run}.npy", clean_active_bold)
-    clean_active_beta = clean_active_beta[keep_mask, ...]
-    print(f"After filtering: Beta Shape: {beta_volume_clean_2d.shape}, Bold shape: {clean_active_bold.shape}")
+    # active_flat_idx = np.ravel_multi_index(active_coords, nan_voxels.shape)
+    # np.save(output_dir / f"active_flat_indices__sub{sub}_ses{ses}_run{run}.npy", active_flat_idx)
+    # keep_mask = ~mask_2d[active_flat_idx]
+    # clean_active_bold = clean_active_bold[keep_mask, ...]
+    # np.save(output_dir / f"active_bold_sub{sub}_ses{ses}_run{run}.npy", clean_active_bold)
+    # clean_active_beta = clean_active_beta[keep_mask, ...]
+    # print(f"After filtering: Beta Shape: {beta_volume_clean_2d.shape}, Bold shape: {clean_active_bold.shape}")
 
-    clean_active_idx = clean_active_idx[keep_mask]
-    active_coords = tuple(coord[keep_mask] for coord in active_coords)
-    np.save(output_dir / f"active_coords_sub{sub}_ses{ses}_run{run}.npy", active_coords)
+    # clean_active_idx = clean_active_idx[keep_mask]
+    # active_coords = tuple(coord[keep_mask] for coord in active_coords)
+    # np.save(output_dir / f"active_coords_sub{sub}_ses{ses}_run{run}.npy", active_coords)
 
     mean_clean_active = np.nanmean(np.abs(beta_volume_filter), axis=-1)
     _save_beta_overlay(mean_clean_active, anat_img=anat_img, out_html=str(overlay_html_path), threshold_pct=overlay_threshold_pct, 

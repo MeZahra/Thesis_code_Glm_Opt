@@ -8,12 +8,15 @@
 *.html
 gray_matter_data/
 *.txt
+*.log
 
 data/
 results/
 checkpoints/
 logs/
 figures/
+tmp_roi_overlay/
+sub09_ses1/
 
 # python cruft
 __pycache__/
