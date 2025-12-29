@@ -19,35 +19,9 @@ sub = '09'
 ses = 1
 run = 1
 TRIAL_LEN = 9
+TRIALS_PER_RUN = 90
 
 # %%
-def _load_trial_keep(root, run):
-    if root is None:
-        return None
-    for pattern in (f'trial_keep_run{run}.npy', f'trial_keep_run{run:02d}.npy'):
-        path = root / pattern
-        if path.exists():
-            return np.load(path)
-    return None
-
-def _trial_counts(total_trials, num_runs, trial_keep):
-    counts = []
-    for run_idx in range(num_runs):
-        keep = trial_keep[run_idx] if run_idx < len(trial_keep) else None
-        if keep is not None:
-            counts.append(int(np.count_nonzero(keep)))
-            continue
-        counts.append(None)
-
-    if all(count is not None for count in counts):
-        if sum(counts) == total_trials:
-            return counts
-
-    base = total_trials // num_runs
-    counts = [base] * num_runs
-    counts[-1] = total_trials - base * (num_runs - 1)
-    return counts
-
 def _extract_trial_segments(masked_bold, trial_len, num_trials, rest_every = 30, rest_len = 20):
     num_voxels, num_timepoints = masked_bold.shape
     segments = np.full((num_voxels, num_trials, trial_len), np.nan, dtype=np.float32)
@@ -460,7 +434,7 @@ def main():
     csf_mask = nib.load(str(data_paths['csf'])).get_fdata(dtype=np.float32)
     gray_mask = nib.load(str(data_paths['gray'])).get_fdata(dtype=np.float32)
 
-    print("Apply Masking on Bold data")
+    print("Apply Masking on Bold data...")
     csf_mask_data = csf_mask > 0
     back_mask_data = back_mask > 0
     mask = np.logical_and(back_mask_data, ~csf_mask_data)
@@ -471,46 +445,21 @@ def main():
     masked_bold = bold_flat[keep_voxels].astype(np.float32)
     masked_coords = tuple(ax[keep_voxels] for ax in nonzero_mask)
 
-    num_runs = 2
-
-    trial_keep = []
-    for run_idx in range(num_runs):
-        trial_keep.append(_load_trial_keep(data_root, run_idx + 1))
-
-    counts = _trial_counts(beta_glm.shape[-1], num_runs, trial_keep)
-    run_index = max(0, run - 1)
-    run_index = min(run_index, num_runs - 1)
-
-    start_idx = sum(counts[:run_index])
-    end_idx = start_idx + counts[run_index]
-    end_idx = min(end_idx, beta_glm.shape[-1])
-
+    print("Reshape Bold and Beta datasets...")
+    start_idx = (run-1) * TRIALS_PER_RUN
+    end_idx = start_idx + TRIALS_PER_RUN
     beta = beta_glm[:, 0, 0, start_idx:end_idx]
-
-    keep = trial_keep[run_index]
-    num_trials = int(keep.shape[0]) if keep is not None else beta.shape[-1]
-    bold_data_reshape = _extract_trial_segments(
-        masked_bold,
-        trial_len=TRIAL_LEN,
-        num_trials=num_trials,
-        rest_every=30,
-        rest_len=20
-    )
-    if bold_data_reshape.shape[1] > beta.shape[-1]:
-        bold_data_reshape = bold_data_reshape[:, : beta.shape[-1], :]
-
-    print(2, flush=True)
-
     beta = beta[keep_voxels]
-
+    bold_data_reshape = _extract_trial_segments(masked_bold, trial_len=TRIAL_LEN, num_trials=TRIALS_PER_RUN, rest_every=30, rest_len=20)
+    print("Remove NaN voxels...")
     nan_voxels = np.isnan(beta).all(axis=1)
     if np.any(nan_voxels):
         beta = beta[~nan_voxels]
         bold_data_reshape = bold_data_reshape[~nan_voxels]
         masked_coords = tuple(coord[~nan_voxels] for coord in masked_coords)
+    print(f"Beta Shape: {beta.shape}, Bold shape: {bold_data_reshape.shape}")
 
-    print(3, flush=True)
-
+    print("Remove Outlier Beta Values...")
     med = np.nanmedian(beta, keepdims=True)
     mad = np.nanmedian(np.abs(beta - med), keepdims=True)
     scale = 1.4826 * np.maximum(mad, 1e-9)
@@ -531,8 +480,7 @@ def main():
     trial_outliers = np.logical_and(outlier_mask, valid_voxels[:, None])
     bold_data_reshape = np.where(trial_outliers[:, :, None], np.nan, bold_data_reshape)
     bold_data_reshape = bold_data_reshape[keeped_mask]
-
-    print(4, flush=True)
+    print(f"Clean Beta Shape: {clean_beta.shape}, Bold shape: {bold_data_reshape.shape}")
 
     if args.skip_ttest:
         clean_active_beta = clean_beta
