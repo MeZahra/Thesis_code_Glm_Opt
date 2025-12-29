@@ -7,7 +7,6 @@ import subprocess
 import tempfile
 from os.path import join
 from pathlib import Path
-
 import nibabel as nib
 import numpy as np
 from scipy.stats import ttest_1samp
@@ -540,32 +539,9 @@ def hampel_filter_image(image, window_size, threshold_factor, return_stats=False
 
 def _parse_args():
     parser = argparse.ArgumentParser(description='Beta preprocessing for GLMsingle outputs.')
-    parser.add_argument('--typed-path', type=Path, default=None)
-    parser.add_argument('--output-dir', type=Path, default=None)
     parser.add_argument('--gray-threshold', type=float, default=0.5)
-    parser.add_argument('--apply-gray-mask', action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--mask-mode', default='brain_minus_csf', choices=('brain_minus_csf', 'brain_only', 'gray_only', 'gray_minus_csf'))
-    parser.add_argument('--csf-threshold', type=float, default=None)
-    parser.add_argument('--fdr-alpha', type=float, default=0.05)
     parser.add_argument('--skip-ttest', action='store_true')
-    parser.add_argument('--outlier-percentile', type=float, default=99.9)
-    parser.add_argument('--max-outlier-fraction', type=float, default=0.5)
     parser.add_argument('--skip-hampel', action='store_true')
-    parser.add_argument('--hampel-window', type=int, default=5)
-    parser.add_argument('--hampel-threshold', type=float, default=3.0)
-    parser.add_argument('--overlay-threshold-pct', type=float, default=90.0)
-    parser.add_argument('--overlay-vmax-pct', type=float, default=99.0)
-    parser.add_argument('--overlay-stat', default='mean_abs', choices=('mean_abs', 'mean', 'mean_z'), help='Summary statistic for overlay (default: mean_abs).')
-    parser.add_argument('--overlay-positive-only', action='store_true', help='Zero out non-positive overlay values before thresholding.')
-    parser.add_argument('--cut-coords', type=float, nargs=3, default=None)
-    parser.add_argument('--snapshot-path', type=Path, default=None)
-    parser.add_argument('--skip-roi-ranking', action='store_true', help='Skip atlas-based ROI ranking.')
-    parser.add_argument('--roi-atlas-threshold', type=int, default=25, help='Harvard-Oxford atlas threshold (percent).')
-    parser.add_argument('--roi-label-patterns', default=None, help='Comma-separated label patterns to include (optional).')
-    parser.add_argument('--roi-assume-mni', action='store_true', help='Assume anatomy is in MNI space for atlas alignment.')
-    parser.add_argument('--roi-mni-template', type=Path, default=None, help='Optional MNI template for atlas registration.')
-    parser.add_argument('--force', action='store_true')
-    parser.add_argument('--go-times', type=Path, default=None)
     return parser.parse_args()
 
 
@@ -573,10 +549,30 @@ def main():
     args = _parse_args()
     data_root = DATA_ROOT.expanduser().resolve()
     glmsingle_root = GLMSINGLE_ROOT.expanduser().resolve()
+    typed_path = None
+    csf_threshold = None
+    fdr_alpha = 0.05
+    outlier_percentile = 99.9
+    max_outlier_fraction = 0.5
+    apply_gray_mask = True
+    mask_mode = 'brain_minus_csf'
+    overlay_threshold_pct = 90.0
+    overlay_vmax_pct = 99.0
+    overlay_stat = 'mean_abs'
+    overlay_positive_only = False
+    cut_coords = None
+    snapshot_path = None
+    skip_roi_ranking = False
+    roi_atlas_threshold = 25
+    roi_label_patterns = None
+    roi_assume_mni = False
+    roi_mni_template = None
+    force = False
+    go_times_path = None
+    hampel_window = 5
+    hampel_threshold = 3.0
 
-    output_dir = args.output_dir
-    if output_dir is None:
-        output_dir = Path(f'sub{sub}')
+    output_dir = Path.cwd()
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -591,25 +587,25 @@ def main():
         roi_ref_img = bold_img
         print("Warning: anatomy and BOLD grids differ; ROI ranking will use BOLD grid.", flush=True)
 
-    cut_coords = tuple(args.cut_coords) if args.cut_coords else _precentral_cut_coords(data_root, sub, ses)
-    roi_tag = args.overlay_stat + ("_pos" if args.overlay_positive_only else "")
+    cut_coords = tuple(cut_coords) if cut_coords else _precentral_cut_coords(data_root, sub, ses)
+    roi_tag = overlay_stat + ("_pos" if overlay_positive_only else "")
 
-    if cached_beta_path.exists() and not args.force:
+    if cached_beta_path.exists() and not force:
         beta_volume_filter = np.load(cached_beta_path)
         mean_clean_active = _compute_beta_summary(
             beta_volume_filter,
-            overlay_stat=args.overlay_stat,
-            overlay_positive_only=args.overlay_positive_only,
+            overlay_stat=overlay_stat,
+            overlay_positive_only=overlay_positive_only,
         )
         _save_beta_overlay(
             mean_clean_active,
             anat_img=anat_img,
             out_html=str(output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{run}.html'),
-            threshold_pct=args.overlay_threshold_pct,
-            vmax_pct=args.overlay_vmax_pct,
+            threshold_pct=overlay_threshold_pct,
+            vmax_pct=overlay_vmax_pct,
             cut_coords=cut_coords,
-            snapshot_path=str(args.snapshot_path) if args.snapshot_path else None)
-        if not args.skip_roi_ranking:
+            snapshot_path=str(snapshot_path) if snapshot_path else None)
+        if not skip_roi_ranking:
             roi_rank_path = output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run}.csv'
             _rank_rois_by_beta(
                 mean_clean_active,
@@ -617,10 +613,10 @@ def main():
                 anat_path=data_paths['anat'],
                 ref_img=roi_ref_img,
                 out_path=roi_rank_path,
-                atlas_threshold=args.roi_atlas_threshold,
-                label_patterns=args.roi_label_patterns,
-                assume_mni=args.roi_assume_mni,
-                mni_template=args.roi_mni_template,
+                atlas_threshold=roi_atlas_threshold,
+                label_patterns=roi_label_patterns,
+                assume_mni=roi_assume_mni,
+                mni_template=roi_mni_template,
             )
         return
 
@@ -635,7 +631,6 @@ def main():
     back_mask_data = back_mask > 0
     gray_mask_data = gray_mask > args.gray_threshold
 
-    typed_path = args.typed_path
     if typed_path is None:
         typed_path = _find_latest_glmsingle_typed_file(glmsingle_root, sub, ses)
     print(f'Loading GLMsingle output: {typed_path}', flush=True)
@@ -643,23 +638,23 @@ def main():
     beta_glm = glm_dict['betasmd']
     target_voxels = int(beta_glm.shape[0])
 
-    if args.csf_threshold is None:
+    if csf_threshold is None:
         csf_thr = _infer_csf_exclusion_threshold(back_mask_data, csf_mask, target_voxels)
     else:
-        csf_thr = float(args.csf_threshold)
+        csf_thr = float(csf_threshold)
     print(f'Using csf_threshold={csf_thr} (target voxels={target_voxels})', flush=True)
 
-    if args.mask_mode == 'brain_minus_csf':
+    if mask_mode == 'brain_minus_csf':
         mask = np.logical_and(back_mask_data, ~(csf_mask > csf_thr))
-    elif args.mask_mode == 'brain_only':
+    elif mask_mode == 'brain_only':
         mask = back_mask_data
-    elif args.mask_mode == 'gray_only':
+    elif mask_mode == 'gray_only':
         mask = gray_mask_data
     else:
         mask = np.logical_and(gray_mask_data, ~(csf_mask > csf_thr))
 
     nonzero_mask = np.where(mask)
-    if args.apply_gray_mask and args.mask_mode not in ('gray_only', 'gray_minus_csf'):
+    if apply_gray_mask and mask_mode not in ('gray_only', 'gray_minus_csf'):
         keep_voxels = gray_mask_data[nonzero_mask]
     else:
         keep_voxels = np.ones(nonzero_mask[0].shape[0], dtype=bool)
@@ -670,7 +665,6 @@ def main():
 
     masked_bold = masked_bold.astype(np.float32)
 
-    go_times_path = args.go_times
     if go_times_path is None:
         go_times_path = _resolve_go_times(data_root, sub, ses)
     go_times = _load_go_times(go_times_path)
@@ -718,12 +712,12 @@ def main():
     mad = np.nanmedian(np.abs(beta - med), keepdims=True)
     scale = 1.4826 * np.maximum(mad, 1e-9)
     beta_norm = (beta - med) / scale
-    thr = np.nanpercentile(np.abs(beta_norm), args.outlier_percentile)
+    thr = np.nanpercentile(np.abs(beta_norm), outlier_percentile)
     outlier_mask = np.abs(beta_norm) > thr
 
     clean_beta = beta.copy()
     voxel_outlier_fraction = np.mean(outlier_mask, axis=1)
-    valid_voxels = voxel_outlier_fraction <= args.max_outlier_fraction
+    valid_voxels = voxel_outlier_fraction <= max_outlier_fraction
     clean_beta[~valid_voxels] = np.nan
     clean_beta[np.logical_and(outlier_mask, valid_voxels[:, None])] = np.nan
     keeped_mask = ~np.all(np.isnan(clean_beta), axis=1)
@@ -745,7 +739,7 @@ def main():
         tvals, pvals = ttest_1samp(clean_beta, popmean=0, axis=1, nan_policy='omit')
 
         tested = np.isfinite(pvals)
-        rej, q, _, _ = multipletests(pvals[tested], alpha=args.fdr_alpha, method='fdr_bh')
+        rej, q, _, _ = multipletests(pvals[tested], alpha=fdr_alpha, method='fdr_bh')
 
         n_voxel = clean_beta.shape[0]
         qvals = np.full(n_voxel, np.nan)
@@ -770,8 +764,8 @@ def main():
     else:
         beta_volume_filter, hampel_stats = hampel_filter_image(
             clean_active_volume.astype(np.float32),
-            window_size=args.hampel_window,
-            threshold_factor=args.hampel_threshold,
+            window_size=hampel_window,
+            threshold_factor=hampel_threshold,
             return_stats=True,
         )
     print('Total voxels with <3 neighbours:', hampel_stats['insufficient_total'], flush=True)
@@ -803,20 +797,20 @@ def main():
 
     mean_clean_active = _compute_beta_summary(
         beta_volume_filter,
-        overlay_stat=args.overlay_stat,
-        overlay_positive_only=args.overlay_positive_only,
+        overlay_stat=overlay_stat,
+        overlay_positive_only=overlay_positive_only,
     )
 
     _save_beta_overlay(
         mean_clean_active,
         anat_img=anat_img,
         out_html=str(output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{run}.html'),
-        threshold_pct=args.overlay_threshold_pct,
-        vmax_pct=args.overlay_vmax_pct,
+        threshold_pct=overlay_threshold_pct,
+        vmax_pct=overlay_vmax_pct,
         cut_coords=cut_coords,
-        snapshot_path=str(args.snapshot_path) if args.snapshot_path else None,
+        snapshot_path=str(snapshot_path) if snapshot_path else None,
     )
-    if not args.skip_roi_ranking:
+    if not skip_roi_ranking:
         roi_rank_path = output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run}.csv'
         _rank_rois_by_beta(
             mean_clean_active,
@@ -824,10 +818,10 @@ def main():
             anat_path=data_paths['anat'],
             ref_img=roi_ref_img,
             out_path=roi_rank_path,
-            atlas_threshold=args.roi_atlas_threshold,
-            label_patterns=args.roi_label_patterns,
-            assume_mni=args.roi_assume_mni,
-            mni_template=args.roi_mni_template,
+            atlas_threshold=roi_atlas_threshold,
+            label_patterns=roi_label_patterns,
+            assume_mni=roi_assume_mni,
+            mni_template=roi_mni_template,
         )
 
 
