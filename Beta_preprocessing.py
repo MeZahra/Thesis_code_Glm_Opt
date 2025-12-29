@@ -446,25 +446,27 @@ def main():
     args = _parse_args()
     data_root = (Path.cwd() / DATA_DIRNAME).resolve()
     
-    fdr_alpha = 0.05
-    hampel_window = 5
-    hampel_threshold = 3.0
-    outlier_percentile = 99.9
-    max_outlier_fraction = 0.5
-    apply_gray_mask = True
-    overlay_threshold_pct = 90.0
-    overlay_vmax_pct = 99.0
-    overlay_stat = 'mean_abs'
-    overlay_positive_only = False
-    cut_coords = None
-    snapshot_path = None
-    skip_roi_ranking = False
-    roi_atlas_threshold = 25
-    roi_label_patterns = None
-    roi_assume_mni = False
+
+    fdr_alpha = 0.05   # FDR alpha for voxelwise t-tests.
+    hampel_window = 5      # Hampel filter window size (voxels).
+    hampel_threshold = 3.0   # Hampel MAD multiplier for outliers.
+    outlier_percentile = 99.9      # Percentile cutoff for beta outliers.
+    max_outlier_fraction = 0.5     # Max outlier fraction per voxel.
+    apply_gray_mask = True      # Restrict analysis to gray mask.
+    overlay_threshold_pct = 90.0      # Overlay threshold percentile.
+    overlay_vmax_pct = 99.0      # Overlay vmax percentile.
+    overlay_stat = 'mean_abs'      # Overlay summary statistic choice.
+    overlay_positive_only = False      # Keep only positive overlay values.
+    cut_coords = None      # Slice coords; None uses precentral ROI.
+    skip_roi_ranking = False      # Skip ROI ranking output.
+    roi_atlas_threshold = 25      # Harvard-Oxford atlas threshold.
+    roi_label_patterns = None      # ROI label filter patterns.
     output_dir = Path.cwd()
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    overlay_html_path = output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{run}.html'
+    overlay_snapshot_path = overlay_html_path.with_suffix(".png")
 
     cached_beta_path = output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy'
 
@@ -478,10 +480,6 @@ def main():
     bold_img = nib.load(str(data_paths['bold']))
 
     roi_ref_img = anat_img
-    if bold_img.shape[:3] != anat_img.shape[:3] or not np.allclose(bold_img.affine, anat_img.affine):
-        roi_ref_img = bold_img
-        print("Warning: anatomy and BOLD grids differ; ROI ranking will use BOLD grid.", flush=True)
-
     cut_coords = tuple(cut_coords) if cut_coords else _precentral_cut_coords(data_root, sub, ses)
     roi_tag = overlay_stat + ("_pos" if overlay_positive_only else "")
 
@@ -495,11 +493,12 @@ def main():
         _save_beta_overlay(
             mean_clean_active,
             anat_img=anat_img,
-            out_html=str(output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{run}.html'),
+            out_html=str(overlay_html_path),
             threshold_pct=overlay_threshold_pct,
             vmax_pct=overlay_vmax_pct,
             cut_coords=cut_coords,
-            snapshot_path=str(snapshot_path) if snapshot_path else None)
+            snapshot_path=str(overlay_snapshot_path),
+        )
         if not skip_roi_ranking:
             roi_rank_path = output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run}.csv'
             _rank_rois_by_beta(
@@ -510,7 +509,7 @@ def main():
                 out_path=roi_rank_path,
                 atlas_threshold=roi_atlas_threshold,
                 label_patterns=roi_label_patterns,
-                assume_mni=roi_assume_mni,
+                assume_mni=False,
             )
         return
 
@@ -681,11 +680,11 @@ def main():
     _save_beta_overlay(
         mean_clean_active,
         anat_img=anat_img,
-        out_html=str(output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{run}.html'),
+        out_html=str(overlay_html_path),
         threshold_pct=overlay_threshold_pct,
         vmax_pct=overlay_vmax_pct,
         cut_coords=cut_coords,
-        snapshot_path=str(snapshot_path) if snapshot_path else None,
+        snapshot_path=str(overlay_snapshot_path),
     )
     if not skip_roi_ranking:
         roi_rank_path = output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run}.csv'
@@ -697,7 +696,7 @@ def main():
             out_path=roi_rank_path,
             atlas_threshold=roi_atlas_threshold,
             label_patterns=roi_label_patterns,
-            assume_mni=roi_assume_mni,
+            assume_mni=False,
         )
 
 
