@@ -95,11 +95,33 @@ def _save_beta_overlay(
         print(f'Saved snapshot: {snapshot_path}', flush=True)
 
 
+def _save_overlay_html(data, anat_img, out_html, title, threshold, vmax, threshold_pct, vmax_pct, cmap='jet', symmetric_cmap = False, cut_coords=None):
+    img = nib.Nifti1Image(data.astype(np.float32), anat_img.affine, anat_img.header)
+    finite = data[np.isfinite(data)]
+
+    if threshold is None and threshold_pct is not None:
+        threshold = float(np.percentile(finite, threshold_pct))
+    if vmax is None and vmax_pct is not None:
+        vmax = float(np.percentile(finite, vmax_pct))
+
+    view = plotting.view_img(img, bg_img=anat_img, cmap=cmap, symmetric_cmap=symmetric_cmap, threshold=threshold, vmax=vmax, colorbar=True, title=title, cut_coords=cut_coords)
+    view.save_as_html(out_html)
+    print(f'Saved overlay: {out_html}', flush=True)
+
+
 def _compute_beta_summary(beta_volume_filter):
     with np.errstate(invalid='ignore'):
         summary = np.nanmean(np.abs(beta_volume_filter), axis=-1)
 
     return summary
+
+
+def _mean_abs_beta_volume(beta, coords, volume_shape):
+    with np.errstate(invalid='ignore'):
+        mean_abs = np.nanmean(np.abs(beta), axis=1)
+    volume = np.full(volume_shape, np.nan, dtype=np.float32)
+    volume[coords] = mean_abs.astype(np.float32)
+    return volume
 
 
 def _find_flirt():
@@ -403,6 +425,8 @@ def main():
     output_dir = Path.cwd()
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    beta_overlay_html_path = output_dir / f'beta_overlay_sub{sub}_ses{ses}_run{run}.html'
+    clean_beta_overlay_html_path = output_dir / f'clean_beta_overlay_sub{sub}_ses{ses}_run{run}.html'
     overlay_html_path = output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{run}.html'
     overlay_snapshot_path = overlay_html_path.with_suffix(".png")
     cached_beta_path = output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy'
@@ -458,6 +482,9 @@ def main():
         bold_data_reshape = bold_data_reshape[~nan_voxels]
         masked_coords = tuple(coord[~nan_voxels] for coord in masked_coords)
     print(f"Beta Shape: {beta.shape}, Bold shape: {bold_data_reshape.shape}")
+    beta_overlay = _mean_abs_beta_volume(beta, masked_coords, bold_data.shape[:3])
+    _save_overlay_html(beta_overlay, anat_img=anat_img, out_html=str(beta_overlay_html_path), title='Mean |beta| (pre-outlier)', 
+                       threshold_pct=overlay_threshold_pct, vmax_pct=overlay_vmax_pct, cut_coords=cut_coords)
 
     print("Remove Outlier Beta Values...")
     med = np.nanmedian(beta, keepdims=True)
@@ -473,22 +500,28 @@ def main():
     clean_beta[~valid_voxels] = np.nan
     clean_beta[np.logical_and(outlier_mask, valid_voxels[:, None])] = np.nan
     keeped_mask = ~np.all(np.isnan(clean_beta), axis=1)
+
     clean_beta = clean_beta[keeped_mask]
     keeped_indices = np.flatnonzero(keeped_mask)
-
     bold_data_reshape[~valid_voxels, :, :] = np.nan
     trial_outliers = np.logical_and(outlier_mask, valid_voxels[:, None])
     bold_data_reshape = np.where(trial_outliers[:, :, None], np.nan, bold_data_reshape)
     bold_data_reshape = bold_data_reshape[keeped_mask]
+    removed_voxels = beta.shape[0] - int(np.sum(keeped_mask))
+    print(f"Outlier filter removed {removed_voxels}/{beta.shape[0]}.")
     print(f"Clean Beta Shape: {clean_beta.shape}, Bold shape: {bold_data_reshape.shape}")
-
+    clean_beta_coords = tuple(coord[keeped_mask] for coord in masked_coords)
+    clean_beta_overlay = _mean_abs_beta_volume(clean_beta, clean_beta_coords, bold_data.shape[:3])
+    _save_overlay_html(clean_beta_overlay, anat_img=anat_img, out_html=str(clean_beta_overlay_html_path), title='Mean |beta| (post-outlier)',
+                       threshold_pct=overlay_threshold_pct, vmax_pct=overlay_vmax_pct, cut_coords=cut_coords)
+    
+    print(f"Apply ttest?: {args.skip_ttest}")
     if args.skip_ttest:
         clean_active_beta = clean_beta
         clean_active_idx = keeped_indices
         clean_active_bold = bold_data_reshape
     else:
         tvals, pvals = ttest_1samp(clean_beta, popmean=0, axis=1, nan_policy='omit')
-
         tested = np.isfinite(pvals)
         rej, q, _, _ = multipletests(pvals[tested], alpha=fdr_alpha, method='fdr_bh')
 
@@ -501,27 +534,23 @@ def main():
         clean_active_beta = clean_beta[reject]
         clean_active_idx = keeped_indices[reject]
         clean_active_bold = bold_data_reshape[reject]
+        print(f"After ttest: Beta Shape: {clean_active_beta.shape}, Bold shape: {clean_active_bold.shape}")
 
     num_trials = clean_active_beta.shape[1]
     clean_active_volume = np.full(bold_data.shape[:3] + (num_trials,), np.nan)
     active_coords = tuple(coord[clean_active_idx] for coord in masked_coords)
     clean_active_volume[active_coords[0], active_coords[1], active_coords[2], :] = clean_active_beta
 
-    print(5, flush=True)
-
+    print(f"Apply spatial filtering?: {args.skip_hampel}")
     if args.skip_hampel:
-        beta_volume_filter = clean_active_volume.astype(np.float32)
-        hampel_stats = {'insufficient_total': 0, 'corrected_total': 0}
+        beta_volume_filter = clean_active_volume
     else:
-        beta_volume_filter, hampel_stats = hampel_filter_image(
-            clean_active_volume.astype(np.float32),
-            window_size=hampel_window,
-            threshold_factor=hampel_threshold,
-            return_stats=True,
-        )
-    print('Total voxels with <3 neighbours:', hampel_stats['insufficient_total'], flush=True)
-    print('Total corrected voxels:', hampel_stats['corrected_total'], flush=True)
+        beta_volume_filter, hampel_stats = hampel_filter_image(clean_active_volume.astype(np.float32), window_size=hampel_window,
+                                                               threshold_factor=hampel_threshold, return_stats=True)
+        print('Total voxels with <3 neighbours:', hampel_stats['insufficient_total'], flush=True)
+        print('Total corrected voxels:', hampel_stats['corrected_total'], flush=True)
 
+    print("Saving Beta preprocessing files ....")
     nan_voxels = np.all(np.isnan(beta_volume_filter), axis=-1)
     mask_2d = nan_voxels.reshape(-1)
 
@@ -541,6 +570,7 @@ def main():
     clean_active_bold = clean_active_bold[keep_mask, ...]
     np.save(output_dir / f"active_bold_sub{sub}_ses{ses}_run{run}.npy", clean_active_bold)
     clean_active_beta = clean_active_beta[keep_mask, ...]
+    print(f"After filtering: Beta Shape: {beta_volume_clean_2d.shape}, Bold shape: {clean_active_bold.shape}")
 
     clean_active_idx = clean_active_idx[keep_mask]
     active_coords = tuple(coord[keep_mask] for coord in active_coords)
