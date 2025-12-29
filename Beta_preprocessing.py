@@ -20,22 +20,6 @@ run = 1
 TRIAL_LEN = 9
 
 # %%
-def _infer_csf_exclusion_threshold(brain_mask, csf_pve, target_voxels):
-    candidates = [0.0, 0.2, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99]
-    counts = {thr: int(np.count_nonzero(brain_mask & ~(csf_pve > thr))) for thr in candidates}
-
-    for thr, count in counts.items():
-        if count == target_voxels:
-            return float(thr)
-
-    best_thr = min(candidates, key=lambda thr: abs(counts[thr] - target_voxels))
-    print(
-        f'Warning: could not exactly match GLMsingle voxel count ({target_voxels}). '
-        f'Using csf_threshold={best_thr} with mask voxels={counts[best_thr]}.',
-        flush=True,
-    )
-    return float(best_thr)
-
 def _precentral_cut_coords(data_root, subject, session):
     roi_path = (
         data_root
@@ -472,11 +456,9 @@ def _parse_args():
     parser.add_argument('--skip-hampel', action='store_true')
     return parser.parse_args()
 
-
 def main():
     args = _parse_args()
     data_root = (Path.cwd() / DATA_DIRNAME).resolve()
-    csf_threshold = None
     fdr_alpha = 0.05
     outlier_percentile = 99.9
     max_outlier_fraction = 0.5
@@ -566,13 +548,8 @@ def main():
     print(f'Loading GLMsingle output: {glmsingle_file}', flush=True)
     glm_dict = np.load(str(glmsingle_file), allow_pickle=True).item()
     beta_glm = glm_dict['betasmd']
-    target_voxels = int(beta_glm.shape[0])
-
-    if csf_threshold is None:
-        csf_thr = _infer_csf_exclusion_threshold(back_mask_data, csf_mask, target_voxels)
-    else:
-        csf_thr = float(csf_threshold)
-    print(f'Using csf_threshold={csf_thr} (target voxels={target_voxels})', flush=True)
+    csf_thr = 0.0
+    print(f'Using csf_threshold={csf_thr}', flush=True)
 
     if mask_mode == 'brain_minus_csf':
         mask = np.logical_and(back_mask_data, ~(csf_mask > csf_thr))
