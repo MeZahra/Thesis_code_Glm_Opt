@@ -43,14 +43,6 @@ def _precentral_cut_coords(data_root, subject, session):
     centroid_world = (roi_img.affine @ np.r_[centroid_vox, 1])[:3]
     return tuple(float(x) for x in centroid_world)
 
-def _load_go_times(path):
-    if path is None or not path.exists():
-        return None
-    arr = np.loadtxt(path, dtype=int)
-    if arr.ndim == 1:
-        arr = arr[np.newaxis, :]
-    return arr
-
 def _load_trial_keep(root, run):
     if root is None:
         return None
@@ -60,15 +52,12 @@ def _load_trial_keep(root, run):
             return np.load(path)
     return None
 
-def _trial_counts(total_trials, num_runs, trial_keep, go_times):
+def _trial_counts(total_trials, num_runs, trial_keep):
     counts = []
     for run_idx in range(num_runs):
         keep = trial_keep[run_idx] if run_idx < len(trial_keep) else None
         if keep is not None:
             counts.append(int(np.count_nonzero(keep)))
-            continue
-        if go_times is not None and run_idx < go_times.shape[0]:
-            counts.append(int(go_times.shape[1]))
             continue
         counts.append(None)
 
@@ -473,10 +462,6 @@ def main():
     roi_atlas_threshold = 25
     roi_label_patterns = None
     roi_assume_mni = False
-    force = False
-    go_times_path = None
-
-
     output_dir = Path.cwd()
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -500,7 +485,7 @@ def main():
     cut_coords = tuple(cut_coords) if cut_coords else _precentral_cut_coords(data_root, sub, ses)
     roi_tag = overlay_stat + ("_pos" if overlay_positive_only else "")
 
-    if cached_beta_path.exists() and not force:
+    if cached_beta_path.exists():
         beta_volume_filter = np.load(cached_beta_path)
         mean_clean_active = _compute_beta_summary(
             beta_volume_filter,
@@ -560,16 +545,13 @@ def main():
 
     masked_bold = masked_bold.astype(np.float32)
 
-    if go_times_path is None:
-        go_times_path = data_root / f'PSPD0{sub}-ses-{ses}-go-times.txt'
-    go_times = _load_go_times(go_times_path)
-    num_runs = go_times.shape[0] if go_times is not None else 2
+    num_runs = 2
 
     trial_keep = []
     for run_idx in range(num_runs):
         trial_keep.append(_load_trial_keep(data_root, run_idx + 1))
 
-    counts = _trial_counts(beta_glm.shape[-1], num_runs, trial_keep, go_times)
+    counts = _trial_counts(beta_glm.shape[-1], num_runs, trial_keep)
     run_index = max(0, run - 1)
     run_index = min(run_index, num_runs - 1)
 
