@@ -1,4 +1,5 @@
 # %%
+# In this file, the brain activation is always reported as absolute value.
 import argparse
 import csv
 import os
@@ -120,19 +121,9 @@ def _save_beta_overlay(
         print(f'Saved snapshot: {snapshot_path}', flush=True)
 
 
-def _compute_beta_summary(beta_volume_filter, overlay_stat):
+def _compute_beta_summary(beta_volume_filter):
     with np.errstate(invalid='ignore'):
-        if overlay_stat == 'mean_abs':
-            summary = np.nanmean(np.abs(beta_volume_filter), axis=-1)
-        elif overlay_stat == 'mean':
-            summary = np.nanmean(beta_volume_filter, axis=-1)
-        else:
-            mean_beta = np.nanmean(beta_volume_filter, axis=-1)
-            finite = mean_beta[np.isfinite(mean_beta)]
-            scale = float(np.nanstd(finite)) if finite.size else 0.0
-            if scale <= 0:
-                scale = 1.0
-            summary = (mean_beta - float(np.nanmean(finite)) if finite.size else mean_beta) / scale
+        summary = np.nanmean(np.abs(beta_volume_filter), axis=-1)
 
     return summary
 
@@ -428,7 +419,6 @@ def main():
     apply_gray_mask = True      # Restrict analysis to gray mask.
     overlay_threshold_pct = 90.0      # Overlay threshold percentile.
     overlay_vmax_pct = 99.0      # Overlay vmax percentile.
-    overlay_stat = 'mean_abs'      # Overlay summary statistic choice.
     cut_coords = None      # Slice coords for overlay; None uses default cuts.
     skip_roi_ranking = False      # Skip ROI ranking output.
     roi_atlas_threshold = 25      # Harvard-Oxford atlas threshold.
@@ -450,16 +440,12 @@ def main():
     anat_img = nib.load(str(data_paths['anat']))
     bold_img = nib.load(str(data_paths['bold']))
 
-    roi_ref_img = anat_img
     cut_coords = tuple(cut_coords) if cut_coords else None
-    roi_tag = overlay_stat
+    roi_tag = 'mean_abs'
 
     if cached_beta_path.exists():
         beta_volume_filter = np.load(cached_beta_path)
-        mean_clean_active = _compute_beta_summary(
-            beta_volume_filter,
-            overlay_stat=overlay_stat,
-        )
+        mean_clean_active = _compute_beta_summary(beta_volume_filter)
         _save_beta_overlay(
             mean_clean_active,
             anat_img=anat_img,
@@ -475,7 +461,7 @@ def main():
                 mean_clean_active,
                 anat_img=anat_img,
                 anat_path=data_paths['anat'],
-                ref_img=roi_ref_img,
+                ref_img=anat_img,
                 out_path=roi_rank_path,
                 atlas_threshold=roi_atlas_threshold,
                 label_patterns=roi_label_patterns,
@@ -641,10 +627,7 @@ def main():
     active_coords = tuple(coord[keep_mask] for coord in active_coords)
     np.save(output_dir / f"active_coords_sub{sub}_ses{ses}_run{run}.npy", active_coords)
 
-    mean_clean_active = _compute_beta_summary(
-        beta_volume_filter,
-        overlay_stat=overlay_stat,
-    )
+    mean_clean_active = _compute_beta_summary(beta_volume_filter)
 
     _save_beta_overlay(
         mean_clean_active,
@@ -661,7 +644,7 @@ def main():
             mean_clean_active,
             anat_img=anat_img,
             anat_path=data_paths['anat'],
-            ref_img=roi_ref_img,
+            ref_img=anat_img,
             out_path=roi_rank_path,
             atlas_threshold=roi_atlas_threshold,
             label_patterns=roi_label_patterns,
