@@ -16,16 +16,16 @@ import scipy.ndimage as ndimage
 from nilearn import datasets, image, plotting
 
 
-DEFAULT_DATA_ROOT = Path(os.environ.get('GLM_DATA_ROOT', Path(__file__).resolve().parent / 'GLMsingle'))
-DEFAULT_GLMSINGLE_ROOT = Path(os.environ.get('GLM_OUTPUT_ROOT', DEFAULT_DATA_ROOT))
-DEFAULT_SUB = os.environ.get('GLM_SUB', '09')
-DEFAULT_SES = int(os.environ.get('GLM_SES', '1'))
-DEFAULT_RUN = int(os.environ.get('GLM_RUN', '1'))
-DEFAULT_TRIAL_LEN = int(os.environ.get('GLM_TRIAL_LEN', '9'))
+DATA_ROOT = Path(__file__).resolve().parent / 'GLMsingle'
+GLMSINGLE_ROOT = DATA_ROOT
+sub = '09'
+ses = 1
+run = 1
+TRIAL_LEN = 9
 
 
 # %%
-def _find_latest_glmsingle_typed_file(root: Path, subject: str, session: int) -> Path:
+def _find_latest_glmsingle_typed_file(root, subject, session):
     ses_int = int(session)
     candidates = [root / f'GLMOutputs-sub{subject}-ses{ses_int}']
     patterns = [f'TYPED_FITHRF_GLMDENOISE_RR.npy']
@@ -42,7 +42,7 @@ def _find_latest_glmsingle_typed_file(root: Path, subject: str, session: int) ->
 
     return max(matches, key=lambda p: p.stat().st_mtime)
 
-def _infer_csf_exclusion_threshold(brain_mask: np.ndarray, csf_pve: np.ndarray, target_voxels: int) -> float:
+def _infer_csf_exclusion_threshold(brain_mask, csf_pve, target_voxels):
     candidates = [0.0, 0.2, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99]
     counts = {thr: int(np.count_nonzero(brain_mask & ~(csf_pve > thr))) for thr in candidates}
 
@@ -58,7 +58,7 @@ def _infer_csf_exclusion_threshold(brain_mask: np.ndarray, csf_pve: np.ndarray, 
     )
     return float(best_thr)
 
-def _precentral_cut_coords(data_root: Path, subject: str, session: int):
+def _precentral_cut_coords(data_root, subject, session):
     roi_path = (
         data_root
         / f'sub-pd0{subject}'
@@ -81,14 +81,14 @@ def _precentral_cut_coords(data_root: Path, subject: str, session: int):
     centroid_world = (roi_img.affine @ np.r_[centroid_vox, 1])[:3]
     return tuple(float(x) for x in centroid_world)
 
-def _resolve_first_match(root: Path, patterns: list[str]) -> Path:
+def _resolve_first_match(root, patterns):
     for pattern in patterns:
         matches = sorted(root.glob(pattern))
         if matches:
             return matches[0]
     raise FileNotFoundError(f'No files matched patterns under {root}: {patterns}')
 
-def _resolve_data_paths(data_root: Path, subject: str, session: int, run: int) -> dict:
+def _resolve_data_paths(data_root, subject, session, run):
     sub_label = f'sub-pd0{subject}'
     ses_label = f'ses-{session}'
     derivatives_dir = data_root / sub_label / ses_label
@@ -122,7 +122,7 @@ def _resolve_data_paths(data_root: Path, subject: str, session: int, run: int) -
 
     return {key: _resolve_first_match(data_root, pats) for key, pats in patterns.items()}
 
-def _resolve_go_times(data_root: Path, subject: str, session: int) -> Path | None:
+def _resolve_go_times(data_root, subject, session):
     candidates = [
         data_root / f'PSPD0{subject}-ses-{session}-go-times.txt',
         data_root / f'PSPD0{subject}-ses-{session:02d}-go-times.txt',
@@ -132,7 +132,7 @@ def _resolve_go_times(data_root: Path, subject: str, session: int) -> Path | Non
             return candidate
     return None
 
-def _load_go_times(path: Path | None) -> np.ndarray | None:
+def _load_go_times(path):
     if path is None or not path.exists():
         return None
     arr = np.loadtxt(path, dtype=int)
@@ -140,7 +140,7 @@ def _load_go_times(path: Path | None) -> np.ndarray | None:
         arr = arr[np.newaxis, :]
     return arr
 
-def _load_trial_keep(root: Path, run: int) -> np.ndarray | None:
+def _load_trial_keep(root, run):
     if root is None:
         return None
     for pattern in (f'trial_keep_run{run}.npy', f'trial_keep_run{run:02d}.npy'):
@@ -149,7 +149,7 @@ def _load_trial_keep(root: Path, run: int) -> np.ndarray | None:
             return np.load(path)
     return None
 
-def _trial_counts(total_trials: int, num_runs: int, trial_keep: list[np.ndarray | None], go_times: np.ndarray | None):
+def _trial_counts(total_trials, num_runs, trial_keep, go_times):
     counts = []
     for run_idx in range(num_runs):
         keep = trial_keep[run_idx] if run_idx < len(trial_keep) else None
@@ -243,11 +243,7 @@ def _save_beta_overlay(
         print(f'Saved snapshot: {snapshot_path}', flush=True)
 
 
-def _compute_beta_summary(
-    beta_volume_filter: np.ndarray,
-    overlay_stat: str,
-    overlay_positive_only: bool,
-) -> np.ndarray:
+def _compute_beta_summary(beta_volume_filter, overlay_stat, overlay_positive_only):
     with np.errstate(invalid='ignore'):
         if overlay_stat == 'mean_abs':
             summary = np.nanmean(np.abs(beta_volume_filter), axis=-1)
@@ -264,7 +260,7 @@ def _compute_beta_summary(
         if overlay_positive_only:
             summary = np.where(summary > 0, summary, np.nan)
 
-    return summary.astype(np.float32)
+    return summary
 
 
 def _find_flirt():
@@ -544,14 +540,8 @@ def hampel_filter_image(image, window_size, threshold_factor, return_stats=False
 
 def _parse_args():
     parser = argparse.ArgumentParser(description='Beta preprocessing for GLMsingle outputs.')
-    parser.add_argument('--subject', default=DEFAULT_SUB)
-    parser.add_argument('--session', type=int, default=DEFAULT_SES)
-    parser.add_argument('--run', type=int, default=DEFAULT_RUN)
-    parser.add_argument('--data-root', type=Path, default=DEFAULT_DATA_ROOT)
-    parser.add_argument('--glmsingle-root', type=Path, default=DEFAULT_GLMSINGLE_ROOT)
     parser.add_argument('--typed-path', type=Path, default=None)
     parser.add_argument('--output-dir', type=Path, default=None)
-    parser.add_argument('--trial-len', type=int, default=DEFAULT_TRIAL_LEN)
     parser.add_argument('--gray-threshold', type=float, default=0.5)
     parser.add_argument('--apply-gray-mask', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--mask-mode', default='brain_minus_csf', choices=('brain_minus_csf', 'brain_only', 'gray_only', 'gray_minus_csf'))
@@ -581,12 +571,8 @@ def _parse_args():
 
 def main():
     args = _parse_args()
-    sub = args.subject
-    ses = args.session
-    run = args.run
-
-    data_root = args.data_root.expanduser().resolve()
-    glmsingle_root = args.glmsingle_root.expanduser().resolve()
+    data_root = DATA_ROOT.expanduser().resolve()
+    glmsingle_root = GLMSINGLE_ROOT.expanduser().resolve()
 
     output_dir = args.output_dir
     if output_dir is None:
@@ -708,7 +694,7 @@ def main():
     num_trials = int(keep.shape[0]) if keep is not None else beta.shape[-1]
     bold_data_reshape = _extract_trial_segments(
         masked_bold,
-        trial_len=args.trial_len,
+        trial_len=TRIAL_LEN,
         num_trials=num_trials,
         rest_every=30,
         rest_len=20
