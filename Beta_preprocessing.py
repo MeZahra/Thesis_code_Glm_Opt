@@ -85,7 +85,7 @@ def _save_beta_overlay(mean_abs_beta, anat_img, out_html, threshold_pct, vmax_pc
     print(f'Saved overlay: {out_html}', flush=True)
 
     if snapshot_path:
-        display = plotting.plot_stat_map(img, bg_img=anat_img, cmap='inferno', symmetric_cmap=False, threshold=thr, vmax=vmax, colorbar=True, 
+        display = plotting.plot_stat_map(img, bg_img=anat_img, cmap='inferno', symmetric_cbar=False, threshold=thr, vmax=vmax, colorbar=True, 
                                          title=f'Mean |beta| (thr p{threshold_pct}, vmax p{vmax_pct})',cut_coords=cut_coords)
         display.savefig(snapshot_path)
         display.close()
