@@ -20,29 +20,6 @@ run = 1
 TRIAL_LEN = 9
 
 # %%
-def _precentral_cut_coords(data_root, subject, session):
-    roi_path = (
-        data_root
-        / f'sub-pd0{subject}'
-        / f'ses-{session}'
-        / 'func'
-        / 'atlas_files'
-        / 'rois'
-        / 'precentral.nii.gz'
-    )
-    if not roi_path.exists():
-        return None
-
-    roi_img = nib.load(str(roi_path))
-    roi_data = roi_img.get_fdata() > 0
-    if not np.any(roi_data):
-        return None
-
-    coords_vox = np.array(np.where(roi_data)).T
-    centroid_vox = coords_vox.mean(axis=0)
-    centroid_world = (roi_img.affine @ np.r_[centroid_vox, 1])[:3]
-    return tuple(float(x) for x in centroid_world)
-
 def _load_trial_keep(root, run):
     if root is None:
         return None
@@ -143,7 +120,7 @@ def _save_beta_overlay(
         print(f'Saved snapshot: {snapshot_path}', flush=True)
 
 
-def _compute_beta_summary(beta_volume_filter, overlay_stat, overlay_positive_only):
+def _compute_beta_summary(beta_volume_filter, overlay_stat):
     with np.errstate(invalid='ignore'):
         if overlay_stat == 'mean_abs':
             summary = np.nanmean(np.abs(beta_volume_filter), axis=-1)
@@ -156,9 +133,6 @@ def _compute_beta_summary(beta_volume_filter, overlay_stat, overlay_positive_onl
             if scale <= 0:
                 scale = 1.0
             summary = (mean_beta - float(np.nanmean(finite)) if finite.size else mean_beta) / scale
-
-        if overlay_positive_only:
-            summary = np.where(summary > 0, summary, np.nan)
 
     return summary
 
@@ -446,7 +420,6 @@ def main():
     args = _parse_args()
     data_root = (Path.cwd() / DATA_DIRNAME).resolve()
     
-
     fdr_alpha = 0.05   # FDR alpha for voxelwise t-tests.
     hampel_window = 5      # Hampel filter window size (voxels).
     hampel_threshold = 3.0   # Hampel MAD multiplier for outliers.
@@ -456,18 +429,16 @@ def main():
     overlay_threshold_pct = 90.0      # Overlay threshold percentile.
     overlay_vmax_pct = 99.0      # Overlay vmax percentile.
     overlay_stat = 'mean_abs'      # Overlay summary statistic choice.
-    overlay_positive_only = False      # Keep only positive overlay values.
-    cut_coords = None      # Slice coords; None uses precentral ROI.
+    cut_coords = None      # Slice coords for overlay; None uses default cuts.
     skip_roi_ranking = False      # Skip ROI ranking output.
     roi_atlas_threshold = 25      # Harvard-Oxford atlas threshold.
     roi_label_patterns = None      # ROI label filter patterns.
+    
     output_dir = Path.cwd()
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-
     overlay_html_path = output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{run}.html'
     overlay_snapshot_path = overlay_html_path.with_suffix(".png")
-
     cached_beta_path = output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy'
 
     sub_label = f'sub-pd0{sub}'
@@ -480,15 +451,14 @@ def main():
     bold_img = nib.load(str(data_paths['bold']))
 
     roi_ref_img = anat_img
-    cut_coords = tuple(cut_coords) if cut_coords else _precentral_cut_coords(data_root, sub, ses)
-    roi_tag = overlay_stat + ("_pos" if overlay_positive_only else "")
+    cut_coords = tuple(cut_coords) if cut_coords else None
+    roi_tag = overlay_stat
 
     if cached_beta_path.exists():
         beta_volume_filter = np.load(cached_beta_path)
         mean_clean_active = _compute_beta_summary(
             beta_volume_filter,
             overlay_stat=overlay_stat,
-            overlay_positive_only=overlay_positive_only,
         )
         _save_beta_overlay(
             mean_clean_active,
@@ -674,7 +644,6 @@ def main():
     mean_clean_active = _compute_beta_summary(
         beta_volume_filter,
         overlay_stat=overlay_stat,
-        overlay_positive_only=overlay_positive_only,
     )
 
     _save_beta_overlay(
