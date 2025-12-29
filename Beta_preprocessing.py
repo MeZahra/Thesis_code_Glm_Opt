@@ -5,7 +5,6 @@ import os
 import shutil
 import subprocess
 import tempfile
-from os.path import join
 from pathlib import Path
 import nibabel as nib
 import numpy as np
@@ -14,33 +13,13 @@ from statsmodels.stats.multitest import multipletests
 import scipy.ndimage as ndimage
 from nilearn import datasets, image, plotting
 
-
-DATA_ROOT = Path(__file__).resolve().parent / 'GLMsingle'
-GLMSINGLE_ROOT = DATA_ROOT
+DATA_DIRNAME = 'sub09_ses1'
 sub = '09'
 ses = 1
 run = 1
 TRIAL_LEN = 9
 
-
 # %%
-def _find_latest_glmsingle_typed_file(root, subject, session):
-    ses_int = int(session)
-    candidates = [root / f'GLMOutputs-sub{subject}-ses{ses_int}']
-    patterns = [f'TYPED_FITHRF_GLMDENOISE_RR.npy']
-
-    matches: list[Path] = []
-    for directory in candidates:
-        if not directory.exists():
-            continue
-        for pattern in patterns:
-            matches.extend(directory.glob(pattern))
-
-    if not matches:
-        raise FileNotFoundError(f'Could not find GLMsingle TYPE-D output under {root} for sub={subject}, ses={session}.')
-
-    return max(matches, key=lambda p: p.stat().st_mtime)
-
 def _infer_csf_exclusion_threshold(brain_mask, csf_pve, target_voxels):
     candidates = [0.0, 0.2, 0.5, 0.7, 0.8, 0.9, 0.95, 0.99]
     counts = {thr: int(np.count_nonzero(brain_mask & ~(csf_pve > thr))) for thr in candidates}
@@ -79,57 +58,6 @@ def _precentral_cut_coords(data_root, subject, session):
     centroid_vox = coords_vox.mean(axis=0)
     centroid_world = (roi_img.affine @ np.r_[centroid_vox, 1])[:3]
     return tuple(float(x) for x in centroid_world)
-
-def _resolve_first_match(root, patterns):
-    for pattern in patterns:
-        matches = sorted(root.glob(pattern))
-        if matches:
-            return matches[0]
-    raise FileNotFoundError(f'No files matched patterns under {root}: {patterns}')
-
-def _resolve_data_paths(data_root, subject, session, run):
-    sub_label = f'sub-pd0{subject}'
-    ses_label = f'ses-{session}'
-    derivatives_dir = data_root / sub_label / ses_label
-
-    bold_name = f'{sub_label}_ses-{session}_run-{run}_task-mv_bold_corrected_smoothed_reg.nii.gz'
-    brain_mask_name = f'{sub_label}_ses-{session}_T1w_brain_mask.nii.gz'
-    csf_name = f'{sub_label}_ses-{session}_T1w_brain_pve_0.nii.gz'
-    gray_name = f'{sub_label}_ses-{session}_T1w_brain_pve_1.nii.gz'
-    anat_name = f'{sub_label}_ses-{session}_T1w_brain.nii.gz'
-
-    if derivatives_dir.exists():
-        anat_dir = derivatives_dir / 'anat'
-        func_dir = derivatives_dir / 'func'
-        bold_path = func_dir / bold_name
-        if bold_path.exists():
-            return {
-                'bold': bold_path,
-                'brain': anat_dir / brain_mask_name,
-                'csf': anat_dir / csf_name,
-                'gray': anat_dir / gray_name,
-                'anat': anat_dir / anat_name,
-            }
-
-    patterns = {
-        'bold': [bold_name, f'{sub_label}_ses-{session:02d}_run-{run}_task-mv_bold_corrected_smoothed_reg.nii.gz'],
-        'brain': [brain_mask_name, f'{sub_label}_ses-{session:02d}_T1w_brain_mask.nii.gz'],
-        'csf': [csf_name, f'{sub_label}_ses-{session:02d}_T1w_brain_pve_0.nii.gz'],
-        'gray': [gray_name, f'{sub_label}_ses-{session:02d}_T1w_brain_pve_1.nii.gz'],
-        'anat': [anat_name, f'{sub_label}_ses-{session:02d}_T1w_brain.nii.gz'],
-    }
-
-    return {key: _resolve_first_match(data_root, pats) for key, pats in patterns.items()}
-
-def _resolve_go_times(data_root, subject, session):
-    candidates = [
-        data_root / f'PSPD0{subject}-ses-{session}-go-times.txt',
-        data_root / f'PSPD0{subject}-ses-{session:02d}-go-times.txt',
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return None
 
 def _load_go_times(path):
     if path is None or not path.exists():
@@ -547,9 +475,7 @@ def _parse_args():
 
 def main():
     args = _parse_args()
-    data_root = DATA_ROOT.expanduser().resolve()
-    glmsingle_root = GLMSINGLE_ROOT.expanduser().resolve()
-    typed_path = None
+    data_root = (Path.cwd() / DATA_DIRNAME).resolve()
     csf_threshold = None
     fdr_alpha = 0.05
     outlier_percentile = 99.9
@@ -578,7 +504,12 @@ def main():
 
     cached_beta_path = output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy'
 
-    data_paths = _resolve_data_paths(data_root, sub, ses, run)
+    sub_label = f'sub-pd0{sub}'
+    data_paths = {'bold': data_root / f'{sub_label}_ses-{ses}_run-{run}_task-mv_bold_corrected_smoothed_reg.nii.gz',
+        'brain': data_root / f'{sub_label}_ses-{ses}_T1w_brain_mask.nii.gz',
+        'csf': data_root / f'{sub_label}_ses-{ses}_T1w_brain_pve_0.nii.gz',
+        'gray': data_root / f'{sub_label}_ses-{ses}_T1w_brain_pve_1.nii.gz',
+        'anat': data_root / f'{sub_label}_ses-{ses}_T1w_brain.nii.gz'}
     anat_img = nib.load(str(data_paths['anat']))
     bold_img = nib.load(str(data_paths['bold']))
 
@@ -631,10 +562,9 @@ def main():
     back_mask_data = back_mask > 0
     gray_mask_data = gray_mask > args.gray_threshold
 
-    if typed_path is None:
-        typed_path = _find_latest_glmsingle_typed_file(glmsingle_root, sub, ses)
-    print(f'Loading GLMsingle output: {typed_path}', flush=True)
-    glm_dict = np.load(str(typed_path), allow_pickle=True).item()
+    glmsingle_file = data_root / 'TYPED_FITHRF_GLMDENOISE_RR.npy'
+    print(f'Loading GLMsingle output: {glmsingle_file}', flush=True)
+    glm_dict = np.load(str(glmsingle_file), allow_pickle=True).item()
     beta_glm = glm_dict['betasmd']
     target_voxels = int(beta_glm.shape[0])
 
@@ -666,13 +596,13 @@ def main():
     masked_bold = masked_bold.astype(np.float32)
 
     if go_times_path is None:
-        go_times_path = _resolve_go_times(data_root, sub, ses)
+        go_times_path = data_root / f'PSPD0{sub}-ses-{ses}-go-times.txt'
     go_times = _load_go_times(go_times_path)
     num_runs = go_times.shape[0] if go_times is not None else 2
 
     trial_keep = []
     for run_idx in range(num_runs):
-        trial_keep.append(_load_trial_keep(Path(typed_path).parent, run_idx + 1))
+        trial_keep.append(_load_trial_keep(data_root, run_idx + 1))
 
     counts = _trial_counts(beta_glm.shape[-1], num_runs, trial_keep, go_times)
     run_index = max(0, run - 1)
