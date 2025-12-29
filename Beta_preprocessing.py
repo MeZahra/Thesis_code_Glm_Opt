@@ -259,15 +259,14 @@ def _align_atlas_to_reference(
     ref_img,
     out_dir,
     assume_mni=False,
-    mni_template=None,
 ):
     use_flirt = False
     flirt_path = None
     mni_template_img = None
     if not assume_mni:
         flirt_path = _find_flirt()
-        mni_template = mni_template or _default_mni_template()
-        if flirt_path and mni_template and Path(mni_template).exists():
+        mni_template = _default_mni_template()
+        if flirt_path and mni_template and mni_template.exists():
             try:
                 _compute_mni_to_anat(mni_template, anat_path, out_dir, flirt_path)
                 use_flirt = True
@@ -341,7 +340,6 @@ def _rank_rois_by_beta(
     atlas_threshold: int,
     label_patterns: str | None,
     assume_mni: bool,
-    mni_template: Path | None,
 ):
     atlas = datasets.fetch_atlas_harvard_oxford(f"cort-maxprob-thr{atlas_threshold}-2mm")
     atlas_img = atlas.maps if isinstance(atlas.maps, nib.Nifti1Image) else nib.load(atlas.maps)
@@ -363,7 +361,6 @@ def _rank_rois_by_beta(
         ref_img,
         out_path.parent,
         assume_mni=assume_mni,
-        mni_template=mni_template,
     )
     atlas_data = np.rint(atlas_in_ref.get_fdata(dtype=np.float32)).astype(int)
 
@@ -459,11 +456,13 @@ def _parse_args():
 def main():
     args = _parse_args()
     data_root = (Path.cwd() / DATA_DIRNAME).resolve()
+    
     fdr_alpha = 0.05
+    hampel_window = 5
+    hampel_threshold = 3.0
     outlier_percentile = 99.9
     max_outlier_fraction = 0.5
     apply_gray_mask = True
-    mask_mode = 'brain_minus_csf'
     overlay_threshold_pct = 90.0
     overlay_vmax_pct = 99.0
     overlay_stat = 'mean_abs'
@@ -474,11 +473,9 @@ def main():
     roi_atlas_threshold = 25
     roi_label_patterns = None
     roi_assume_mni = False
-    roi_mni_template = None
     force = False
     go_times_path = None
-    hampel_window = 5
-    hampel_threshold = 3.0
+
 
     output_dir = Path.cwd()
     output_dir = output_dir.expanduser().resolve()
@@ -529,7 +526,6 @@ def main():
                 atlas_threshold=roi_atlas_threshold,
                 label_patterns=roi_label_patterns,
                 assume_mni=roi_assume_mni,
-                mni_template=roi_mni_template,
             )
         return
 
@@ -551,17 +547,9 @@ def main():
     csf_thr = 0.0
     print(f'Using csf_threshold={csf_thr}', flush=True)
 
-    if mask_mode == 'brain_minus_csf':
-        mask = np.logical_and(back_mask_data, ~(csf_mask > csf_thr))
-    elif mask_mode == 'brain_only':
-        mask = back_mask_data
-    elif mask_mode == 'gray_only':
-        mask = gray_mask_data
-    else:
-        mask = np.logical_and(gray_mask_data, ~(csf_mask > csf_thr))
-
+    mask = np.logical_and(back_mask_data, ~(csf_mask > csf_thr))
     nonzero_mask = np.where(mask)
-    if apply_gray_mask and mask_mode not in ('gray_only', 'gray_minus_csf'):
+    if apply_gray_mask:
         keep_voxels = gray_mask_data[nonzero_mask]
     else:
         keep_voxels = np.ones(nonzero_mask[0].shape[0], dtype=bool)
@@ -728,7 +716,6 @@ def main():
             atlas_threshold=roi_atlas_threshold,
             label_patterns=roi_label_patterns,
             assume_mni=roi_assume_mni,
-            mni_template=roi_mni_template,
         )
 
 
