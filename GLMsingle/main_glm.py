@@ -20,14 +20,12 @@ subject_id = '09'
 session_id = '1'
 runs = ['1', '2']
 
-bold_template = 'sub-pd0{sub}_ses-{ses}_run-{run}_task-mv_bold_corrected_smoothed_reg.nii.gz'
+bold = 'sub-pd0{sub}_ses-{ses}_run-{run}_task-mv_bold_corrected_smoothed_reg.nii.gz'
 brain_mask_template = 'sub-pd0{sub}_ses-{ses}_T1w_brain_mask.nii.gz'
 csf_mask_template = 'sub-pd0{sub}_ses-{ses}_T1w_brain_pve_0.nii.gz'
 gray_mask_template = 'sub-pd0{sub}_ses-{ses}_T1w_brain_pve_1.nii.gz'
 anat_template = 'sub-pd0{sub}_ses-{ses}_T1w_brain.nii.gz'
-go_times_root = Path(
-    '/mnt/TeamShare/Data_Masterfile/Zahra-Thesis-Data/Master_Thesis_Files/GLM_single_results/Go-times'
-)
+go_times_root = Path('/mnt/TeamShare/Data_Masterfile/Zahra-Thesis-Data/Master_Thesis_Files/GLM_single_results/Go-times')
 go_times_template = 'PSPD0{sub}-ses-{ses}-go-times.txt'
 
 mask_threshold_brain = 0.0
@@ -54,28 +52,28 @@ glmsingle_wantfracridge = 1
 glmsingle_wantfileoutputs = [1, 1, 1, 1]
 glmsingle_wantmemoryoutputs = [0, 0, 0, 1]
 
-run_beta = True
-beta_subject = None
-beta_session = None
-beta_run = None
-beta_typed_path = None
-beta_output_dir = None
-beta_data_root = None
-beta_glmsingle_root = None
-beta_extra_args = []
+# run_beta = True
+# beta_subject = None
+# beta_session = None
+# beta_run = None
+# beta_typed_path = None
+# beta_output_dir = None
+# beta_data_root = None
+# beta_glmsingle_root = None
+# beta_extra_args = []
 
-run_roi = True
-atlas_threshold = 25
-summary_stat = 'mean_abs'
-top_n = 10
-motor_patterns = ['Precentral Gyrus']
-motor_corr_threshold = 0.0
-motor_corr_abs = False
-atlas_register = False
-atlas_register_reference = 'anat'
-atlas_register_force = False
-atlas_mni_template = None
-atlas_data_dir = None
+# run_roi = True
+# atlas_threshold = 25
+# summary_stat = 'mean_abs'
+# top_n = 10
+# motor_patterns = ['Precentral Gyrus']
+# motor_corr_threshold = 0.0
+# motor_corr_abs = False
+# atlas_register = False
+# atlas_register_reference = 'anat'
+# atlas_register_force = False
+# atlas_mni_template = None
+# atlas_data_dir = None
 
 
 def apply_mask(anat_data, bold_data, nonzero_mask):
@@ -85,32 +83,13 @@ def apply_mask(anat_data, bold_data, nonzero_mask):
     print('bold_data masked shape:', cleaned_bold_data.shape)
     return cleaned_bold_data, cleaned_anat_data
 
-def _build_mask(brain_mask, csf_mask, gray_mask, mask_mode: str):
+def _build_mask(brain_mask, csf_mask, gray_mask, mask_mode):
     if mask_mode == 'brain_csf':
         return np.logical_and(brain_mask, ~csf_mask)
     if mask_mode == 'brain_csf_gray':
         return np.logical_and(brain_mask, np.logical_and(gray_mask, ~csf_mask))
 
-def _extract_regressors(bold_run, brain_mask, csf_mask, gray_mask, mode: str):
-    if mode == 'none':
-        return None
-    parts = [p.strip() for p in mode.split('+') if p.strip()]
-    regressors = []
-    for part in parts:
-        if part == 'csf':
-            regressors.append(np.mean(bold_run[csf_mask], axis=0))
-        elif part == 'gray':
-            regressors.append(np.mean(bold_run[gray_mask], axis=0))
-        elif part in {'brain', 'global'}:
-            regressors.append(np.mean(bold_run[brain_mask], axis=0))
-        else:
-            raise ValueError(f'Unknown regressor mode: {part}')
-    if not regressors:
-        return None
-    return np.vstack(regressors).T.astype(np.float32)
-
-
-def _trial_onsets_from_blocks(num_trials, stimdur, trials_per_block, rest_tr, total_timepoints=None):
+def _trial_onsets_from_blocks(num_trials, stimdur, trials_per_block, rest_tr):
     onsets = []
     onset = 1
     for trial_idx in range(num_trials):
@@ -119,29 +98,13 @@ def _trial_onsets_from_blocks(num_trials, stimdur, trials_per_block, rest_tr, to
         if (trial_idx + 1) % trials_per_block == 0 and (trial_idx + 1) < num_trials:
             onset += rest_tr
     onsets = np.array(onsets, dtype=np.int32)
-    if total_timepoints is not None:
-        expected_end = int(onsets[-1]) - 1 + stimdur
-        if expected_end > total_timepoints:
-            raise ValueError(
-                f'Expected {expected_end} TRs from trial structure, but only have {total_timepoints}.'
-            )
-        if expected_end < total_timepoints:
-            print(
-                f'Warning: expected {expected_end} TRs from trial structure, '
-                f'but have {total_timepoints}. Trailing TRs will be ignored.'
-            )
     return onsets
-
 
 def _trial_metrics(masked_bold, onsets, stimdur, metric):
     metrics = []
     for onset in onsets:
         start = int(onset) - 1
         end = start + stimdur
-        if end > masked_bold.shape[1]:
-            raise ValueError(
-                f'Trial window [{start}:{end}) exceeds BOLD length {masked_bold.shape[1]}.'
-            )
         segment = masked_bold[:, start:end]
         if metric == 'mean_abs':
             value = float(np.nanmean(np.abs(segment)))
@@ -154,7 +117,6 @@ def _trial_metrics(masked_bold, onsets, stimdur, metric):
             raise ValueError(f'Unknown trial metric: {metric}')
         metrics.append(value)
     return np.array(metrics, dtype=np.float32)
-
 
 def _trial_keep_mask(metrics, z_thr, fallback_pct, max_drop_fraction):
     if z_thr <= 0:
@@ -187,156 +149,132 @@ sub = subject_id
 ses = session_id
 runs = list(runs)
 
-files_cfg = {
-    'bold_template': bold_template,
-    'brain_mask': brain_mask_template,
-    'csf_mask': csf_mask_template,
-    'gray_mask': gray_mask_template,
-    'anat': anat_template,
-}
+files_cfg = {'bold_template': bold, 'brain_mask': brain_mask_template, 'csf_mask': csf_mask_template, 'gray_mask': gray_mask_template, 'anat': anat_template}
 
 data_root = Path(__file__).resolve().parent
 data_root = data_root.expanduser().resolve()
 outputdir_glmsingle = data_root / f'GLMOutputs-sub{sub}-ses{ses}'
 go_times_path = go_times_root / go_times_template.format(sub=sub, ses=ses)
+outputdir_glmsingle.mkdir(parents=True, exist_ok=True)
+data_dir = data_root.parent / 'sub09_ses1'
+anat_dir = data_dir
+func_dir = data_dir
 
+brain_mask = nib.load(join(anat_dir, files_cfg['brain_mask'].format(sub=sub, ses=ses)))
+csf_mask = nib.load(join(anat_dir, files_cfg['csf_mask'].format(sub=sub, ses=ses)))
+gray_mask = nib.load(join(anat_dir, files_cfg['gray_mask'].format(sub=sub, ses=ses)))
+anat_file = nib.load(join(anat_dir, files_cfg['anat'].format(sub=sub, ses=ses)))
 
-typed_path = data_root / f'TYPED_FITHRF_GLMDENOISE_RR_sub{sub}_ses{int(ses):02d}.npy'
-if not typed_path.exists():
-    typed_path = None
+brain_mask_data = brain_mask.get_fdata() > mask_threshold_brain
+csf_mask_data = csf_mask.get_fdata() > mask_threshold_csf
+gray_mask_data = gray_mask.get_fdata() > mask_threshold_gray
+mask = _build_mask(brain_mask_data, csf_mask_data, gray_mask_data, mask_mode)
+mask_indices = np.where(mask)
 
-run_glm = typed_path is None
-if not run_glm:
-    if typed_path is not None:
-        print(f'Using existing GLMsingle output: {typed_path}', flush=True)
-    print('Skipping GLMsingle fit.', flush=True)
+print('Combined mask voxels:', mask_indices[0].size)
+anat_data = anat_file.get_fdata(dtype=np.float32)
 
-if run_glm:
-    outputdir_glmsingle.mkdir(parents=True, exist_ok=True)
+# %%
+run_timepoints = None
 
-    anat_dir, func_dir = _resolve_data_dirs(data_root, sub, ses)
+data = []
+extraregressors = []
+trial_keep_by_run = []
 
-    brain_mask = nib.load(join(anat_dir, files_cfg['brain_mask'].format(sub=sub, ses=ses)))
-    csf_mask = nib.load(join(anat_dir, files_cfg['csf_mask'].format(sub=sub, ses=ses)))
-    gray_mask = nib.load(join(anat_dir, files_cfg['gray_mask'].format(sub=sub, ses=ses)))
-    anat_file = nib.load(join(anat_dir, files_cfg['anat'].format(sub=sub, ses=ses)))
+for run in runs:
+    bold_name = files_cfg['bold_template'].format(sub=sub, ses=ses, run=run)
+    bold_path = join(func_dir, bold_name)
+    bold_run = nib.load(bold_path).get_fdata(dtype=np.float32)
+    masked_bold, _ = apply_mask(anat_data, bold_run, mask_indices)
+    data.append(masked_bold)
 
-    brain_mask_data = brain_mask.get_fdata() > mask_threshold_brain
-    csf_mask_data = csf_mask.get_fdata() > mask_threshold_csf
-    gray_mask_data = gray_mask.get_fdata() > mask_threshold_gray
-    mask = _build_mask(brain_mask_data, csf_mask_data, gray_mask_data, mask_mode)
-    mask_indices = np.where(mask)
+    if run_timepoints is None:
+        run_timepoints = bold_run.shape[-1]
+    
+    extraregressors.append(np.mean(bold_run[csf_mask], axis=0))
+extraregressors = np.vstack(extraregressors).T.astype(np.float32)
 
-    print('Combined mask voxels:', mask_indices[0].size)
+del anat_data
 
-    anat_data = anat_file.get_fdata(dtype=np.float32)
-
-    # %%
-    run_timepoints = None
-
-    data = []
-    extraregressors = []
-    trial_keep_by_run = []
-
-    for run in runs:
-        bold_name = files_cfg['bold_template'].format(sub=sub, ses=ses, run=run)
-        bold_path = join(func_dir, bold_name)
-        bold_run = nib.load(bold_path).get_fdata(dtype=np.float32)
-        masked_bold, _ = apply_mask(anat_data, bold_run, mask_indices)
-        data.append(masked_bold)
-
-        if run_timepoints is None:
-            run_timepoints = bold_run.shape[-1]
-
-        regressors = _extract_regressors(bold_run, brain_mask_data, csf_mask_data, gray_mask_data, extra_mode)
-        if regressors is not None:
-            extraregressors.append(regressors)
-        print(f'Run {run}: masked data shape {masked_bold.shape}')
-
-    del anat_data
-
-    # %%
-    run_timepoints = run_timepoints or data[0].shape[-1]
-    configured_timepoints = design_timepoints
-    if configured_timepoints is None:
-        T = run_timepoints
-    else:
-        T = configured_timepoints
-        if T != run_timepoints:
-            print(f'Warning: configured timepoints ({T}) differ from BOLD length ({run_timepoints}).')
-
-    num_trials = int(design_num_trials)
-    stimdur = int(design_stimdur)
-    tr = float(design_tr)
-
-    go_flag = np.loadtxt(go_times_path, dtype=int)
-    if go_flag.ndim == 1:
-        go_flag = go_flag[np.newaxis, :]
-    if go_flag.shape[0] < len(runs):
-        raise ValueError('Go-times file does not contain enough rows for the configured runs.')
-    if go_flag.shape[1] < num_trials:
-        raise ValueError('Go-times file does not contain enough trials for the configured design.')
-
-    run_onsets_metric = _trial_onsets_from_blocks(
-        num_trials,
-        stimdur,
-        trial_block_size,
-        trial_rest_trs,
-        total_timepoints=T,
-    )
-
-    trial_keep_by_run = []
-    for idx, run in enumerate(runs):
-        metrics = _trial_metrics(data[idx], run_onsets_metric, stimdur, trial_metric)
-        keep = _trial_keep_mask(metrics, trial_z, trial_fallback, trial_max_drop)
-        trial_keep_by_run.append(keep)
-        np.save(outputdir_glmsingle / f'trial_keep_run{run}.npy', keep)
-        np.save(outputdir_glmsingle / f'trial_metric_run{run}.npy', metrics)
-        dropped = int(np.count_nonzero(~keep))
-        print(f'Run {run}: dropping {dropped}/{len(keep)} trials (metric={trial_metric}).')
-
-    # %%
-    design_matrix = []
-    for idx, run in enumerate(runs):
-        design = np.zeros((T, 1), dtype=int)
-        run_onsets_design = go_flag[idx][:num_trials]
-        keep = trial_keep_by_run[idx]
-        for onset, keep_trial in zip(run_onsets_design, keep):
-            if not keep_trial:
-                continue
-            onset_idx = onset - 1
-            if onset_idx < 0 or onset_idx >= T:
-                raise ValueError(f'Invalid onset {onset} for run {run} with T={T}')
-            design[onset_idx, 0] = 1
-        design_matrix.append(design)
-
-    opt = {
-        'wantlibrary': glmsingle_wantlibrary,
-        'wantglmdenoise': int(glmsingle_wantglmdenoise),
-        'wantfracridge': int(glmsingle_wantfracridge),
-        'wantfileoutputs': glmsingle_wantfileoutputs,
-        'wantmemoryoutputs': glmsingle_wantmemoryoutputs,
-    }
-    if extraregressors and len(extraregressors) == len(runs):
-        opt['extra_regressors'] = extraregressors
-
-    # %%
-    glmsingle_obj = GLM_single(opt)
-    start_time = time.time()
-
-    print('running GLMsingle...')
-    process = psutil.Process()
-    memory_before = process.memory_info().rss / 1024 / 1024 / 1024
-    print(f'Memory usage before GLMsingle: {memory_before:.2f} GB')
-
-    gc.collect()
-    results_glmsingle = glmsingle_obj.fit(design_matrix, data, stimdur, tr, outputdir=str(outputdir_glmsingle))
-
-    elapsed_time = time.time() - start_time
-
-    print('\telapsed time: ', f'{time.strftime("%H:%M:%S", time.gmtime(elapsed_time))}')
+# %%
+run_timepoints = run_timepoints or data[0].shape[-1]
+configured_timepoints = design_timepoints
+if configured_timepoints is None:
+    T = run_timepoints
 else:
-    print('Skipping GLMsingle fit; using existing outputs if available.', flush=True)
+    T = configured_timepoints
+    if T != run_timepoints:
+        print(f'Warning: configured timepoints ({T}) differ from BOLD length ({run_timepoints}).')
+
+num_trials = int(design_num_trials)
+stimdur = int(design_stimdur)
+tr = float(design_tr)
+
+go_flag = np.loadtxt(go_times_path, dtype=int)
+if go_flag.ndim == 1:
+    go_flag = go_flag[np.newaxis, :]
+if go_flag.shape[0] < len(runs):
+    raise ValueError('Go-times file does not contain enough rows for the configured runs.')
+if go_flag.shape[1] < num_trials:
+    raise ValueError('Go-times file does not contain enough trials for the configured design.')
+
+run_onsets_metric = _trial_onsets_from_blocks(
+    num_trials,
+    stimdur,
+    trial_block_size,
+    trial_rest_trs,
+)
+
+trial_keep_by_run = []
+for idx, run in enumerate(runs):
+    metrics = _trial_metrics(data[idx], run_onsets_metric, stimdur, trial_metric)
+    keep = _trial_keep_mask(metrics, trial_z, trial_fallback, trial_max_drop)
+    trial_keep_by_run.append(keep)
+    np.save(outputdir_glmsingle / f'trial_keep_run{run}.npy', keep)
+    np.save(outputdir_glmsingle / f'trial_metric_run{run}.npy', metrics)
+    dropped = int(np.count_nonzero(~keep))
+    print(f'Run {run}: dropping {dropped}/{len(keep)} trials (metric={trial_metric}).')
+
+# %%
+design_matrix = []
+for idx, run in enumerate(runs):
+    design = np.zeros((T, 1), dtype=int)
+    run_onsets_design = go_flag[idx][:num_trials]
+    keep = trial_keep_by_run[idx]
+    for onset, keep_trial in zip(run_onsets_design, keep):
+        if not keep_trial:
+            continue
+        onset_idx = onset - 1
+        if onset_idx < 0 or onset_idx >= T:
+            raise ValueError(f'Invalid onset {onset} for run {run} with T={T}')
+        design[onset_idx, 0] = 1
+    design_matrix.append(design)
+
+opt = {
+    'wantlibrary': glmsingle_wantlibrary,
+    'wantglmdenoise': int(glmsingle_wantglmdenoise),
+    'wantfracridge': int(glmsingle_wantfracridge),
+    'wantfileoutputs': glmsingle_wantfileoutputs,
+    'wantmemoryoutputs': glmsingle_wantmemoryoutputs,
+}
+if extraregressors and len(extraregressors) == len(runs):
+    opt['extra_regressors'] = extraregressors
+
+# %%
+glmsingle_obj = GLM_single(opt)
+start_time = time.time()
+
+print('running GLMsingle...')
+process = psutil.Process()
+memory_before = process.memory_info().rss / 1024 / 1024 / 1024
+print(f'Memory usage before GLMsingle: {memory_before:.2f} GB')
+
+gc.collect()
+results_glmsingle = glmsingle_obj.fit(design_matrix, data, stimdur, tr, outputdir=str(outputdir_glmsingle))
+
+elapsed_time = time.time() - start_time
+
+print('\telapsed time: ', f'{time.strftime("%H:%M:%S", time.gmtime(elapsed_time))}')
 
 # %%
 # if run_beta:
