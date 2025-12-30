@@ -17,6 +17,8 @@ logs/
 figures/
 tmp_roi_overlay/
 sub09_ses1/
+analysis_motor_cortex/
+empca/
 
 # python cruft
 __pycache__/
