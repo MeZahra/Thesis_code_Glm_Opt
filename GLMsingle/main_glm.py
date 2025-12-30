@@ -38,15 +38,15 @@ trial_rest_trs = 20
 
 
 extra_mode = 'csf'
-trial_metric = 'mean_abs'
-trial_z = 0.0
-trial_fallback = 0.0
+trial_metric = 'dvars'
+trial_z = 3.5
+trial_fallback = 95
 trial_max_drop = 0.2
 
 glmsingle_wantlibrary = 1
 glmsingle_wantglmdenoise = 1
 glmsingle_wantfracridge = 1
-glmsingle_wantfileoutputs = [1, 1, 1, 1]
+glmsingle_wantfileoutputs = [0, 0, 0, 1]
 glmsingle_wantmemoryoutputs = [0, 0, 0, 1]
 
 
@@ -78,7 +78,7 @@ def _trial_metrics(masked_bold, onsets, stimdur, metric):
     metrics = []
     for onset in onsets:
         start = int(onset) - 1
-        end = start + stimdur
+        end = start + int(round(stimdur / tr))
         segment = masked_bold[:, start:end]
         if metric == 'mean_abs':
             value = float(np.nanmean(np.abs(segment)))
@@ -92,7 +92,7 @@ def _trial_metrics(masked_bold, onsets, stimdur, metric):
         metrics.append(value)
     return np.array(metrics, dtype=np.float32)
 
-def _trial_keep_mask(metrics, z_thr, fallback_pct, max_drop_fraction):
+def _trial_keep_mask(metrics, z_thr, fallback_pct, max_drop_fraction, metric):
     if z_thr <= 0:
         return np.ones_like(metrics, dtype=bool)
 
@@ -101,19 +101,36 @@ def _trial_keep_mask(metrics, z_thr, fallback_pct, max_drop_fraction):
     scale = 1.4826 * max(mad, 1e-9)
     z = (metrics - med) / scale
 
-    keep = z <= z_thr
+    if metric == 'mean_abs':
+        direction = 'low'
+    else:
+        direction = 'high'
+
+    if direction == 'high':
+        keep = z <= z_thr
+    elif direction == 'low':
+        keep = z >= -z_thr
+    else:
+        raise ValueError(f'Unknown trial metric direction: {direction}')
     keep &= np.isfinite(metrics)
 
     if np.all(keep) and fallback_pct > 0:
-        cutoff = float(np.nanpercentile(metrics, fallback_pct))
-        keep = metrics <= cutoff
+        if direction == 'high':
+            cutoff = float(np.nanpercentile(metrics, fallback_pct))
+            keep = metrics <= cutoff
+        else:
+            cutoff = float(np.nanpercentile(metrics, 100 - fallback_pct))
+            keep = metrics >= cutoff
 
     drop_fraction = 1 - np.mean(keep)
     if drop_fraction > max_drop_fraction:
         n_keep = int(np.ceil(len(metrics) * (1 - max_drop_fraction)))
         order = np.argsort(metrics)
         keep = np.zeros_like(metrics, dtype=bool)
-        keep[order[:n_keep]] = True
+        if direction == 'high':
+            keep[order[:n_keep]] = True
+        else:
+            keep[order[-n_keep:]] = True
 
     return keep
 
@@ -171,7 +188,7 @@ run_onsets_metric = _trial_onsets_from_blocks(num_trials,stimdur, trial_block_si
 trial_keep_by_run = []
 for idx, run in enumerate(runs):
     metrics = _trial_metrics(data[idx], run_onsets_metric, stimdur, trial_metric)
-    keep = _trial_keep_mask(metrics, trial_z, trial_fallback, trial_max_drop)
+    keep = _trial_keep_mask(metrics, trial_z, trial_fallback, trial_max_drop, trial_metric)
     trial_keep_by_run.append(keep)
     np.save(outputdir_glmsingle / f'trial_keep_run{run}.npy', keep)
     np.save(outputdir_glmsingle / f'trial_metric_run{run}.npy', metrics)
@@ -198,7 +215,7 @@ opt = {'wantlibrary': glmsingle_wantlibrary,'wantglmdenoise': int(glmsingle_want
        'wantfileoutputs': glmsingle_wantfileoutputs, 'wantmemoryoutputs': glmsingle_wantmemoryoutputs}
 if len(extraregressors) == len(runs):
     opt['extra_regressors'] = extraregressors
-
+opt['chunklen'] = 100000
 # %%
 print('running GLMsingle...')
 glmsingle_obj = GLM_single(opt)

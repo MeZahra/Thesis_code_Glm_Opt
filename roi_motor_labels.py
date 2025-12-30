@@ -96,6 +96,12 @@ def _parse_args():
         help="Gray-matter threshold for anatomy-based ROI.",
     )
     parser.add_argument(
+        "--atlas-gm-threshold",
+        type=float,
+        default=0.5,
+        help="Gray-matter threshold for atlas ROI overlap stats.",
+    )
+    parser.add_argument(
         "--csf-threshold",
         type=float,
         default=0.5,
@@ -378,6 +384,17 @@ def main():
     gray_img = nib.load(str(args.gray)) if args.gray else None
     brain_img = nib.load(str(args.brain_mask)) if args.brain_mask else None
     csf_img = nib.load(str(args.csf)) if args.csf else None
+    gm_data = None
+    if gray_img is not None:
+        if gray_img.shape[:3] != anat_img.shape[:3] or not np.allclose(gray_img.affine, anat_img.affine):
+            gray_img = image.resample_to_img(
+                gray_img,
+                anat_img,
+                interpolation="continuous",
+                force_resample=True,
+                copy_header=True,
+            )
+        gm_data = gray_img.get_fdata(dtype=np.float32)
 
     flirt_path = None
     use_flirt = False
@@ -526,12 +543,26 @@ def main():
     atlas_left_mask = atlas_left_resampled.get_fdata(dtype=np.float32) > 0.5
     atlas_right_mask = atlas_right_resampled.get_fdata(dtype=np.float32) > 0.5
     atlas_combined_mask = atlas_combined_resampled.get_fdata(dtype=np.float32) > 0.5
+    atlas_gm_counts = None
+    if gm_data is not None:
+        gm_high = gm_data > args.atlas_gm_threshold
+        atlas_gm_counts = {
+            "left": int(np.count_nonzero(atlas_left_mask & gm_high)),
+            "right": int(np.count_nonzero(atlas_right_mask & gm_high)),
+            "combined": int(np.count_nonzero(atlas_combined_mask & gm_high)),
+        }
+        print(
+            "Atlas motor voxels with GM>{thr}: left={left}, right={right}, combined={combined}".format(
+                thr=args.atlas_gm_threshold,
+                **atlas_gm_counts,
+            ),
+            flush=True,
+        )
 
     # Anatomy-based spherical ROIs restricted to gray matter (and brain mask if provided).
     shape = anat_img.shape[:3]
     gm_mask = None
-    if gray_img is not None:
-        gm_data = gray_img.get_fdata(dtype=np.float32)
+    if gm_data is not None:
         gm_mask = gm_data > args.gm_threshold
     brain_mask = _maybe_resample_mask(brain_img, anat_img, threshold=0) if brain_img is not None else None
     csf_mask = (
@@ -708,6 +739,12 @@ def main():
                 "left": int(np.count_nonzero(atlas_left_resampled.get_fdata())),
                 "right": int(np.count_nonzero(atlas_right_resampled.get_fdata())),
                 "combined": int(np.count_nonzero(atlas_combined_resampled.get_fdata())),
+            },
+            "gray_overlap": None
+            if atlas_gm_counts is None
+            else {
+                "gm_threshold": float(args.atlas_gm_threshold),
+                **atlas_gm_counts,
             },
         },
         "anatomy": {

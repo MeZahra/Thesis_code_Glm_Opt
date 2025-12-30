@@ -471,7 +471,7 @@ def main():
     hampel_threshold = 3.0   # Hampel MAD multiplier for outliers.
     outlier_percentile = 99.9      # Percentile cutoff for beta outliers.
     max_outlier_fraction = 0.5     # Max outlier fraction per voxel.
-    overlay_threshold_pct = 10      # Overlay threshold percentile.
+    overlay_threshold_pct = 60      # Overlay threshold percentile.
     overlay_vmax_pct = 99.9      # Overlay vmax percentile.
     cut_coords = None      # Slice coords for overlay; None uses default cuts.
     cut_coords = tuple(cut_coords) if cut_coords else None
