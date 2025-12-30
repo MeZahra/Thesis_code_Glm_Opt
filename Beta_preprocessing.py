@@ -130,6 +130,9 @@ def _with_tag(path, tag):
     safe_tag = str(tag).strip().replace(' ', '_')
     if not safe_tag:
         return path
+    if path.name.endswith(".nii.gz"):
+        base = path.name[:-7]
+        return path.with_name(f"{base}_{safe_tag}.nii.gz")
     return path.with_name(f"{path.stem}_{safe_tag}{path.suffix}")
 
 def _mean_abs_beta_volume(beta, coords, volume_shape):
@@ -658,6 +661,10 @@ def main():
     if cached_beta_path.exists():
         beta_volume_filter = np.load(cached_beta_path)
         mean_clean_active = np.nanmean(np.abs(beta_volume_filter), axis=-1)
+        mean_clean_active_path = _with_tag(output_dir / f'mean_clean_active_sub{sub}_ses{ses}_run{run}.nii.gz', output_tag)
+        mean_clean_active_img = nib.Nifti1Image(mean_clean_active.astype(np.float32), anat_img.affine, anat_img.header)
+        mean_clean_active_img.to_filename(str(mean_clean_active_path))
+        print(f'Saved mean_clean_active: {mean_clean_active_path}', flush=True)
         _save_beta_overlay(mean_clean_active, anat_img=anat_img, out_html=str(overlay_html_path),threshold_pct=overlay_threshold_pct,
                             vmax_pct=overlay_vmax_pct, cut_coords=cut_coords, snapshot_path=str(overlay_snapshot_path))
         if not skip_roi_ranking:
@@ -810,6 +817,10 @@ def main():
     # np.save(output_dir / f"active_coords_sub{sub}_ses{ses}_run{run}.npy", active_coords)
 
     mean_clean_active = np.nanmean(np.abs(beta_volume_filter), axis=-1)
+    mean_clean_active_path = _with_tag(output_dir / f'mean_clean_active_sub{sub}_ses{ses}_run{run}.nii.gz', output_tag)
+    mean_clean_active_img = nib.Nifti1Image(mean_clean_active.astype(np.float32), anat_img.affine, anat_img.header)
+    mean_clean_active_img.to_filename(str(mean_clean_active_path))
+    print(f'Saved mean_clean_active: {mean_clean_active_path}', flush=True)
     _save_beta_overlay(mean_clean_active, anat_img=anat_img, out_html=str(overlay_html_path), threshold_pct=overlay_threshold_pct, 
                        vmax_pct=overlay_vmax_pct, cut_coords=cut_coords, snapshot_path=str(overlay_snapshot_path))
     if not skip_roi_ranking:
