@@ -22,7 +22,7 @@ brain_mask_template = 'sub-pd0{sub}_ses-{ses}_T1w_brain_mask.nii.gz'
 csf_mask_template = 'sub-pd0{sub}_ses-{ses}_T1w_brain_pve_0.nii.gz'
 gray_mask_template = 'sub-pd0{sub}_ses-{ses}_T1w_brain_pve_1.nii.gz'
 anat_template = 'sub-pd0{sub}_ses-{ses}_T1w_brain.nii.gz'
-go_times_root = Path('/mnt/TeamShare/Data_Masterfile/Zahra-Thesis-Data/Master_Thesis_Files/GLM_single_results/Go-times')
+go_times_root = Path(__file__).resolve().parent.parent / 'sub09_ses1'
 go_times_template = 'PSPD0{sub}-ses-{ses}-go-times.txt'
 
 mask_threshold_brain = 0.0
@@ -174,9 +174,9 @@ files_cfg = {'bold_template': bold, 'brain_mask': brain_mask_template, 'csf_mask
 data_root = Path(__file__).resolve().parent
 data_root = data_root.expanduser().resolve()
 outputdir_glmsingle = data_root / f'GLMOutputs-sub{sub}-ses{ses}-{trial_metric}'
-go_times_path = go_times_root / go_times_template.format(sub=sub, ses=ses)
 outputdir_glmsingle.mkdir(parents=True, exist_ok=True)
 data_dir = data_root.parent / 'sub09_ses1'
+go_times_path = go_times_root / go_times_template.format(sub=sub, ses=ses)
 brain_mask = nib.load(join(data_dir, files_cfg['brain_mask'].format(sub=sub, ses=ses)))
 csf_mask = nib.load(join(data_dir, files_cfg['csf_mask'].format(sub=sub, ses=ses)))
 gray_mask = nib.load(join(data_dir, files_cfg['gray_mask'].format(sub=sub, ses=ses)))
