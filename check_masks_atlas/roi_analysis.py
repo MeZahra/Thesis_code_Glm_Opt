@@ -62,6 +62,12 @@ def _compute_voxel_summary(beta_2d: np.ndarray, stat: str) -> np.ndarray:
             summary = np.nanmean(np.abs(beta_2d), axis=1)
         elif stat == 'mean':
             summary = np.nanmean(beta_2d, axis=1)
+        elif stat == 'percentile_95':
+            summary = np.nanpercentile(np.abs(beta_2d), 95, axis=1)
+        elif stat == 'percentile_90':
+            summary = np.nanpercentile(np.abs(beta_2d), 90, axis=1)
+        elif stat == 'peak':
+            summary = np.nanmax(np.abs(beta_2d), axis=1)
         elif stat == 'mean_z':
             mean_beta = np.nanmean(beta_2d, axis=1)
             finite = mean_beta[np.isfinite(mean_beta)]

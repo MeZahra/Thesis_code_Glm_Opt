@@ -263,6 +263,86 @@ def _apply_flirt(in_path, ref_path, mat_path, out_path, flirt_path, interp="near
     cmd = [flirt_path, "-in", str(in_path), "-ref", str(ref_path), "-applyxfm", "-init", str(mat_path), "-interp", interp,"-out", str(out_path)]
     _run_flirt(cmd)
 
+def _save_atlas_qc_plots(atlas_in_ref, labels, ref_img, brain_mask_path, out_dir, atlas_name, registration_method):
+    """Generate QC plots for atlas registration quality.
+
+    Parameters
+    ----------
+    atlas_in_ref : nib.Nifti1Image
+        Registered atlas in reference space.
+    labels : list of str
+        Atlas label names.
+    ref_img : nib.Nifti1Image
+        Reference anatomical image.
+    brain_mask_path : str or Path
+        Path to brain mask for overlap statistics.
+    out_dir : Path
+        Output directory for QC plots.
+    atlas_name : str
+        Atlas identifier for filenames.
+    registration_method : str
+        'flirt' or 'resample' for documentation.
+
+    Returns
+    -------
+    dict
+        QC statistics including overlap percentages.
+    """
+    from nilearn import plotting
+    import json
+
+    out_dir = Path(out_dir)
+    atlas_data = np.rint(atlas_in_ref.get_fdata(dtype=np.float32)).astype(int)
+
+    # Load brain mask for overlap stats
+    brain_mask = nib.load(str(brain_mask_path)).get_fdata() > 0
+
+    # Compute overlap statistics
+    atlas_voxels = atlas_data > 0
+    total_atlas = int(np.count_nonzero(atlas_voxels))
+    in_brain = int(np.count_nonzero(atlas_voxels & brain_mask))
+    outside_brain = total_atlas - in_brain
+
+    qc_stats = {
+        'registration_method': registration_method,
+        'total_atlas_voxels': total_atlas,
+        'voxels_in_brain': in_brain,
+        'voxels_outside_brain': outside_brain,
+        'pct_in_brain': float(in_brain) / float(total_atlas) * 100 if total_atlas else 0.0,
+        'pct_outside_brain': float(outside_brain) / float(total_atlas) * 100 if total_atlas else 0.0,
+    }
+
+    # Generate overlay showing atlas boundaries on anatomy
+    qc_html = out_dir / f'atlas_qc_{atlas_name}_{registration_method}.html'
+    qc_png = out_dir / f'atlas_qc_{atlas_name}_{registration_method}.png'
+
+    # Create edge map of atlas regions for visualization
+    from scipy import ndimage
+    atlas_binary = (atlas_data > 0).astype(np.uint8)
+    atlas_edges = ndimage.sobel(atlas_binary.astype(float))
+    atlas_edges = (atlas_edges > 0).astype(np.float32)
+    edges_img = nib.Nifti1Image(atlas_edges, atlas_in_ref.affine, atlas_in_ref.header)
+
+    view = plotting.view_img(edges_img, bg_img=ref_img, threshold=0.5, cmap='hot',
+                            title=f'Atlas QC: {registration_method} ({qc_stats["pct_in_brain"]:.1f}% in brain)',
+                            colorbar=True)
+    view.save_as_html(str(qc_html))
+
+    display = plotting.plot_roi(atlas_in_ref, bg_img=ref_img, cmap='tab20',
+                               title=f'Atlas Regions: {registration_method}')
+    display.savefig(str(qc_png))
+    display.close()
+
+    # Save QC statistics to JSON
+    qc_json = out_dir / f'atlas_qc_{atlas_name}_{registration_method}.json'
+    with open(qc_json, 'w') as f:
+        json.dump(qc_stats, f, indent=2)
+
+    print(f"Atlas QC: {in_brain}/{total_atlas} voxels in brain ({qc_stats['pct_in_brain']:.1f}%)", flush=True)
+    print(f"Saved atlas QC plots: {qc_html.name}, {qc_png.name}, {qc_json.name}", flush=True)
+
+    return qc_stats
+
 def _select_roi_indices(labels, label_patterns):
     """Select atlas label indices matching requested patterns.
 
@@ -319,13 +399,15 @@ def _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_dir, 
     use_flirt = False
     flirt_path = None
     mni_template_img = None
+
     if not assume_mni:
         flirt_path = shutil.which("flirt")
         mni_template = _default_mni_template()
         if flirt_path and mni_template and mni_template.exists():
-                _compute_mni_to_anat(mni_template, anat_path, out_dir, flirt_path)
-                use_flirt = True
-                print("Registered MNI template to anatomy with FLIRT.", flush=True)
+            mni_template_img = nib.load(str(mni_template))
+            _compute_mni_to_anat(mni_template, anat_path, out_dir, flirt_path)
+            use_flirt = True
+            print("Registered MNI template to anatomy with FLIRT.", flush=True)
         else:
             print("Warning: FLIRT or MNI template not available; falling back to header-based resampling.", flush=True)
 
@@ -346,14 +428,20 @@ def _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_dir, 
     else:
         atlas_in_anat = image.resample_to_img(atlas_img, anat_img, interpolation="nearest", force_resample=True, copy_header=True)
 
+    # Diagnostic output
+    registration_method = 'FLIRT registration' if use_flirt else 'header-based resampling'
+    print(f"Atlas alignment method: {registration_method}", flush=True)
+    if not use_flirt:
+        print("WARNING: Using fallback resampling - atlas alignment may be suboptimal", flush=True)
+
     if (atlas_in_anat.shape[:3] != ref_img.shape[:3] or not np.allclose(atlas_in_anat.affine, ref_img.affine)):
         atlas_in_ref = image.resample_to_img(atlas_in_anat, ref_img, interpolation="nearest", force_resample=True, copy_header=True)
         return atlas_in_ref
 
     return atlas_in_anat
 
-def _rank_rois_by_beta(summary, anat_img, anat_path, ref_img, out_path, atlas_threshold, label_patterns, assume_mni):
-    """Rank atlas ROIs by mean beta and write a CSV report.
+def _rank_rois_by_beta(summary, anat_img, anat_path, ref_img, out_path, atlas_threshold, label_patterns, assume_mni, summary_stat='percentile_95'):
+    """Rank atlas ROIs by summary statistic and write a CSV report.
 
     Parameters
     ----------
@@ -373,6 +461,8 @@ def _rank_rois_by_beta(summary, anat_img, anat_path, ref_img, out_path, atlas_th
         Comma-separated substrings to match ROI labels.
     assume_mni : bool
         If True, assume atlas is already in MNI space.
+    summary_stat : str
+        ROI summary statistic: 'mean', 'mean_abs', 'percentile_95', 'percentile_90', or 'peak'.
 
     Returns
     -------
@@ -385,6 +475,14 @@ def _rank_rois_by_beta(summary, anat_img, anat_path, ref_img, out_path, atlas_th
         raise ValueError(f"Summary shape does not match ROI reference image; summary shape={summary.shape}, ref shape={ref_img.shape[:3]}.")
 
     atlas_in_ref = _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_path.parent, assume_mni=assume_mni)
+
+    # Generate atlas QC diagnostics
+    brain_mask_path = str(anat_path).replace('T1w_brain.nii.gz', 'T1w_brain_mask.nii.gz')
+    if Path(brain_mask_path).exists():
+        registration_method = 'flirt' if not assume_mni else 'resample'
+        _save_atlas_qc_plots(atlas_in_ref, labels, ref_img, brain_mask_path, out_path.parent,
+                            f'thr{atlas_threshold}', registration_method)
+
     atlas_data = np.rint(atlas_in_ref.get_fdata(dtype=np.float32)).astype(int)
     indices = _select_roi_indices(labels, label_patterns)
     if not indices:
@@ -395,27 +493,41 @@ def _rank_rois_by_beta(summary, anat_img, anat_path, ref_img, out_path, atlas_th
         mask = atlas_data == idx
         voxel_count = int(np.count_nonzero(mask))
         if voxel_count == 0:
-            mean_beta = np.nan
+            roi_stat = np.nan
             valid_voxels = 0
         else:
             values = summary[mask]
             finite = values[np.isfinite(values)]
             valid_voxels = int(finite.size)
-            mean_beta = float(np.nanmean(finite)) if finite.size else np.nan
 
-        results.append({"label_index": idx, "label": labels[idx], "mean_beta": mean_beta, "voxel_count": voxel_count, "valid_voxel_count": valid_voxels})
+            if finite.size == 0:
+                roi_stat = np.nan
+            elif summary_stat == 'mean':
+                roi_stat = float(np.nanmean(finite))
+            elif summary_stat == 'mean_abs':
+                roi_stat = float(np.nanmean(np.abs(finite)))
+            elif summary_stat == 'percentile_95':
+                roi_stat = float(np.nanpercentile(finite, 95))
+            elif summary_stat == 'percentile_90':
+                roi_stat = float(np.nanpercentile(finite, 90))
+            elif summary_stat == 'peak':
+                roi_stat = float(np.nanmax(finite))
+            else:
+                raise ValueError(f"Unknown summary_stat: {summary_stat}")
+
+        results.append({"label_index": idx, "label": labels[idx], "roi_stat": roi_stat, "stat_type": summary_stat, "voxel_count": voxel_count, "valid_voxel_count": valid_voxels})
 
     def _sort_key(row):
-        mean_beta = row["mean_beta"]
-        if mean_beta is None or np.isnan(mean_beta):
+        roi_stat = row["roi_stat"]
+        if roi_stat is None or np.isnan(roi_stat):
             return (1, 0.0)
-        return (0, -mean_beta)
+        return (0, -roi_stat)
 
     results = sorted(results, key=_sort_key)
     for rank, row in enumerate(results, start=1):
         row["rank"] = rank
 
-    fieldnames = ["rank", "label_index", "label", "mean_beta", "voxel_count", "valid_voxel_count"]
+    fieldnames = ["rank", "label_index", "label", "roi_stat", "stat_type", "voxel_count", "valid_voxel_count"]
     with open(out_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -488,6 +600,9 @@ def _parse_args():
     parser.add_argument('--output-dir', type=str, default=None)
     parser.add_argument('--output-tag', type=str, default=None)
     parser.add_argument('--mask-indices', type=str, default=None)
+    parser.add_argument('--roi-stat', type=str, default='percentile_95',
+                       choices=['mean', 'mean_abs', 'percentile_95', 'percentile_90', 'peak'],
+                       help='ROI summary statistic (default: percentile_95)')
     return parser.parse_args()
 
 def main():
@@ -547,8 +662,8 @@ def main():
                             vmax_pct=overlay_vmax_pct, cut_coords=cut_coords, snapshot_path=str(overlay_snapshot_path))
         if not skip_roi_ranking:
             roi_rank_path = _with_tag(output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run}.csv', output_tag)
-            _rank_rois_by_beta(mean_clean_active, anat_img=anat_img, anat_path=data_paths['anat'], ref_img=anat_img, out_path=roi_rank_path, 
-                                atlas_threshold=roi_atlas_threshold, label_patterns=roi_label_patterns, assume_mni=False)
+            _rank_rois_by_beta(mean_clean_active, anat_img=anat_img, anat_path=data_paths['anat'], ref_img=anat_img, out_path=roi_rank_path,
+                                atlas_threshold=roi_atlas_threshold, label_patterns=roi_label_patterns, assume_mni=False, summary_stat=args.roi_stat)
         return
 
     print("Apply Masking on Bold data...")
@@ -699,8 +814,8 @@ def main():
                        vmax_pct=overlay_vmax_pct, cut_coords=cut_coords, snapshot_path=str(overlay_snapshot_path))
     if not skip_roi_ranking:
         roi_rank_path = _with_tag(output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run}.csv', output_tag)
-        _rank_rois_by_beta(mean_clean_active, anat_img=anat_img, anat_path=data_paths['anat'], ref_img=anat_img, out_path=roi_rank_path, 
-                           atlas_threshold=roi_atlas_threshold, label_patterns=roi_label_patterns, assume_mni=False)
+        _rank_rois_by_beta(mean_clean_active, anat_img=anat_img, anat_path=data_paths['anat'], ref_img=anat_img, out_path=roi_rank_path,
+                           atlas_threshold=roi_atlas_threshold, label_patterns=roi_label_patterns, assume_mni=False, summary_stat=args.roi_stat)
 
 
 if __name__ == '__main__':

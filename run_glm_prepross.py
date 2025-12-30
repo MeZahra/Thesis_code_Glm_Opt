@@ -17,6 +17,14 @@ SUBJECT_ID = "09"
 SESSION_ID = "1"
 TRIAL_ONSETS = "blocks" #'go_times'
 
+# Environment variables for GLM configuration:
+# - GLM_TRIAL_METRIC: Trial quality metric (dvars, std, mean_abs)
+# - GLM_TRIAL_Z: Z-score threshold for trial outliers
+# - GLM_TRIAL_FALLBACK: Fallback percentile for trial filtering
+# - GLM_TRIAL_MAX_DROP: Maximum fraction of trials to drop
+# - GLM_TRIAL_ONSETS: Trial onset source ('blocks' or 'go_times')
+# - GLM_ROI_STAT: ROI ranking statistic (percentile_95, percentile_90, mean, peak)
+
 
 def _run(cmd, env=None):
     print("Running:", " ".join(cmd), flush=True)
@@ -40,9 +48,10 @@ def main():
             raise FileNotFoundError(f"Missing GLMsingle output: {glmsingle_file}")
 
         mask_indices = output_dir / "mask_indices.npy"
+        roi_stat = os.environ.get("GLM_ROI_STAT", "percentile_95")
         for skip_ttest, tag in ((False, "ttest"), (True, "skip-ttest")):
-            args = [sys.executable, str(BETA_SCRIPT), "--gray-threshold", "0", "--skip-hampel", "--output-dir", str(output_dir), 
-                    "--glmsingle-file", str(glmsingle_file), "--output-tag", tag]
+            args = [sys.executable, str(BETA_SCRIPT), "--gray-threshold", "0", "--skip-hampel", "--output-dir", str(output_dir),
+                    "--glmsingle-file", str(glmsingle_file), "--output-tag", tag, "--roi-stat", roi_stat]
             if skip_ttest:
                 args.append("--skip-ttest")
             if mask_indices.exists():
