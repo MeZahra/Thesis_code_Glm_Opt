@@ -19,6 +19,7 @@ tmp_roi_overlay/
 sub09_ses1/
 analysis_motor_cortex/
 empca/
+codex_m1_search/
 
 # python cruft
 __pycache__/

@@ -38,10 +38,10 @@ trial_rest_trs = 20
 
 
 extra_mode = 'csf'
-trial_metric = 'dvars'
-trial_z = 3.5
+trial_metric = 'std'
+trial_z = 3
 trial_fallback = 95
-trial_max_drop = 0.2
+trial_max_drop = 0.15
 
 glmsingle_wantlibrary = 1
 glmsingle_wantglmdenoise = 1
@@ -167,7 +167,7 @@ data = []
 extraregressors = []
 trial_keep_by_run = []
 
-print("Loaf Bold data....")
+print("Load Bold data....")
 for run in runs:
     bold_name = files_cfg['bold_template'].format(sub=sub, ses=ses, run=run)
     bold_path = join(data_dir, bold_name)
