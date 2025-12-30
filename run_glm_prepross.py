@@ -8,9 +8,10 @@ REPO_ROOT = Path(__file__).resolve().parent
 GLM_SCRIPT = REPO_ROOT / "GLMsingle" / "main_glm.py"
 BETA_SCRIPT = REPO_ROOT / "Beta_preprocessing.py"
 
-TRIAL_CONFIGS = [{"trial_metric": "dvars", "trial_z": 3.5, "trial_fallback": 95, "trial_max_drop": 0.2},
-    {"trial_metric": "std", "trial_z": 3.0, "trial_fallback": 95, "trial_max_drop": 0.15},
-    {"trial_metric": "mean_abs", "trial_z": 3.0, "trial_fallback": 95, "trial_max_drop": 0.1}]
+# TRIAL_CONFIGS = [{"trial_metric": "dvars", "trial_z": 3.5, "trial_fallback": 95, "trial_max_drop": 0.2},
+#     {"trial_metric": "std", "trial_z": 3.0, "trial_fallback": 95, "trial_max_drop": 0.15},
+#     {"trial_metric": "mean_abs", "trial_z": 3.0, "trial_fallback": 95, "trial_max_drop": 0.1}]
+TRIAL_CONFIGS = [{"trial_metric": "dvars", "trial_z": 0, "trial_fallback": 0, "trial_max_drop": 0.2}]
 
 SUBJECT_ID = "09"
 SESSION_ID = "1"
