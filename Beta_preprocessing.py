@@ -161,7 +161,20 @@ def _load_mask_indices(path):
         data = tuple(data)
     if not isinstance(data, tuple) or len(data) != 3:
         raise ValueError(f"Invalid mask indices in {path}")
-    return tuple(np.asarray(ax) for ax in data)
+    axes = []
+    for ax in data:
+        ax_arr = np.asarray(ax)
+        if ax_arr.dtype.kind in ("i", "u"):
+            axes.append(ax_arr.astype(np.intp, copy=False))
+            continue
+        ax_float = ax_arr.astype(np.float64)
+        if not np.all(np.isfinite(ax_float)):
+            raise ValueError(f"Invalid mask indices in {path}: non-finite values.")
+        ax_round = np.rint(ax_float)
+        if not np.allclose(ax_float, ax_round):
+            raise ValueError(f"Invalid mask indices in {path}: non-integer values.")
+        axes.append(ax_round.astype(np.intp))
+    return tuple(axes)
 
 def _default_mni_template():
     """Return an MNI template path from FSLDIR if available.
