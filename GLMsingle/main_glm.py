@@ -1,5 +1,6 @@
 # %%
 import gc
+import os
 import subprocess
 import sys
 import time
@@ -38,10 +39,20 @@ trial_rest_trs = 20
 
 
 extra_mode = 'csf'
-trial_metric = 'std'
-trial_z = 3
-trial_fallback = 95
-trial_max_drop = 0.15
+
+def _env_override(name, cast, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return cast(value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid value for {name}: {value!r}") from exc
+
+trial_metric = _env_override('GLM_TRIAL_METRIC', str, 'std')
+trial_z = _env_override('GLM_TRIAL_Z', float, 3)
+trial_fallback = _env_override('GLM_TRIAL_FALLBACK', float, 95)
+trial_max_drop = _env_override('GLM_TRIAL_MAX_DROP', float, 0.15)
 
 glmsingle_wantlibrary = 1
 glmsingle_wantglmdenoise = 1
@@ -160,6 +171,9 @@ gray_mask_data = gray_mask.get_fdata() > mask_threshold_gray
 mask = _build_mask(brain_mask_data, csf_mask_data, gray_mask_data, mask_mode)
 mask_indices = np.where(mask)
 print('Combined mask voxels:', mask_indices[0].size)
+mask_indices_path = outputdir_glmsingle / 'mask_indices.npy'
+np.save(mask_indices_path, np.array(mask_indices, dtype=object))
+print(f'Saved mask indices: {mask_indices_path}')
 anat_data = anat_file.get_fdata(dtype=np.float32)
 
 # %%

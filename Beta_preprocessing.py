@@ -124,6 +124,14 @@ def _save_overlay_html(data, anat_img, out_html, title, threshold_pct, vmax_pct,
     view.save_as_html(out_html)
     print(f'Saved overlay: {out_html}', flush=True)
 
+def _with_tag(path, tag):
+    if not tag:
+        return path
+    safe_tag = str(tag).strip().replace(' ', '_')
+    if not safe_tag:
+        return path
+    return path.with_name(f"{path.stem}_{safe_tag}{path.suffix}")
+
 def _mean_abs_beta_volume(beta, coords, volume_shape):
     """Project per-voxel beta values into a 3D volume by mean |beta|.
 
@@ -146,6 +154,14 @@ def _mean_abs_beta_volume(beta, coords, volume_shape):
     volume = np.full(volume_shape, np.nan, dtype=np.float32)
     volume[coords] = mean_abs.astype(np.float32)
     return volume
+
+def _load_mask_indices(path):
+    data = np.load(str(path), allow_pickle=True)
+    if isinstance(data, np.ndarray):
+        data = tuple(data)
+    if not isinstance(data, tuple) or len(data) != 3:
+        raise ValueError(f"Invalid mask indices in {path}")
+    return tuple(np.asarray(ax) for ax in data)
 
 def _default_mni_template():
     """Return an MNI template path from FSLDIR if available.
@@ -455,6 +471,10 @@ def _parse_args():
     parser.add_argument('--gray-threshold', type=float, default=0.5)
     parser.add_argument('--skip-ttest', action='store_true')
     parser.add_argument('--skip-hampel', action='store_true')
+    parser.add_argument('--glmsingle-file', type=str, default=None)
+    parser.add_argument('--output-dir', type=str, default=None)
+    parser.add_argument('--output-tag', type=str, default=None)
+    parser.add_argument('--mask-indices', type=str, default=None)
     return parser.parse_args()
 
 def main():
@@ -480,15 +500,16 @@ def main():
     roi_atlas_threshold = 25      # Harvard-Oxford atlas threshold.
     roi_label_patterns = None      # ROI label filter patterns.
     
-    output_dir = Path.cwd()
+    output_dir = Path(args.output_dir) if args.output_dir else Path.cwd()
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    beta_overlay_html_path = output_dir / f'beta_overlay_sub{sub}_ses{ses}_run{run}.html'
-    clean_beta_overlay_html_path = output_dir / f'clean_beta_overlay_sub{sub}_ses{ses}_run{run}.html'
-    ttest_beta_overlay_html_path = output_dir / f'ttest_beta_overlay_sub{sub}_ses{ses}_run{run}.html'
-    overlay_html_path = output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{run}.html'
+    output_tag = args.output_tag
+    beta_overlay_html_path = _with_tag(output_dir / f'beta_overlay_sub{sub}_ses{ses}_run{run}.html', output_tag)
+    clean_beta_overlay_html_path = _with_tag(output_dir / f'clean_beta_overlay_sub{sub}_ses{ses}_run{run}.html', output_tag)
+    ttest_beta_overlay_html_path = _with_tag(output_dir / f'ttest_beta_overlay_sub{sub}_ses{ses}_run{run}.html', output_tag)
+    overlay_html_path = _with_tag(output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{run}.html', output_tag)
     overlay_snapshot_path = overlay_html_path.with_suffix(".png")
-    cached_beta_path = output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy'
+    cached_beta_path = _with_tag(output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy', output_tag)
 
     print("Loading Files ...")
     sub_label = f'sub-pd0{sub}'
@@ -497,7 +518,9 @@ def main():
     anat_img = nib.load(str(data_paths['anat']))
     bold_img = nib.load(str(data_paths['bold']))
     bold_data = bold_img.get_fdata()
-    glmsingle_file = data_root / 'TYPED_FITHRF_GLMDENOISE_RR.npy'
+    glmsingle_file = Path(args.glmsingle_file) if args.glmsingle_file else (data_root / 'TYPED_FITHRF_GLMDENOISE_RR.npy')
+    if not glmsingle_file.exists():
+        raise FileNotFoundError(f"GLMsingle output not found: {glmsingle_file}")
     glm_dict = np.load(str(glmsingle_file), allow_pickle=True).item()
     beta_glm = glm_dict['betasmd']
     back_mask = nib.load(str(data_paths['brain'])).get_fdata(dtype=np.float32)
@@ -510,7 +533,7 @@ def main():
         _save_beta_overlay(mean_clean_active, anat_img=anat_img, out_html=str(overlay_html_path),threshold_pct=overlay_threshold_pct,
                             vmax_pct=overlay_vmax_pct, cut_coords=cut_coords, snapshot_path=str(overlay_snapshot_path))
         if not skip_roi_ranking:
-            roi_rank_path = output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run}.csv'
+            roi_rank_path = _with_tag(output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run}.csv', output_tag)
             _rank_rois_by_beta(mean_clean_active, anat_img=anat_img, anat_path=data_paths['anat'], ref_img=anat_img, out_path=roi_rank_path, 
                                 atlas_threshold=roi_atlas_threshold, label_patterns=roi_label_patterns, assume_mni=False)
         return
@@ -518,10 +541,17 @@ def main():
     print("Apply Masking on Bold data...")
     csf_mask_data = csf_mask > 0
     back_mask_data = back_mask > 0
-    mask = np.logical_and(back_mask_data, ~csf_mask_data)
-    nonzero_mask = np.where(mask)
-    gray_mask_data = gray_mask > args.gray_threshold
-    keep_voxels = gray_mask_data[nonzero_mask]
+    if args.mask_indices:
+        nonzero_mask = _load_mask_indices(args.mask_indices)
+        keep_voxels = np.ones(nonzero_mask[0].shape[0], dtype=bool)
+        print(f"Using mask indices from {args.mask_indices}.", flush=True)
+        if args.gray_threshold is not None:
+            print("Note: --gray-threshold is ignored when --mask-indices is set.", flush=True)
+    else:
+        mask = np.logical_and(back_mask_data, ~csf_mask_data)
+        nonzero_mask = np.where(mask)
+        gray_mask_data = gray_mask > args.gray_threshold
+        keep_voxels = gray_mask_data[nonzero_mask]
     bold_flat = bold_data[nonzero_mask]
     masked_bold = bold_flat[keep_voxels].astype(np.float32)
     masked_coords = tuple(ax[keep_voxels] for ax in nonzero_mask)
@@ -531,6 +561,10 @@ def main():
     end_idx = start_idx + TRIALS_PER_RUN
     beta = beta_glm[:, 0, 0, start_idx:end_idx]
     beta = beta[keep_voxels]
+    if beta.shape[0] != masked_bold.shape[0]:
+        raise ValueError(
+            f"Beta voxels ({beta.shape[0]}) do not match masked BOLD ({masked_bold.shape[0]})."
+        )
     bold_data_reshape = _extract_trial_segments(masked_bold, trial_len=TRIAL_LEN, num_trials=TRIALS_PER_RUN, rest_every=30, rest_len=20)
     print("Remove NaN voxels...")
     nan_voxels = np.isnan(beta).all(axis=1)
@@ -640,7 +674,7 @@ def main():
     _save_beta_overlay(mean_clean_active, anat_img=anat_img, out_html=str(overlay_html_path), threshold_pct=overlay_threshold_pct, 
                        vmax_pct=overlay_vmax_pct, cut_coords=cut_coords, snapshot_path=str(overlay_snapshot_path))
     if not skip_roi_ranking:
-        roi_rank_path = output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run}.csv'
+        roi_rank_path = _with_tag(output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run}.csv', output_tag)
         _rank_rois_by_beta(mean_clean_active, anat_img=anat_img, anat_path=data_paths['anat'], ref_img=anat_img, out_path=roi_rank_path, 
                            atlas_threshold=roi_atlas_threshold, label_patterns=roi_label_patterns, assume_mni=False)
 
