@@ -53,6 +53,7 @@ trial_metric = _env_override('GLM_TRIAL_METRIC', str, 'std')
 trial_z = _env_override('GLM_TRIAL_Z', float, 3)
 trial_fallback = _env_override('GLM_TRIAL_FALLBACK', float, 95)
 trial_max_drop = _env_override('GLM_TRIAL_MAX_DROP', float, 0.15)
+trial_onsets_source = _env_override('GLM_TRIAL_ONSETS', str, 'blocks').lower()
 
 glmsingle_wantlibrary = 1
 glmsingle_wantglmdenoise = 1
@@ -201,7 +202,11 @@ run_onsets_metric = _trial_onsets_from_blocks(num_trials,stimdur, trial_block_si
 
 trial_keep_by_run = []
 for idx, run in enumerate(runs):
-    metrics = _trial_metrics(data[idx], run_onsets_metric, stimdur, trial_metric)
+    if trial_onsets_source == 'go_times':
+        run_onsets = go_flag[idx][:num_trials]
+    else:
+        run_onsets = run_onsets_metric
+    metrics = _trial_metrics(data[idx], run_onsets, stimdur, trial_metric)
     keep = _trial_keep_mask(metrics, trial_z, trial_fallback, trial_max_drop, trial_metric)
     trial_keep_by_run.append(keep)
     np.save(outputdir_glmsingle / f'trial_keep_run{run}.npy', keep)

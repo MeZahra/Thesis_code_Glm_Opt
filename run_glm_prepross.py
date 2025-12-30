@@ -14,6 +14,7 @@ TRIAL_CONFIGS = [{"trial_metric": "dvars", "trial_z": 3.5, "trial_fallback": 95,
 
 SUBJECT_ID = "09"
 SESSION_ID = "1"
+TRIAL_ONSETS = "blocks" #'go_times'
 
 
 def _run(cmd, env=None):
@@ -29,6 +30,7 @@ def main():
         env["GLM_TRIAL_Z"] = str(cfg["trial_z"])
         env["GLM_TRIAL_FALLBACK"] = str(cfg["trial_fallback"])
         env["GLM_TRIAL_MAX_DROP"] = str(cfg["trial_max_drop"])
+        env["GLM_TRIAL_ONSETS"] = TRIAL_ONSETS
         _run([sys.executable, str(GLM_SCRIPT)], env=env)
 
         output_dir = REPO_ROOT / "GLMsingle" / f"GLMOutputs-sub{SUBJECT_ID}-ses{SESSION_ID}-{cfg['trial_metric']}"
