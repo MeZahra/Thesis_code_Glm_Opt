@@ -175,6 +175,8 @@ data_root = Path(__file__).resolve().parent
 data_root = data_root.expanduser().resolve()
 outputdir_glmsingle = data_root / f'GLMOutputs-sub{sub}-ses{ses}-{trial_metric}'
 outputdir_glmsingle.mkdir(parents=True, exist_ok=True)
+if load_results_dir is None:
+    load_results_dir = outputdir_glmsingle
 data_dir = data_root.parent / 'sub09_ses1'
 go_times_path = go_times_root / go_times_template.format(sub=sub, ses=ses)
 brain_mask = nib.load(join(data_dir, files_cfg['brain_mask'].format(sub=sub, ses=ses)))
