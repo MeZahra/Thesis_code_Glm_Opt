@@ -18,6 +18,17 @@ def _label_cmap(colors, alpha=0.6):
     return ListedColormap(rgba)
 
 
+def _robust_range(data, lower=2.0, upper=98.0):
+    finite = data[np.isfinite(data)]
+    finite = finite[finite > 0]
+    if finite.size == 0:
+        return float(np.nanmin(data)), float(np.nanmax(data))
+    vmin, vmax = np.percentile(finite, [lower, upper])
+    if vmin == vmax:
+        vmax = vmin + np.finfo(np.float32).eps
+    return float(vmin), float(vmax)
+
+
 def main():
     data_root = (Path.cwd() / bp.DATA_DIRNAME).resolve()
     sub_label = f"sub-pd0{bp.sub}"
@@ -66,6 +77,26 @@ def main():
     out_html = Path.cwd() / f"mask_overlay_sub{bp.sub}_ses{bp.ses}_run{bp.run}.html"
     view.save_as_html(out_html)
     print(f"Saved mask overlay HTML: {out_html}", flush=True)
+
+    gray_value_img = nib.Nifti1Image(gray_mask, anat_img.affine, anat_img.header)
+    vmin, vmax = _robust_range(gray_mask)
+    gray_view = plotting.view_image(
+        gray_value_img,
+        bg_img=anat_img,
+        cmap="viridis",
+        symmetric_cmap=False,
+        vmin=vmin,
+        vmax=vmax,
+        threshold=0.0,
+        resampling_interpolation="continuous",
+        opacity=0.7,
+        colorbar=True,
+        title="Anatomy with Gray mask values",
+    )
+
+    out_gray_html = Path.cwd() / f"gray_overlay_sub{bp.sub}_ses{bp.ses}_run{bp.run}.html"
+    gray_view.save_as_html(out_gray_html)
+    print(f"Saved gray-value overlay HTML: {out_gray_html}", flush=True)
     return view
 
 
