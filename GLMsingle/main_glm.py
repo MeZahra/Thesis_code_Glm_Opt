@@ -54,6 +54,9 @@ trial_z = _env_override('GLM_TRIAL_Z', float, 3)
 trial_fallback = _env_override('GLM_TRIAL_FALLBACK', float, 95)
 trial_max_drop = _env_override('GLM_TRIAL_MAX_DROP', float, 0.15)
 trial_onsets_source = _env_override('GLM_TRIAL_ONSETS', str, 'blocks').lower()
+results_cache_name = 'results_glmsingle.npy'
+load_results_dir = _env_override('GLM_LOAD_DIR', str, '').strip()
+load_results_dir = Path(load_results_dir).expanduser().resolve() if load_results_dir else None
 
 glmsingle_wantlibrary = 1
 glmsingle_wantglmdenoise = 1
@@ -146,6 +149,20 @@ def _trial_keep_mask(metrics, z_thr, fallback_pct, max_drop_fraction, metric):
 
     return keep
 
+def _load_existing_results(load_dir, cache_name):
+    if load_dir is None:
+        return None
+    cache_path = load_dir / cache_name
+    if cache_path.is_file():
+        print(f'Loading cached GLMsingle results from {cache_path}')
+        return np.load(cache_path, allow_pickle=True).item()
+    typed_candidates = sorted(load_dir.glob('TYPED_FITHRF_GLMDENOISE_RR*.npy'))
+    if typed_candidates:
+        typed_path = typed_candidates[0]
+        print(f'Loading cached GLMsingle results from {typed_path}')
+        return {'typed': np.load(typed_path, allow_pickle=True).item()}
+    return None
+
 
 # %%
 sub = subject_id
@@ -236,12 +253,18 @@ if len(extraregressors) == len(runs):
     opt['extra_regressors'] = extraregressors
 opt['chunklen'] = 100000
 # %%
-print('running GLMsingle...')
-glmsingle_obj = GLM_single(opt)
-results_glmsingle = glmsingle_obj.fit(design_matrix, data, stimdur, tr, outputdir=str(outputdir_glmsingle))
+results_glmsingle = _load_existing_results(load_results_dir, results_cache_name)
+if results_glmsingle is None and load_results_dir is not None:
+    print(f'No cached results found in {load_results_dir}; running GLMsingle.')
 
-# GLMsingle wipes outputdir at start, so save sidecar outputs after fit.
-np.save(outputdir_glmsingle / 'mask_indices.npy', np.array(mask_indices, dtype=object))
-for run, keep, metrics in zip(runs, trial_keep_by_run, trial_metrics_by_run):
-    np.save(outputdir_glmsingle / f'trial_keep_run{run}.npy', keep)
-    np.save(outputdir_glmsingle / f'trial_metric_run{run}.npy', metrics)
+if results_glmsingle is None:
+    print('running GLMsingle...')
+    glmsingle_obj = GLM_single(opt)
+    results_glmsingle = glmsingle_obj.fit(design_matrix, data, stimdur, tr, outputdir=str(outputdir_glmsingle))
+    np.save(outputdir_glmsingle / results_cache_name, results_glmsingle)
+
+    # GLMsingle wipes outputdir at start, so save sidecar outputs after fit.
+    np.save(outputdir_glmsingle / 'mask_indices.npy', np.array(mask_indices, dtype=object))
+    for run, keep, metrics in zip(runs, trial_keep_by_run, trial_metrics_by_run):
+        np.save(outputdir_glmsingle / f'trial_keep_run{run}.npy', keep)
+        np.save(outputdir_glmsingle / f'trial_metric_run{run}.npy', metrics)
