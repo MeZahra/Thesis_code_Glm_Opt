@@ -12,12 +12,10 @@ from nilearn import plotting
 import Beta_preprocessing as bp
 
 
-def _mask_cmap(rgb, alpha=0.6):
-    colors = [
-        (0.0, 0.0, 0.0, 0.0),
-        (rgb[0], rgb[1], rgb[2], alpha),
-    ]
-    return ListedColormap(colors)
+def _label_cmap(colors, alpha=0.6):
+    rgba = [(0.0, 0.0, 0.0, 0.0)]
+    rgba.extend((r, g, b, alpha) for r, g, b in colors)
+    return ListedColormap(rgba)
 
 
 def main():
@@ -35,19 +33,40 @@ def main():
     csf_mask = nib.load(str(data_paths["csf"])).get_fdata(dtype=np.float32)
     gray_mask = nib.load(str(data_paths["gray"])).get_fdata(dtype=np.float32)
 
-    back_img = nib.Nifti1Image((back_mask > 0).astype(np.float32), anat_img.affine, anat_img.header)
-    csf_img = nib.Nifti1Image((csf_mask > 0).astype(np.float32), anat_img.affine, anat_img.header)
-    gray_img = nib.Nifti1Image((gray_mask > 0).astype(np.float32), anat_img.affine, anat_img.header)
+    regions = [
+        ("brain", back_mask, (1.0, 0.35, 0.25)),
+        ("csf", csf_mask, (0.2, 0.6, 1.0)),
+        ("gray", gray_mask, (0.2, 0.8, 0.4)),
+    ]
 
-    display = plotting.plot_anat(anat_img, title="Anatomy with CSF/Brain/Gray masks", dim=-1)
-    display.add_overlay(back_img, cmap=_mask_cmap((1.0, 0.35, 0.25)), threshold=0.5)
-    display.add_overlay(csf_img, cmap=_mask_cmap((0.2, 0.6, 1.0)), threshold=0.5)
-    display.add_overlay(gray_img, cmap=_mask_cmap((0.2, 0.8, 0.4)), threshold=0.5)
+    label_data = np.zeros(back_mask.shape, dtype=np.int16)
+    for label_idx, (_, mask_data, _) in enumerate(regions, start=1):
+        label_data[mask_data > 0] = label_idx
 
-    out_png = Path.cwd() / f"mask_overlay_sub{bp.sub}_ses{bp.ses}_run{bp.run}.png"
-    display.savefig(out_png)
-    display.close()
-    print(f"Saved mask overlay PNG: {out_png}", flush=True)
+    label_img = nib.Nifti1Image(label_data, anat_img.affine, anat_img.header)
+    label_cmap = _label_cmap([color for _, _, color in regions], alpha=0.6)
+
+    if not hasattr(plotting, "view_image"):
+        plotting.view_image = plotting.view_img
+
+    view = plotting.view_image(
+        label_img,
+        bg_img=anat_img,
+        cmap=label_cmap,
+        symmetric_cmap=False,
+        vmin=0,
+        vmax=len(regions),
+        threshold=0.5,
+        resampling_interpolation="nearest",
+        opacity=0.6,
+        colorbar=True,
+        title="Anatomy with CSF/Brain/Gray masks",
+    )
+
+    out_html = Path.cwd() / f"mask_overlay_sub{bp.sub}_ses{bp.ses}_run{bp.run}.html"
+    view.save_as_html(out_html)
+    print(f"Saved mask overlay HTML: {out_html}", flush=True)
+    return view
 
 
 if __name__ == "__main__":

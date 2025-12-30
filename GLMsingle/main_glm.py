@@ -158,8 +158,8 @@ for run in runs:
     masked_bold, _ = apply_mask(anat_data, bold_run, mask_indices)
     data.append(masked_bold)
     
-    extraregressors.append(np.mean(bold_run[csf_mask], axis=0))
-extraregressors = np.vstack(extraregressors).T.astype(np.float32)
+    csf_ts = np.mean(bold_run[csf_mask_data], axis=0)
+    extraregressors.append(csf_ts[:, None])
 
 del anat_data
 
@@ -196,7 +196,7 @@ for idx, run in enumerate(runs):
 
 opt = {'wantlibrary': glmsingle_wantlibrary,'wantglmdenoise': int(glmsingle_wantglmdenoise),'wantfracridge': int(glmsingle_wantfracridge),
        'wantfileoutputs': glmsingle_wantfileoutputs, 'wantmemoryoutputs': glmsingle_wantmemoryoutputs}
-if extraregressors and len(extraregressors) == len(runs):
+if len(extraregressors) == len(runs):
     opt['extra_regressors'] = extraregressors
 
 # %%
