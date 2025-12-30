@@ -201,6 +201,7 @@ go_flag = np.loadtxt(go_times_path, dtype=int)
 run_onsets_metric = _trial_onsets_from_blocks(num_trials,stimdur, trial_block_size, trial_rest_trs)
 
 trial_keep_by_run = []
+trial_metrics_by_run = []
 for idx, run in enumerate(runs):
     if trial_onsets_source == 'go_times':
         run_onsets = go_flag[idx][:num_trials]
@@ -209,8 +210,7 @@ for idx, run in enumerate(runs):
     metrics = _trial_metrics(data[idx], run_onsets, stimdur, trial_metric)
     keep = _trial_keep_mask(metrics, trial_z, trial_fallback, trial_max_drop, trial_metric)
     trial_keep_by_run.append(keep)
-    np.save(outputdir_glmsingle / f'trial_keep_run{run}.npy', keep)
-    np.save(outputdir_glmsingle / f'trial_metric_run{run}.npy', metrics)
+    trial_metrics_by_run.append(metrics)
     dropped = int(np.count_nonzero(~keep))
     print(f'Run {run}: dropping {dropped}/{len(keep)} trials (metric={trial_metric}).')
 
@@ -239,3 +239,9 @@ opt['chunklen'] = 100000
 print('running GLMsingle...')
 glmsingle_obj = GLM_single(opt)
 results_glmsingle = glmsingle_obj.fit(design_matrix, data, stimdur, tr, outputdir=str(outputdir_glmsingle))
+
+# GLMsingle wipes outputdir at start, so save sidecar outputs after fit.
+np.save(outputdir_glmsingle / 'mask_indices.npy', np.array(mask_indices, dtype=object))
+for run, keep, metrics in zip(runs, trial_keep_by_run, trial_metrics_by_run):
+    np.save(outputdir_glmsingle / f'trial_keep_run{run}.npy', keep)
+    np.save(outputdir_glmsingle / f'trial_metric_run{run}.npy', metrics)

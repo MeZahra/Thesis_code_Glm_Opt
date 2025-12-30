@@ -560,7 +560,18 @@ def main():
     start_idx = (run-1) * TRIALS_PER_RUN
     end_idx = start_idx + TRIALS_PER_RUN
     beta = beta_glm[:, 0, 0, start_idx:end_idx]
-    beta = beta[keep_voxels]
+    keep_voxels_count = int(np.count_nonzero(keep_voxels))
+    if beta.shape[0] == keep_voxels.shape[0]:
+        beta = beta[keep_voxels]
+    elif beta.shape[0] == keep_voxels_count:
+        # Betas already match the gray-masked voxel set.
+        pass
+    else:
+        raise ValueError(
+            f"Beta voxels ({beta.shape[0]}) do not match mask sizes "
+            f"(mask={keep_voxels.shape[0]}, gray={keep_voxels_count}). "
+            "Provide --mask-indices that match the GLMsingle run or re-run GLMsingle with the same mask."
+        )
     if beta.shape[0] != masked_bold.shape[0]:
         raise ValueError(
             f"Beta voxels ({beta.shape[0]}) do not match masked BOLD ({masked_bold.shape[0]})."
