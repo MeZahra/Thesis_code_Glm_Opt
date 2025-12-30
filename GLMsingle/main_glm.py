@@ -144,7 +144,7 @@ print("loading files...")
 files_cfg = {'bold_template': bold, 'brain_mask': brain_mask_template, 'csf_mask': csf_mask_template, 'gray_mask': gray_mask_template, 'anat': anat_template}
 data_root = Path(__file__).resolve().parent
 data_root = data_root.expanduser().resolve()
-outputdir_glmsingle = data_root / f'GLMOutputs-sub{sub}-ses{ses}'
+outputdir_glmsingle = data_root / f'GLMOutputs-sub{sub}-ses{ses}-{trial_metric}'
 go_times_path = go_times_root / go_times_template.format(sub=sub, ses=ses)
 outputdir_glmsingle.mkdir(parents=True, exist_ok=True)
 data_dir = data_root.parent / 'sub09_ses1'
