@@ -765,14 +765,7 @@ def main():
     if beta.shape[0] == keep_voxels.shape[0]:
         beta = beta[keep_voxels]
     elif beta.shape[0] == keep_voxels_count:
-        # Betas already match the gray-masked voxel set.
         pass
-    else:
-        raise ValueError(
-            f"Beta voxels ({beta.shape[0]}) do not match mask sizes "
-            f"(mask={keep_voxels.shape[0]}, gray={keep_voxels_count}). "
-            "Provide --mask-indices that match the GLMsingle run or re-run GLMsingle with the same mask."
-        )
     # if beta.shape[0] != masked_bold.shape[0]:
     #     raise ValueError(
     #         f"Beta voxels ({beta.shape[0]}) do not match masked BOLD ({masked_bold.shape[0]})."
@@ -785,7 +778,7 @@ def main():
         masked_coords = tuple(coord[~nan_voxels] for coord in masked_coords)
     # print(f"Beta Shape: {beta.shape}, Bold shape: {bold_data_reshape.shape}")
     beta_overlay = _mean_abs_beta_volume(beta, masked_coords, volume_shape)
-    _save_overlay_html(beta_overlay, anat_img=anat_img, out_html=str(beta_overlay_html_path), title='Mean |beta| (pre-outlier)', 
+    _save_overlay_html(beta_overlay, anat_img=anat_img, out_html=str(beta_overlay_html_path), title='', 
                        threshold_pct=overlay_threshold_pct, vmax_pct=overlay_vmax_pct, cut_coords=cut_coords)
 
     print("Remove Outlier Beta Values...")
@@ -814,7 +807,7 @@ def main():
     # print(f"Clean Beta Shape: {clean_beta.shape}, Bold shape: {bold_data_reshape.shape}")
     clean_beta_coords = tuple(coord[keeped_mask] for coord in masked_coords)
     clean_beta_overlay = _mean_abs_beta_volume(clean_beta, clean_beta_coords, volume_shape)
-    _save_overlay_html(clean_beta_overlay, anat_img=anat_img, out_html=str(clean_beta_overlay_html_path), title='Mean |beta| (post-outlier)',
+    _save_overlay_html(clean_beta_overlay, anat_img=anat_img, out_html=str(clean_beta_overlay_html_path), title='',
                        threshold_pct=overlay_threshold_pct, vmax_pct=overlay_vmax_pct, cut_coords=cut_coords)
     
     print(f"Apply ttest?: {args.skip_ttest}")
@@ -839,8 +832,8 @@ def main():
         # print(f"After ttest: Beta Shape: {clean_active_beta.shape}, Bold shape: {clean_active_bold.shape}")
         ttest_coords = tuple(coord[clean_active_idx] for coord in masked_coords)
         ttest_beta_overlay = _mean_abs_beta_volume(clean_active_beta, ttest_coords, volume_shape)
-        _save_overlay_html(ttest_beta_overlay, anat_img=anat_img, out_html=str(ttest_beta_overlay_html_path),
-                           title='Mean |beta| (post-ttest)', threshold_pct=overlay_threshold_pct, vmax_pct=overlay_vmax_pct, cut_coords=cut_coords)
+        _save_overlay_html(ttest_beta_overlay, anat_img=anat_img, out_html=str(ttest_beta_overlay_html_path), title='', 
+                           threshold_pct=overlay_threshold_pct, vmax_pct=overlay_vmax_pct, cut_coords=cut_coords)
 
     num_trials = clean_active_beta.shape[1]
     clean_active_volume = np.full(volume_shape + (num_trials,), np.nan)
