@@ -782,19 +782,37 @@ def main():
                        threshold_pct=overlay_threshold_pct, vmax_pct=overlay_vmax_pct, cut_coords=cut_coords)
 
     print("Remove Outlier Beta Values...")
-    med = np.nanmedian(beta, keepdims=True)
-    mad = np.nanmedian(np.abs(beta - med), keepdims=True)
+    # My code
+    # med = np.nanmedian(beta, keepdims=True)
+    # mad = np.nanmedian(np.abs(beta - med), keepdims=True)
+    # scale = 1.4826 * np.maximum(mad, 1e-9)
+    # beta_norm = (beta - med) / scale
+    # thr = np.nanpercentile(np.abs(beta_norm), outlier_percentile)
+    # outlier_mask = np.abs(beta_norm) > thr
+    # clean_beta = beta.copy()
+    # voxel_outlier_fraction = np.mean(outlier_mask, axis=1)
+    # valid_voxels = voxel_outlier_fraction <= max_outlier_fraction
+    # clean_beta[~valid_voxels] = np.nan
+    # clean_beta[np.logical_and(outlier_mask, valid_voxels[:, None])] = np.nan
+    # keeped_mask = ~np.all(np.isnan(clean_beta), axis=1)
+
+    # GPT code
+    # per-voxel robust z
+    med = np.nanmedian(beta, axis=1, keepdims=True)
+    mad = np.nanmedian(np.abs(beta - med), axis=1, keepdims=True)
     scale = 1.4826 * np.maximum(mad, 1e-9)
     beta_norm = (beta - med) / scale
-    thr = np.nanpercentile(np.abs(beta_norm), outlier_percentile)
+    # per-voxel threshold or fixed z
+    thr = np.nanpercentile(np.abs(beta_norm), outlier_percentile, axis=1, keepdims=True)
     outlier_mask = np.abs(beta_norm) > thr
-
     clean_beta = beta.copy()
-    voxel_outlier_fraction = np.mean(outlier_mask, axis=1)
-    valid_voxels = voxel_outlier_fraction <= max_outlier_fraction
+    clean_beta[outlier_mask] = np.nan
+    min_valid_trials = int(0.7 * total_trials)
+    valid_voxels = np.sum(np.isfinite(clean_beta), axis=1) >= min_valid_trials
     clean_beta[~valid_voxels] = np.nan
-    clean_beta[np.logical_and(outlier_mask, valid_voxels[:, None])] = np.nan
-    keeped_mask = ~np.all(np.isnan(clean_beta), axis=1)
+    keeped_mask = valid_voxels
+    # GPT code finish
+
 
     clean_beta = clean_beta[keeped_mask]
     keeped_indices = np.flatnonzero(keeped_mask)
