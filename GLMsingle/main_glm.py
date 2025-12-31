@@ -49,8 +49,6 @@ def _env_override(name, cast, default):
     except ValueError as exc:
         raise ValueError(f"Invalid value for {name}: {value!r}") from exc
 
-mask_mode = _env_override('GLM_MASK_MODE', str, mask_mode)
-output_tag = _env_override('GLM_OUTPUT_TAG', str, '').strip()
 trial_metric = _env_override('GLM_TRIAL_METRIC', str, 'std')
 trial_z = _env_override('GLM_TRIAL_Z', float, 3)
 trial_fallback = _env_override('GLM_TRIAL_FALLBACK', float, 95)
@@ -175,8 +173,7 @@ print("loading files...")
 files_cfg = {'bold_template': bold, 'brain_mask': brain_mask_template, 'csf_mask': csf_mask_template, 'gray_mask': gray_mask_template, 'anat': anat_template}
 data_root = Path(__file__).resolve().parent
 data_root = data_root.expanduser().resolve()
-output_suffix = f'-{output_tag}' if output_tag else ''
-outputdir_glmsingle = data_root / f'GLMOutputs-sub{sub}-ses{ses}-{trial_metric}{output_suffix}'
+outputdir_glmsingle = data_root / f'GLMOutputs-sub{sub}-ses{ses}-{trial_metric}'
 outputdir_glmsingle.mkdir(parents=True, exist_ok=True)
 if load_results_dir is None:
     load_results_dir = outputdir_glmsingle
@@ -224,13 +221,11 @@ run_onsets_metric = _trial_onsets_from_blocks(num_trials,stimdur, trial_block_si
 
 trial_keep_by_run = []
 trial_metrics_by_run = []
-trial_onsets_by_run = []
 for idx, run in enumerate(runs):
     if trial_onsets_source == 'go_times':
         run_onsets = go_flag[idx][:num_trials]
     else:
         run_onsets = run_onsets_metric
-    trial_onsets_by_run.append(run_onsets)
     metrics = _trial_metrics(data[idx], run_onsets, stimdur, trial_metric)
     keep = _trial_keep_mask(metrics, trial_z, trial_fallback, trial_max_drop, trial_metric)
     trial_keep_by_run.append(keep)
@@ -243,7 +238,7 @@ print("Create Design matrix...")
 design_matrix = []
 for idx, run in enumerate(runs):
     design = np.zeros((num_timepoints, 1), dtype=int)
-    run_onsets_design = trial_onsets_by_run[idx]
+    run_onsets_design = go_flag[idx][:num_trials]
     keep = trial_keep_by_run[idx]
     for onset, keep_trial in zip(run_onsets_design, keep):
         if not keep_trial:
