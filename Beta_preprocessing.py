@@ -127,11 +127,7 @@ def _save_overlay_html(data, anat_img, out_html, title, threshold_pct, vmax_pct,
     print(f'Saved overlay: {out_html}', flush=True)
 
 def _with_tag(path, tag):
-    if not tag:
-        return path
     safe_tag = str(tag).strip().replace(' ', '_')
-    if not safe_tag:
-        return path
     if path.name.endswith(".nii.gz"):
         base = path.name[:-7]
         return path.with_name(f"{base}_{safe_tag}.nii.gz")
@@ -164,8 +160,6 @@ def _load_mask_indices(path):
     data = np.load(str(path), allow_pickle=True)
     if isinstance(data, np.ndarray):
         data = tuple(data)
-    if not isinstance(data, tuple) or len(data) != 3:
-        raise ValueError(f"Invalid mask indices in {path}")
     axes = []
     for ax in data:
         ax_arr = np.asarray(ax)
@@ -173,11 +167,7 @@ def _load_mask_indices(path):
             axes.append(ax_arr.astype(np.intp, copy=False))
             continue
         ax_float = ax_arr.astype(np.float64)
-        if not np.all(np.isfinite(ax_float)):
-            raise ValueError(f"Invalid mask indices in {path}: non-finite values.")
         ax_round = np.rint(ax_float)
-        if not np.allclose(ax_float, ax_round):
-            raise ValueError(f"Invalid mask indices in {path}: non-integer values.")
         axes.append(ax_round.astype(np.intp))
     return tuple(axes)
 
@@ -653,11 +643,8 @@ def _parse_args():
     parser.add_argument('--output-dir', type=str, default=None)
     parser.add_argument('--output-tag', type=str, default=None)
     parser.add_argument('--mask-indices', type=str, default=None)
-    parser.add_argument('--runs', type=str, default=None,
-                       help='Comma-separated run numbers to use (e.g., "1" or "1,2"); default uses RUNS.')
-    parser.add_argument('--roi-stat', type=str, default='percentile_95',
-                       choices=['mean', 'mean_abs', 'percentile_95', 'percentile_95', 'peak'],
-                       help='ROI summary statistic (default: percentile_95)')
+    parser.add_argument('--runs', type=str, default=None, help='Comma-separated run numbers to use (e.g., "1" or "1,2"); default uses RUNS.')
+    parser.add_argument('--roi-stat', type=str, default='percentile_95', choices=['mean', 'mean_abs', 'percentile_95', 'percentile_95', 'peak'], help='ROI summary statistic (default: percentile_95)')
     return parser.parse_args()
 
 def _parse_runs_arg(runs_arg, available_runs):
