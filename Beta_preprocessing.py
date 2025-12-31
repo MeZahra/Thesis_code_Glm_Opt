@@ -559,10 +559,10 @@ def _rank_rois_by_beta(summary, anat_img, anat_path, ref_img, out_path, atlas_th
                 roi_stat = float(np.nanmean(finite))
             elif summary_stat == 'mean_abs':
                 roi_stat = float(np.nanmean(np.abs(finite)))
-            elif summary_stat == 'percentile_85':
-                roi_stat = float(np.nanpercentile(finite, 85))
-            elif summary_stat == 'percentile_80':
-                roi_stat = float(np.nanpercentile(finite, 80))
+            elif summary_stat == 'percentile_95':
+                roi_stat = float(np.nanpercentile(finite, 95))
+            elif summary_stat == 'percentile_90':
+                roi_stat = float(np.nanpercentile(finite, 90))
             elif summary_stat == 'peak':
                 roi_stat = float(np.nanmax(finite))
             else:
@@ -653,10 +653,21 @@ def _parse_args():
     parser.add_argument('--output-dir', type=str, default=None)
     parser.add_argument('--output-tag', type=str, default=None)
     parser.add_argument('--mask-indices', type=str, default=None)
+    parser.add_argument('--runs', type=str, default=None,
+                       help='Comma-separated run numbers to use (e.g., "1" or "1,2"); default uses RUNS.')
     parser.add_argument('--roi-stat', type=str, default='percentile_95',
-                       choices=['mean', 'mean_abs', 'percentile_85', 'percentile_80', 'peak'],
+                       choices=['mean', 'mean_abs', 'percentile_95', 'percentile_95', 'peak'],
                        help='ROI summary statistic (default: percentile_95)')
     return parser.parse_args()
+
+def _parse_runs_arg(runs_arg, available_runs):
+    parts = [p.strip() for p in str(runs_arg).split(",") if p.strip()]
+    runs = []
+    for part in parts:
+        runs.append(int(part))
+    unknown = [r for r in runs if r not in available_runs]
+    requested = set(runs)
+    return [r for r in available_runs if r in requested]
 
 def main():
     """Run the beta preprocessing pipeline.
@@ -664,10 +675,12 @@ def main():
     Outputs are written to the current working directory.
     """
     args = _parse_args()
+    selected_runs = _parse_runs_arg(args.runs, RUNS)
+    run_tag = "_".join(str(r) for r in selected_runs)
     data_root = (Path.cwd() / DATA_DIRNAME).resolve()
     
     print("Define Parameters ....")
-    fdr_alpha = 0.01   # FDR alpha for voxelwise t-tests. 0.05
+    fdr_alpha = 0.03   # FDR alpha for voxelwise t-tests. 0.05
     hampel_window = 5      # Hampel filter window size (voxels).
     hampel_threshold = 3.0   # Hampel MAD multiplier for outliers.
     outlier_percentile = 99.9      # Percentile cutoff for beta outliers.
@@ -685,16 +698,16 @@ def main():
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     output_tag = args.output_tag
-    beta_overlay_html_path = _with_tag(output_dir / f'beta_overlay_sub{sub}_ses{ses}_run{RUN_TAG}.html', output_tag)
-    clean_beta_overlay_html_path = _with_tag(output_dir / f'clean_beta_overlay_sub{sub}_ses{ses}_run{RUN_TAG}.html', output_tag)
-    ttest_beta_overlay_html_path = _with_tag(output_dir / f'ttest_beta_overlay_sub{sub}_ses{ses}_run{RUN_TAG}.html', output_tag)
-    overlay_html_path = _with_tag(output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{RUN_TAG}.html', output_tag)
+    beta_overlay_html_path = _with_tag(output_dir / f'beta_overlay_sub{sub}_ses{ses}_run{run_tag}.html', output_tag)
+    clean_beta_overlay_html_path = _with_tag(output_dir / f'clean_beta_overlay_sub{sub}_ses{ses}_run{run_tag}.html', output_tag)
+    ttest_beta_overlay_html_path = _with_tag(output_dir / f'ttest_beta_overlay_sub{sub}_ses{ses}_run{run_tag}.html', output_tag)
+    overlay_html_path = _with_tag(output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{run_tag}.html', output_tag)
     overlay_snapshot_path = overlay_html_path.with_suffix(".png")
-    cached_beta_path = _with_tag(output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{RUN_TAG}.npy', output_tag)
+    cached_beta_path = _with_tag(output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run_tag}.npy', output_tag)
 
     print("Loading Files ...")
     sub_label = f'sub-pd0{sub}'
-    bold_paths = [data_root / f'{sub_label}_ses-{ses}_run-{r}_task-mv_bold_corrected_smoothed_reg.nii.gz' for r in RUNS]
+    bold_paths = [data_root / f'{sub_label}_ses-{ses}_run-{r}_task-mv_bold_corrected_smoothed_reg.nii.gz' for r in selected_runs]
     data_paths = {'bold': bold_paths[0], 'anat': data_root / f'{sub_label}_ses-{ses}_T1w_brain.nii.gz',
         'brain': data_root / f'{sub_label}_ses-{ses}_T1w_brain_mask.nii.gz', 'csf': data_root / f'{sub_label}_ses-{ses}_T1w_brain_pve_0.nii.gz', 'gray': data_root / f'{sub_label}_ses-{ses}_T1w_brain_pve_1.nii.gz'}
     anat_img = nib.load(str(data_paths['anat']))
@@ -714,14 +727,14 @@ def main():
     if cached_beta_path.exists():
         beta_volume_filter = np.load(cached_beta_path)
         mean_clean_active = np.nanmean(np.abs(beta_volume_filter), axis=-1)
-        mean_clean_active_path = _with_tag(output_dir / f'mean_clean_active_sub{sub}_ses{ses}_run{RUN_TAG}.nii.gz', output_tag)
+        mean_clean_active_path = _with_tag(output_dir / f'mean_clean_active_sub{sub}_ses{ses}_run{run_tag}.nii.gz', output_tag)
         mean_clean_active_img = nib.Nifti1Image(mean_clean_active.astype(np.float32), anat_img.affine, anat_img.header)
         mean_clean_active_img.to_filename(str(mean_clean_active_path))
         print(f'Saved mean_clean_active: {mean_clean_active_path}', flush=True)
         _save_beta_overlay(mean_clean_active, anat_img=anat_img, out_html=str(overlay_html_path),threshold_pct=overlay_threshold_pct,
                             vmax_pct=overlay_vmax_pct, cut_coords=cut_coords, snapshot_path=str(overlay_snapshot_path))
         if not skip_roi_ranking:
-            roi_rank_path = _with_tag(output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{RUN_TAG}.csv', output_tag)
+            roi_rank_path = _with_tag(output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run_tag}.csv', output_tag)
             _rank_rois_by_beta(mean_clean_active, anat_img=anat_img, anat_path=data_paths['anat'], ref_img=anat_img, out_path=roi_rank_path,
                                 atlas_threshold=roi_atlas_threshold, label_patterns=roi_label_patterns, assume_mni=False, summary_stat=args.roi_stat)
         return
@@ -748,6 +761,18 @@ def main():
     start_idx = 0
     end_idx = beta_glm.shape[-1]
     beta = beta_glm[:, 0, 0, start_idx:end_idx]
+    if args.runs:
+        run_to_pos = {run: idx for idx, run in enumerate(RUNS)}
+        run_slices = []
+        for run in selected_runs:
+            pos = run_to_pos[run]
+            run_start = pos * TRIALS_PER_RUN
+            run_end = run_start + TRIALS_PER_RUN
+            run_slices.append(slice(run_start, run_end))
+        if len(run_slices) == 1:
+            beta = beta[:, run_slices[0]]
+        else:
+            beta = np.concatenate([beta[:, s] for s in run_slices], axis=1)
     total_trials = beta.shape[1]
     keep_voxels_count = int(np.count_nonzero(keep_voxels))
     if beta.shape[0] == keep_voxels.shape[0]:
@@ -870,14 +895,14 @@ def main():
     # np.save(output_dir / f"active_coords_sub{sub}_ses{ses}_run{run}.npy", active_coords)
 
     mean_clean_active = np.nanmean(np.abs(beta_volume_filter), axis=-1)
-    mean_clean_active_path = _with_tag(output_dir / f'mean_clean_active_sub{sub}_ses{ses}_run{RUN_TAG}.nii.gz', output_tag)
+    mean_clean_active_path = _with_tag(output_dir / f'mean_clean_active_sub{sub}_ses{ses}_run{run_tag}.nii.gz', output_tag)
     mean_clean_active_img = nib.Nifti1Image(mean_clean_active.astype(np.float32), anat_img.affine, anat_img.header)
     mean_clean_active_img.to_filename(str(mean_clean_active_path))
     print(f'Saved mean_clean_active: {mean_clean_active_path}', flush=True)
     _save_beta_overlay(mean_clean_active, anat_img=anat_img, out_html=str(overlay_html_path), threshold_pct=overlay_threshold_pct, 
                        vmax_pct=overlay_vmax_pct, cut_coords=cut_coords, snapshot_path=str(overlay_snapshot_path))
     if not skip_roi_ranking:
-        roi_rank_path = _with_tag(output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{RUN_TAG}.csv', output_tag)
+        roi_rank_path = _with_tag(output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run_tag}.csv', output_tag)
         _rank_rois_by_beta(mean_clean_active, anat_img=anat_img, anat_path=data_paths['anat'], ref_img=anat_img, out_path=roi_rank_path,
                            atlas_threshold=roi_atlas_threshold, label_patterns=roi_label_patterns, assume_mni=False, summary_stat=args.roi_stat)
 
