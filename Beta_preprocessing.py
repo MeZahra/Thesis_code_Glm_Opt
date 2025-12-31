@@ -17,9 +17,11 @@ from nilearn import datasets, image, plotting
 DATA_DIRNAME = 'sub09_ses1'
 sub = '09'
 ses = 1
-run = 1
+RUNS = (1, 2)
+RUN_TAG = "_".join(str(r) for r in RUNS)
 TRIAL_LEN = 9
 TRIALS_PER_RUN = 90
+TOTAL_TRIALS = TRIALS_PER_RUN * len(RUNS)
 
 # %%
 def _extract_trial_segments(masked_bold, trial_len, num_trials, rest_every = 30, rest_len = 20):
@@ -683,20 +685,22 @@ def main():
     output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     output_tag = args.output_tag
-    beta_overlay_html_path = _with_tag(output_dir / f'beta_overlay_sub{sub}_ses{ses}_run{run}.html', output_tag)
-    clean_beta_overlay_html_path = _with_tag(output_dir / f'clean_beta_overlay_sub{sub}_ses{ses}_run{run}.html', output_tag)
-    ttest_beta_overlay_html_path = _with_tag(output_dir / f'ttest_beta_overlay_sub{sub}_ses{ses}_run{run}.html', output_tag)
-    overlay_html_path = _with_tag(output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{run}.html', output_tag)
+    beta_overlay_html_path = _with_tag(output_dir / f'beta_overlay_sub{sub}_ses{ses}_run{RUN_TAG}.html', output_tag)
+    clean_beta_overlay_html_path = _with_tag(output_dir / f'clean_beta_overlay_sub{sub}_ses{ses}_run{RUN_TAG}.html', output_tag)
+    ttest_beta_overlay_html_path = _with_tag(output_dir / f'ttest_beta_overlay_sub{sub}_ses{ses}_run{RUN_TAG}.html', output_tag)
+    overlay_html_path = _with_tag(output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{RUN_TAG}.html', output_tag)
     overlay_snapshot_path = overlay_html_path.with_suffix(".png")
-    cached_beta_path = _with_tag(output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy', output_tag)
+    cached_beta_path = _with_tag(output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{RUN_TAG}.npy', output_tag)
 
     print("Loading Files ...")
     sub_label = f'sub-pd0{sub}'
-    data_paths = {'bold': data_root / f'{sub_label}_ses-{ses}_run-{run}_task-mv_bold_corrected_smoothed_reg.nii.gz', 'anat': data_root / f'{sub_label}_ses-{ses}_T1w_brain.nii.gz',
+    bold_paths = [data_root / f'{sub_label}_ses-{ses}_run-{r}_task-mv_bold_corrected_smoothed_reg.nii.gz' for r in RUNS]
+    data_paths = {'bold': bold_paths[0], 'anat': data_root / f'{sub_label}_ses-{ses}_T1w_brain.nii.gz',
         'brain': data_root / f'{sub_label}_ses-{ses}_T1w_brain_mask.nii.gz', 'csf': data_root / f'{sub_label}_ses-{ses}_T1w_brain_pve_0.nii.gz', 'gray': data_root / f'{sub_label}_ses-{ses}_T1w_brain_pve_1.nii.gz'}
     anat_img = nib.load(str(data_paths['anat']))
-    bold_img = nib.load(str(data_paths['bold']))
-    bold_data = bold_img.get_fdata()
+    bold_imgs = [nib.load(str(path)) for path in bold_paths]
+    bold_img = bold_imgs[0]
+    bold_data = np.concatenate([img.get_fdata() for img in bold_imgs], axis=3)
     glmsingle_file = Path(args.glmsingle_file) if args.glmsingle_file else (data_root / 'TYPED_FITHRF_GLMDENOISE_RR.npy')
     if not glmsingle_file.exists():
         raise FileNotFoundError(f"GLMsingle output not found: {glmsingle_file}")
@@ -709,14 +713,14 @@ def main():
     if cached_beta_path.exists():
         beta_volume_filter = np.load(cached_beta_path)
         mean_clean_active = np.nanmean(np.abs(beta_volume_filter), axis=-1)
-        mean_clean_active_path = _with_tag(output_dir / f'mean_clean_active_sub{sub}_ses{ses}_run{run}.nii.gz', output_tag)
+        mean_clean_active_path = _with_tag(output_dir / f'mean_clean_active_sub{sub}_ses{ses}_run{RUN_TAG}.nii.gz', output_tag)
         mean_clean_active_img = nib.Nifti1Image(mean_clean_active.astype(np.float32), anat_img.affine, anat_img.header)
         mean_clean_active_img.to_filename(str(mean_clean_active_path))
         print(f'Saved mean_clean_active: {mean_clean_active_path}', flush=True)
         _save_beta_overlay(mean_clean_active, anat_img=anat_img, out_html=str(overlay_html_path),threshold_pct=overlay_threshold_pct,
                             vmax_pct=overlay_vmax_pct, cut_coords=cut_coords, snapshot_path=str(overlay_snapshot_path))
         if not skip_roi_ranking:
-            roi_rank_path = _with_tag(output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run}.csv', output_tag)
+            roi_rank_path = _with_tag(output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{RUN_TAG}.csv', output_tag)
             _rank_rois_by_beta(mean_clean_active, anat_img=anat_img, anat_path=data_paths['anat'], ref_img=anat_img, out_path=roi_rank_path,
                                 atlas_threshold=roi_atlas_threshold, label_patterns=roi_label_patterns, assume_mni=False, summary_stat=args.roi_stat)
         return
@@ -740,9 +744,10 @@ def main():
     masked_coords = tuple(ax[keep_voxels] for ax in nonzero_mask)
 
     print("Reshape Bold and Beta datasets...")
-    start_idx = (run-1) * TRIALS_PER_RUN
-    end_idx = start_idx + TRIALS_PER_RUN
+    start_idx = 0
+    end_idx = beta_glm.shape[-1]
     beta = beta_glm[:, 0, 0, start_idx:end_idx]
+    total_trials = beta.shape[1]
     keep_voxels_count = int(np.count_nonzero(keep_voxels))
     if beta.shape[0] == keep_voxels.shape[0]:
         beta = beta[keep_voxels]
@@ -759,7 +764,7 @@ def main():
         raise ValueError(
             f"Beta voxels ({beta.shape[0]}) do not match masked BOLD ({masked_bold.shape[0]})."
         )
-    bold_data_reshape = _extract_trial_segments(masked_bold, trial_len=TRIAL_LEN, num_trials=TRIALS_PER_RUN, rest_every=30, rest_len=20)
+    bold_data_reshape = _extract_trial_segments(masked_bold, trial_len=TRIAL_LEN, num_trials=total_trials, rest_every=30, rest_len=20)
     print("Remove NaN voxels...")
     nan_voxels = np.isnan(beta).all(axis=1)
     if np.any(nan_voxels):
@@ -865,14 +870,14 @@ def main():
     # np.save(output_dir / f"active_coords_sub{sub}_ses{ses}_run{run}.npy", active_coords)
 
     mean_clean_active = np.nanmean(np.abs(beta_volume_filter), axis=-1)
-    mean_clean_active_path = _with_tag(output_dir / f'mean_clean_active_sub{sub}_ses{ses}_run{run}.nii.gz', output_tag)
+    mean_clean_active_path = _with_tag(output_dir / f'mean_clean_active_sub{sub}_ses{ses}_run{RUN_TAG}.nii.gz', output_tag)
     mean_clean_active_img = nib.Nifti1Image(mean_clean_active.astype(np.float32), anat_img.affine, anat_img.header)
     mean_clean_active_img.to_filename(str(mean_clean_active_path))
     print(f'Saved mean_clean_active: {mean_clean_active_path}', flush=True)
     _save_beta_overlay(mean_clean_active, anat_img=anat_img, out_html=str(overlay_html_path), threshold_pct=overlay_threshold_pct, 
                        vmax_pct=overlay_vmax_pct, cut_coords=cut_coords, snapshot_path=str(overlay_snapshot_path))
     if not skip_roi_ranking:
-        roi_rank_path = _with_tag(output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run}.csv', output_tag)
+        roi_rank_path = _with_tag(output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{RUN_TAG}.csv', output_tag)
         _rank_rois_by_beta(mean_clean_active, anat_img=anat_img, anat_path=data_paths['anat'], ref_img=anat_img, out_path=roi_rank_path,
                            atlas_threshold=roi_atlas_threshold, label_patterns=roi_label_patterns, assume_mni=False, summary_stat=args.roi_stat)
 
