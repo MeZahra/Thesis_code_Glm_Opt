@@ -509,10 +509,10 @@ def _rank_rois_by_beta(summary, anat_img, anat_path, ref_img, out_path, atlas_th
                 roi_stat = float(np.nanmean(finite))
             elif summary_stat == 'mean_abs':
                 roi_stat = float(np.nanmean(np.abs(finite)))
-            elif summary_stat == 'percentile_95':
-                roi_stat = float(np.nanpercentile(finite, 95))
-            elif summary_stat == 'percentile_90':
-                roi_stat = float(np.nanpercentile(finite, 90))
+            elif summary_stat == 'percentile_85':
+                roi_stat = float(np.nanpercentile(finite, 85))
+            elif summary_stat == 'percentile_80':
+                roi_stat = float(np.nanpercentile(finite, 80))
             elif summary_stat == 'peak':
                 roi_stat = float(np.nanmax(finite))
             else:
@@ -604,7 +604,7 @@ def _parse_args():
     parser.add_argument('--output-tag', type=str, default=None)
     parser.add_argument('--mask-indices', type=str, default=None)
     parser.add_argument('--roi-stat', type=str, default='percentile_95',
-                       choices=['mean', 'mean_abs', 'percentile_95', 'percentile_90', 'peak'],
+                       choices=['mean', 'mean_abs', 'percentile_85', 'percentile_80', 'peak'],
                        help='ROI summary statistic (default: percentile_95)')
     return parser.parse_args()
 
@@ -617,11 +617,11 @@ def main():
     data_root = (Path.cwd() / DATA_DIRNAME).resolve()
     
     print("Define Parameters ....")
-    fdr_alpha = 0.05   # FDR alpha for voxelwise t-tests.
+    fdr_alpha = 0.01   # FDR alpha for voxelwise t-tests. 0.05
     hampel_window = 5      # Hampel filter window size (voxels).
     hampel_threshold = 3.0   # Hampel MAD multiplier for outliers.
     outlier_percentile = 99.9      # Percentile cutoff for beta outliers.
-    max_outlier_fraction = 0.5     # Max outlier fraction per voxel.
+    max_outlier_fraction = 0.3     # Max outlier fraction per voxel. 0.5
     overlay_threshold_pct = 60      # Overlay threshold percentile.
     overlay_vmax_pct = 99.9      # Overlay vmax percentile.
     cut_coords = None      # Slice coords for overlay; None uses default cuts.
