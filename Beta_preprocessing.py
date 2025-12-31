@@ -179,22 +179,49 @@ def _load_mask_indices(path):
         axes.append(ax_round.astype(np.intp))
     return tuple(axes)
 
-def _default_mni_template():
-    """Return an MNI template path from FSLDIR if available.
+def _resolve_fsl_dir(flirt_path=None):
+    """Resolve FSLDIR from a flirt path or environment."""
+    if flirt_path:
+        try:
+            flirt_path = Path(flirt_path).resolve()
+        except OSError:
+            flirt_path = None
+    if flirt_path:
+        candidate = flirt_path.parent.parent
+        if (candidate / "data" / "standard").exists():
+            return candidate
+    fsl_dir = os.environ.get("FSLDIR")
+    if fsl_dir:
+        return Path(fsl_dir)
+    return None
+
+def _default_mni_template(flirt_path=None):
+    """Return an MNI template path from FSL if available.
 
     Returns
     -------
     Path or None
         Existing template path, or None if not found.
     """
-    fsl_dir = os.environ.get("FSLDIR")
+    fsl_dir = _resolve_fsl_dir(flirt_path)
     if not fsl_dir:
         return None
-    fsl_dir = Path(fsl_dir)
     for name in ("MNI152_T1_2mm_brain.nii.gz", "MNI152_T1_1mm_brain.nii.gz"):
         candidate = fsl_dir / "data" / "standard" / name
         if candidate.exists():
             return candidate
+    return None
+
+def _find_flirt():
+    flirt_path = shutil.which("flirt")
+    if flirt_path:
+        return flirt_path
+    fsl_dir = os.environ.get("FSLDIR")
+    if not fsl_dir:
+        return None
+    candidate = Path(fsl_dir) / "bin" / "flirt"
+    if candidate.exists():
+        return str(candidate)
     return None
 
 def _run_flirt(cmd):
@@ -376,7 +403,7 @@ def _select_roi_indices(labels, label_patterns):
             indices.append(idx)
     return indices
 
-def _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_dir, assume_mni=False):
+def _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_dir, assume_mni=False, return_method=False):
     """Resample atlas to the reference image space.
 
     Parameters
@@ -393,23 +420,29 @@ def _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_dir, 
         Directory for FLIRT outputs and temporary files.
     assume_mni : bool, optional
         If True, skip MNI-to-anat registration and only resample.
+    return_method : bool, optional
+        If True, also return the registration method string ('flirt' or 'resample').
 
     Returns
     -------
     atlas_in_ref : nib.Nifti1Image
         Atlas resampled to ref_img space (shape ref_img.shape[:3]).
+    registration_method : str, optional
+        Returned only when return_method is True.
     """
     use_flirt = False
     flirt_path = None
     mni_template_img = None
+    registration_method = "resample"
 
     if not assume_mni:
-        flirt_path = shutil.which("flirt")
-        mni_template = _default_mni_template()
+        flirt_path = _find_flirt()
+        mni_template = _default_mni_template(flirt_path)
         if flirt_path and mni_template and mni_template.exists():
             mni_template_img = nib.load(str(mni_template))
             _compute_mni_to_anat(mni_template, anat_path, out_dir, flirt_path)
             use_flirt = True
+            registration_method = "flirt"
             print("Registered MNI template to anatomy with FLIRT.", flush=True)
         else:
             print("Warning: FLIRT or MNI template not available; falling back to header-based resampling.", flush=True)
@@ -432,15 +465,19 @@ def _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_dir, 
         atlas_in_anat = image.resample_to_img(atlas_img, anat_img, interpolation="nearest", force_resample=True, copy_header=True)
 
     # Diagnostic output
-    registration_method = 'FLIRT registration' if use_flirt else 'header-based resampling'
-    print(f"Atlas alignment method: {registration_method}", flush=True)
+    method_label = 'FLIRT registration' if use_flirt else 'header-based resampling'
+    print(f"Atlas alignment method: {method_label}", flush=True)
     if not use_flirt:
         print("WARNING: Using fallback resampling - atlas alignment may be suboptimal", flush=True)
 
     if (atlas_in_anat.shape[:3] != ref_img.shape[:3] or not np.allclose(atlas_in_anat.affine, ref_img.affine)):
         atlas_in_ref = image.resample_to_img(atlas_in_anat, ref_img, interpolation="nearest", force_resample=True, copy_header=True)
+        if return_method:
+            return atlas_in_ref, registration_method
         return atlas_in_ref
 
+    if return_method:
+        return atlas_in_anat, registration_method
     return atlas_in_anat
 
 def _rank_rois_by_beta(summary, anat_img, anat_path, ref_img, out_path, atlas_threshold, label_patterns, assume_mni, summary_stat='percentile_95'):
@@ -477,14 +514,25 @@ def _rank_rois_by_beta(summary, anat_img, anat_path, ref_img, out_path, atlas_th
     if summary.shape != ref_img.shape[:3]:
         raise ValueError(f"Summary shape does not match ROI reference image; summary shape={summary.shape}, ref shape={ref_img.shape[:3]}.")
 
-    atlas_in_ref = _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_path.parent, assume_mni=assume_mni)
+    atlas_in_ref, registration_method = _align_atlas_to_reference(
+        atlas_img,
+        anat_img,
+        anat_path,
+        ref_img,
+        out_path.parent,
+        assume_mni=assume_mni,
+        return_method=True,
+    )
 
     # Generate atlas QC diagnostics
     brain_mask_path = str(anat_path).replace('T1w_brain.nii.gz', 'T1w_brain_mask.nii.gz')
     if Path(brain_mask_path).exists():
-        registration_method = 'flirt' if not assume_mni else 'resample'
         _save_atlas_qc_plots(atlas_in_ref, labels, ref_img, brain_mask_path, out_path.parent,
                             f'thr{atlas_threshold}', registration_method)
+
+    atlas_out_path = out_path.parent / f'atlas_thr{atlas_threshold}_{registration_method}.nii.gz'
+    atlas_in_ref.to_filename(str(atlas_out_path))
+    print(f"Saved aligned atlas: {atlas_out_path}", flush=True)
 
     atlas_data = np.rint(atlas_in_ref.get_fdata(dtype=np.float32)).astype(int)
     indices = _select_roi_indices(labels, label_patterns)
