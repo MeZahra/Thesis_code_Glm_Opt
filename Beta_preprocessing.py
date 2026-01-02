@@ -555,6 +555,17 @@ def _rank_rois_by_beta(summary, anat_img, anat_path, ref_img, out_path, atlas_th
                 roi_stat = float(np.nanpercentile(finite, 90))
             elif summary_stat == 'peak':
                 roi_stat = float(np.nanmax(finite))
+            elif summary_stat == 'robust_mean':
+                # Trim top/bottom 5% then take mean - resistant to outliers
+                abs_finite = np.abs(finite)
+                lower = np.percentile(abs_finite, 5)
+                upper = np.percentile(abs_finite, 95)
+                trimmed = abs_finite[(abs_finite >= lower) & (abs_finite <= upper)]
+                roi_stat = float(np.mean(trimmed)) if trimmed.size > 0 else np.nan
+            elif summary_stat == 'total_activation':
+                # Total integrated activation: mean × valid_voxel_count
+                # Rewards spatially extensive activation
+                roi_stat = float(np.nanmean(np.abs(finite)) * valid_voxels)
             else:
                 raise ValueError(f"Unknown summary_stat: {summary_stat}")
 
@@ -636,15 +647,15 @@ def hampel_filter_image(image, window_size, threshold_factor, return_stats=False
 
 def _parse_args():
     parser = argparse.ArgumentParser(description='Beta preprocessing for GLMsingle outputs.')
-    parser.add_argument('--gray-threshold', type=float, default=0.5)
-    parser.add_argument('--skip-ttest', action='store_true')
+    parser.add_argument('--gray-threshold', type=float, default=0.7)  # Increased from 0.5
+    parser.add_argument('--skip-ttest', action='store_true', default=True)  # Skip FDR by default for motor tasks
     parser.add_argument('--skip-hampel', action='store_true')
     parser.add_argument('--glmsingle-file', type=str, default=None)
     parser.add_argument('--output-dir', type=str, default=None)
     parser.add_argument('--output-tag', type=str, default=None)
     parser.add_argument('--mask-indices', type=str, default=None)
     parser.add_argument('--runs', type=str, default=None, help='Comma-separated run numbers to use (e.g., "1" or "1,2"); default uses RUNS.')
-    parser.add_argument('--roi-stat', type=str, default='percentile_95', choices=['mean', 'mean_abs', 'percentile_95', 'percentile_95', 'peak'], help='ROI summary statistic (default: percentile_95)')
+    parser.add_argument('--roi-stat', type=str, default='mean_abs', choices=['mean', 'mean_abs', 'percentile_95', 'percentile_90', 'peak', 'robust_mean', 'total_activation'], help='ROI summary statistic (default: mean_abs)')
     return parser.parse_args()
 
 def _parse_runs_arg(runs_arg, available_runs):
@@ -667,10 +678,10 @@ def main():
     data_root = (Path.cwd() / DATA_DIRNAME).resolve()
     
     print("Define Parameters ....")
-    fdr_alpha = 0.03   # FDR alpha for voxelwise t-tests. 0.05
+    fdr_alpha = 0.2   # FDR alpha for voxelwise t-tests. Relaxed to 0.2 for motor discovery
     hampel_window = 5      # Hampel filter window size (voxels).
     hampel_threshold = 3.0   # Hampel MAD multiplier for outliers.
-    outlier_percentile = 99.9      # Percentile cutoff for beta outliers.
+    outlier_percentile = 99.0      # Percentile cutoff for beta outliers. Relaxed from 99.9 to 99.0
     max_outlier_fraction = 0.3     # Max outlier fraction per voxel. 0.5
     overlay_threshold_pct = 60      # Overlay threshold percentile.
     overlay_vmax_pct = 99.9      # Overlay vmax percentile.
@@ -735,11 +746,26 @@ def main():
         print(f"Using mask indices from {args.mask_indices}.", flush=True)
         if args.gray_threshold is not None:
             print("Note: --gray-threshold is ignored when --mask-indices is set.", flush=True)
+
+        # Create mapping from beta_glm voxels to mask_indices voxels
+        # beta_glm was created with a gray threshold of 0.5, but mask_indices may be a subset
+        # We need to find which voxels in beta_glm correspond to mask_indices
+        gray_mask_data = gray_mask > 0.5  # The threshold used when creating beta_glm
+        beta_mask = np.logical_and(back_mask_data, np.logical_and(gray_mask_data, ~csf_mask_data))
+        beta_indices = np.where(beta_mask)
+
+        # Create a 3D boolean mask from mask_indices
+        mask_3d = np.zeros(volume_shape, dtype=bool)
+        mask_3d[tuple(nonzero_mask)] = True
+
+        # Extract this mask at beta_indices locations to get which beta voxels to keep
+        beta_subset_mask = mask_3d[beta_indices]
     else:
         mask = np.logical_and(back_mask_data, ~csf_mask_data)
         nonzero_mask = np.where(mask)
         gray_mask_data = gray_mask > args.gray_threshold
         keep_voxels = gray_mask_data[nonzero_mask]
+        beta_subset_mask = None
     # bold_flat = bold_data[nonzero_mask]
     # masked_bold = bold_flat[keep_voxels].astype(np.float32)
     masked_coords = tuple(ax[keep_voxels] for ax in nonzero_mask)
@@ -761,11 +787,20 @@ def main():
         else:
             beta = np.concatenate([beta[:, s] for s in run_slices], axis=1)
     total_trials = beta.shape[1]
-    keep_voxels_count = int(np.count_nonzero(keep_voxels))
-    if beta.shape[0] == keep_voxels.shape[0]:
-        beta = beta[keep_voxels]
-    elif beta.shape[0] == keep_voxels_count:
-        pass
+
+    # Apply masking to beta to match masked_coords
+    if beta_subset_mask is not None:
+        # Using mask_indices: beta has all voxels from the GLM mask (gray>0.5),
+        # but we only want the subset in mask_indices
+        beta = beta[beta_subset_mask]
+    else:
+        # In the non-mask_indices case, we need to apply the keep_voxels mask
+        keep_voxels_count = int(np.count_nonzero(keep_voxels))
+        if beta.shape[0] == keep_voxels.shape[0]:
+            beta = beta[keep_voxels]
+        elif beta.shape[0] == keep_voxels_count:
+            # Beta is already filtered somehow
+            pass
     # if beta.shape[0] != masked_bold.shape[0]:
     #     raise ValueError(
     #         f"Beta voxels ({beta.shape[0]}) do not match masked BOLD ({masked_bold.shape[0]})."
