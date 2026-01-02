@@ -20,6 +20,7 @@ sub09_ses1/
 analysis_motor_cortex/
 empca/
 codex_m1_search/
+tmp_param_sweep/
 
 # python cruft
 __pycache__/
@@ -40,6 +41,8 @@ slurm-*.err
 *.png
 *.csv
 *.json
+*.sh
+*.md
 
 GLMsingle/glmsingle/
 tmp/
