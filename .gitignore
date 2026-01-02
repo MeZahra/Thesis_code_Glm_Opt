@@ -42,7 +42,7 @@ slurm-*.err
 *.csv
 *.json
 *.sh
-*.md
+
 
 GLMsingle/glmsingle/
 tmp/
