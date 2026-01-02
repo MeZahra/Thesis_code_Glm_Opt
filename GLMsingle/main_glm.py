@@ -27,7 +27,7 @@ go_times_template = 'PSPD0{sub}-ses-{ses}-go-times.txt'
 
 mask_threshold_brain = 0.0
 mask_threshold_csf = 0.0
-mask_threshold_gray = 0.5
+mask_threshold_gray = 0.7  # Increased from 0.5 to reduce partial volume effects
 mask_mode = 'brain_csf_gray'
 
 num_timepoints = 850
@@ -238,7 +238,11 @@ print("Create Design matrix...")
 design_matrix = []
 for idx, run in enumerate(runs):
     design = np.zeros((num_timepoints, 1), dtype=int)
-    run_onsets_design = go_flag[idx][:num_trials]
+    # FIX: Use consistent onset source for trial selection and design matrix
+    if trial_onsets_source == 'go_times':
+        run_onsets_design = go_flag[idx][:num_trials]
+    else:
+        run_onsets_design = run_onsets_metric
     keep = trial_keep_by_run[idx]
     for onset, keep_trial in zip(run_onsets_design, keep):
         if not keep_trial:
