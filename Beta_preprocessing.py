@@ -905,27 +905,27 @@ def main():
     nan_voxels = np.all(np.isnan(beta_volume_filter), axis=-1)
     mask_2d = nan_voxels.reshape(-1)
 
-    # np.save(output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy', beta_volume_filter)
-    # np.save(output_dir / f'mask_all_nan_sub{sub}_ses{ses}_run{run}.npy', mask_2d)
+    np.save(output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy', beta_volume_filter)
+    np.save(output_dir / f'mask_all_nan_sub{sub}_ses{ses}_run{run}.npy', mask_2d)
 
-    # beta_volume_filter = np.load(output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy')
-    # nan_voxels = np.all(np.isnan(beta_volume_filter), axis=-1)
-    # mask_2d = np.load(output_dir / f'mask_all_nan_sub{sub}_ses{ses}_run{run}.npy')
-    # np.save(output_dir / f"nan_mask_flat_sub{sub}_ses{ses}_run{run}.npy", mask_2d)
-    # beta_volume_clean_2d = beta_volume_filter[~nan_voxels]
-    # np.save(output_dir / f"beta_volume_filter_sub{sub}_ses{ses}_run{run}.npy", beta_volume_clean_2d)
+    beta_volume_filter = np.load(output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy')
+    nan_voxels = np.all(np.isnan(beta_volume_filter), axis=-1)
+    mask_2d = np.load(output_dir / f'mask_all_nan_sub{sub}_ses{ses}_run{run}.npy')
+    np.save(output_dir / f"nan_mask_flat_sub{sub}_ses{ses}_run{run}.npy", mask_2d)
+    beta_volume_clean_2d = beta_volume_filter[~nan_voxels]
+    np.save(output_dir / f"beta_volume_filter_sub{sub}_ses{ses}_run{run}.npy", beta_volume_clean_2d)
 
-    # active_flat_idx = np.ravel_multi_index(active_coords, nan_voxels.shape)
-    # np.save(output_dir / f"active_flat_indices__sub{sub}_ses{ses}_run{run}.npy", active_flat_idx)
-    # keep_mask = ~mask_2d[active_flat_idx]
-    # clean_active_bold = clean_active_bold[keep_mask, ...]
-    # np.save(output_dir / f"active_bold_sub{sub}_ses{ses}_run{run}.npy", clean_active_bold)
-    # clean_active_beta = clean_active_beta[keep_mask, ...]
-    # print(f"After filtering: Beta Shape: {beta_volume_clean_2d.shape}, Bold shape: {clean_active_bold.shape}")
+    active_flat_idx = np.ravel_multi_index(active_coords, nan_voxels.shape)
+    np.save(output_dir / f"active_flat_indices__sub{sub}_ses{ses}_run{run}.npy", active_flat_idx)
+    keep_mask = ~mask_2d[active_flat_idx]
+    clean_active_bold = clean_active_bold[keep_mask, ...]
+    np.save(output_dir / f"active_bold_sub{sub}_ses{ses}_run{run}.npy", clean_active_bold)
+    clean_active_beta = clean_active_beta[keep_mask, ...]
+    print(f"After filtering: Beta Shape: {beta_volume_clean_2d.shape}, Bold shape: {clean_active_bold.shape}")
 
-    # clean_active_idx = clean_active_idx[keep_mask]
-    # active_coords = tuple(coord[keep_mask] for coord in active_coords)
-    # np.save(output_dir / f"active_coords_sub{sub}_ses{ses}_run{run}.npy", active_coords)
+    clean_active_idx = clean_active_idx[keep_mask]
+    active_coords = tuple(coord[keep_mask] for coord in active_coords)
+    np.save(output_dir / f"active_coords_sub{sub}_ses{ses}_run{run}.npy", active_coords)
 
     mean_clean_active = np.nanmean(np.abs(beta_volume_filter), axis=-1)
     mean_clean_active_path = _with_tag(output_dir / f'mean_clean_active_sub{sub}_ses{ses}_run{run_tag}.nii.gz', output_tag)
