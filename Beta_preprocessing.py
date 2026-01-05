@@ -709,9 +709,9 @@ def main():
     data_paths = {'bold': bold_paths[0], 'anat': data_root / f'{sub_label}_ses-{ses}_T1w_brain.nii.gz',
         'brain': data_root / f'{sub_label}_ses-{ses}_T1w_brain_mask.nii.gz', 'csf': data_root / f'{sub_label}_ses-{ses}_T1w_brain_pve_0.nii.gz', 'gray': data_root / f'{sub_label}_ses-{ses}_T1w_brain_pve_1.nii.gz'}
     anat_img = nib.load(str(data_paths['anat']))
-    # bold_imgs = [nib.load(str(path)) for path in bold_paths]
-    # bold_img = bold_imgs[0]
-    # bold_data = np.concatenate([img.get_fdata() for img in bold_imgs], axis=3)
+    bold_imgs = [nib.load(str(path)) for path in bold_paths]
+    bold_img = bold_imgs[0]
+    bold_data = np.concatenate([img.get_fdata() for img in bold_imgs], axis=3)
     volume_shape = anat_img.shape[:3]
     glmsingle_file = Path(args.glmsingle_file) if args.glmsingle_file else (data_root / 'TYPED_FITHRF_GLMDENOISE_RR.npy')
     if not glmsingle_file.exists():
@@ -766,8 +766,8 @@ def main():
         gray_mask_data = gray_mask > args.gray_threshold
         keep_voxels = gray_mask_data[nonzero_mask]
         beta_subset_mask = None
-    # bold_flat = bold_data[nonzero_mask]
-    # masked_bold = bold_flat[keep_voxels].astype(np.float32)
+    bold_flat = bold_data[nonzero_mask]
+    masked_bold = bold_flat[keep_voxels].astype(np.float32)
     masked_coords = tuple(ax[keep_voxels] for ax in nonzero_mask)
 
     print("Reshape Bold and Beta datasets...")
@@ -805,13 +805,13 @@ def main():
     #     raise ValueError(
     #         f"Beta voxels ({beta.shape[0]}) do not match masked BOLD ({masked_bold.shape[0]})."
     #     )
-    # bold_data_reshape = _extract_trial_segments(masked_bold, trial_len=TRIAL_LEN, num_trials=total_trials, rest_every=30, rest_len=20)
+    bold_data_reshape = _extract_trial_segments(masked_bold, trial_len=TRIAL_LEN, num_trials=total_trials, rest_every=30, rest_len=20)
     print("Remove NaN voxels...")
     nan_voxels = np.isnan(beta).all(axis=1)
     if np.any(nan_voxels):
         beta = beta[~nan_voxels]
         masked_coords = tuple(coord[~nan_voxels] for coord in masked_coords)
-    # print(f"Beta Shape: {beta.shape}, Bold shape: {bold_data_reshape.shape}")
+    print(f"Beta Shape: {beta.shape}, Bold shape: {bold_data_reshape.shape}")
     beta_overlay = _mean_abs_beta_volume(beta, masked_coords, volume_shape)
     _save_overlay_html(beta_overlay, anat_img=anat_img, out_html=str(beta_overlay_html_path), title='', 
                        threshold_pct=overlay_threshold_pct, vmax_pct=overlay_vmax_pct, cut_coords=cut_coords)
@@ -851,13 +851,13 @@ def main():
 
     clean_beta = clean_beta[keeped_mask]
     keeped_indices = np.flatnonzero(keeped_mask)
-    # bold_data_reshape[~valid_voxels, :, :] = np.nan
+    bold_data_reshape[~valid_voxels, :, :] = np.nan
     trial_outliers = np.logical_and(outlier_mask, valid_voxels[:, None])
-    # bold_data_reshape = np.where(trial_outliers[:, :, None], np.nan, bold_data_reshape)
-    # bold_data_reshape = bold_data_reshape[keeped_mask]
+    bold_data_reshape = np.where(trial_outliers[:, :, None], np.nan, bold_data_reshape)
+    bold_data_reshape = bold_data_reshape[keeped_mask]
     removed_voxels = beta.shape[0] - int(np.sum(keeped_mask))
     print(f"Outlier filter removed {removed_voxels}/{beta.shape[0]}.")
-    # print(f"Clean Beta Shape: {clean_beta.shape}, Bold shape: {bold_data_reshape.shape}")
+    print(f"Clean Beta Shape: {clean_beta.shape}, Bold shape: {bold_data_reshape.shape}")
     clean_beta_coords = tuple(coord[keeped_mask] for coord in masked_coords)
     clean_beta_overlay = _mean_abs_beta_volume(clean_beta, clean_beta_coords, volume_shape)
     _save_overlay_html(clean_beta_overlay, anat_img=anat_img, out_html=str(clean_beta_overlay_html_path), title='',
@@ -867,7 +867,7 @@ def main():
     if args.skip_ttest:
         clean_active_beta = clean_beta
         clean_active_idx = keeped_indices
-        # clean_active_bold = bold_data_reshape
+        clean_active_bold = bold_data_reshape
     else:
         tvals, pvals = ttest_1samp(clean_beta, popmean=0, axis=1, nan_policy='omit')
         tested = np.isfinite(pvals)
@@ -881,8 +881,8 @@ def main():
 
         clean_active_beta = clean_beta[reject]
         clean_active_idx = keeped_indices[reject]
-        # clean_active_bold = bold_data_reshape[reject]
-        # print(f"After ttest: Beta Shape: {clean_active_beta.shape}, Bold shape: {clean_active_bold.shape}")
+        clean_active_bold = bold_data_reshape[reject]
+        print(f"After ttest: Beta Shape: {clean_active_beta.shape}, Bold shape: {clean_active_bold.shape}")
         ttest_coords = tuple(coord[clean_active_idx] for coord in masked_coords)
         ttest_beta_overlay = _mean_abs_beta_volume(clean_active_beta, ttest_coords, volume_shape)
         _save_overlay_html(ttest_beta_overlay, anat_img=anat_img, out_html=str(ttest_beta_overlay_html_path), title='', 
