@@ -1,9 +1,7 @@
-nibabel
 numpy
-matplotlib
 scipy
-statsmodels
+nibabel
 nilearn
-cvxpy
-scikit-learn
-h5py
+statsmodels
+pandas
+matplotlib
