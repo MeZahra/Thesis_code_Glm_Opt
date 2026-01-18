@@ -3,10 +3,8 @@ import argparse
 import json
 import math
 import os
-import re
 import shutil
 import subprocess
-import tempfile
 from glob import glob
 from collections import defaultdict
 from datetime import datetime
@@ -19,9 +17,8 @@ from matplotlib import colors, ticker
 import nibabel as nib
 import numpy as np
 import pandas as pd
-from nilearn import plotting, image, datasets
+from nilearn import image, plotting
 from scipy import sparse
-from scipy import ndimage
 from scipy.io import loadmat
 from scipy.linalg import eigh
 from scipy.optimize import minimize
@@ -76,6 +73,406 @@ def _append_run_log(entry, path=LOG_FILE):
     payload = _sanitize_for_json(payload)
     with open(path, "a") as log_file:
         log_file.write(json.dumps(payload) + "\n")
+
+def _resolve_fsl_dir(flirt_path=None):
+    if flirt_path:
+        try:
+            flirt_path = os.path.realpath(flirt_path)
+        except OSError:
+            flirt_path = None
+    if flirt_path:
+        candidate = os.path.dirname(os.path.dirname(flirt_path))
+        if os.path.isdir(os.path.join(candidate, "data", "standard")):
+            return candidate
+    fsl_dir = os.environ.get("FSLDIR")
+    if fsl_dir:
+        return fsl_dir
+    return None
+
+def _default_mni_template(flirt_path=None):
+    fsl_dir = _resolve_fsl_dir(flirt_path)
+    if not fsl_dir:
+        return None
+    for name in ("MNI152_T1_2mm_brain.nii.gz", "MNI152_T1_1mm_brain.nii.gz"):
+        candidate = os.path.join(fsl_dir, "data", "standard", name)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+def _find_flirt():
+    flirt_path = shutil.which("flirt")
+    if flirt_path:
+        return flirt_path
+    fsl_dir = os.environ.get("FSLDIR")
+    if not fsl_dir:
+        return None
+    candidate = os.path.join(fsl_dir, "bin", "flirt")
+    if os.path.exists(candidate):
+        return candidate
+    return None
+
+def _run_flirt(cmd):
+    env = os.environ.copy()
+    env.setdefault("FSLOUTPUTTYPE", "NIFTI_GZ")
+    subprocess.run(cmd, check=True, env=env)
+
+def _compute_anat_to_mni(anat_path, mni_template, out_dir, flirt_path):
+    mat_path = os.path.join(out_dir, "anat_to_mni_flirt.mat")
+    warped_path = os.path.join(out_dir, "anat_in_mni.nii.gz")
+    if os.path.exists(mat_path) and os.path.exists(warped_path):
+        return mat_path, warped_path
+    cmd = [
+        flirt_path,
+        "-in",
+        anat_path,
+        "-ref",
+        mni_template,
+        "-omat",
+        mat_path,
+        "-out",
+        warped_path,
+        "-dof",
+        "12",
+        "-cost",
+        "normmi",
+        "-searchrx",
+        "-90",
+        "90",
+        "-searchry",
+        "-90",
+        "90",
+        "-searchrz",
+        "-90",
+        "90",
+    ]
+    _run_flirt(cmd)
+    return mat_path, warped_path
+
+def _apply_flirt(in_path, ref_path, mat_path, out_path, flirt_path, interp="trilinear"):
+    if os.path.exists(out_path):
+        return out_path
+    cmd = [
+        flirt_path,
+        "-in",
+        in_path,
+        "-ref",
+        ref_path,
+        "-applyxfm",
+        "-init",
+        mat_path,
+        "-interp",
+        interp,
+        "-out",
+        out_path,
+    ]
+    _run_flirt(cmd)
+    return out_path
+
+def _resolve_mni_template(explicit_template, flirt_path):
+    if explicit_template:
+        template = os.path.expanduser(explicit_template)
+        if not os.path.exists(template):
+            raise FileNotFoundError(f"MNI template not found: {template}")
+        return template
+    template = _default_mni_template(flirt_path)
+    if template:
+        return template
+    raise RuntimeError("Could not resolve an MNI template. Set MNI_TEMPLATE or install FSL.")
+
+def _resample_to_template(img, template_img, interpolation):
+    return image.resample_to_img(
+        img, template_img, interpolation=interpolation, force_resample=True, copy_header=True
+    )
+
+def _fast_map_active_bold_to_mni(active_bold, active_coords, mask_bool, vox2vox, fill_value=0.0):
+    if active_bold is None:
+        return None, 0, int(np.count_nonzero(mask_bool))
+    if active_coords is None:
+        total = int(np.count_nonzero(mask_bool))
+        if total == 0:
+            empty = np.empty((0, active_bold.shape[1], active_bold.shape[2]), dtype=np.float32)
+            return empty, 0, 0
+        placeholder = np.full(
+            (total, active_bold.shape[1], active_bold.shape[2]),
+            fill_value,
+            dtype=np.float32,
+        )
+        return placeholder, 0, total
+    coords = np.column_stack(active_coords).astype(np.float64, copy=False)
+    ones = np.ones((coords.shape[0], 1), dtype=np.float64)
+    homo_coords = np.concatenate((coords, ones), axis=1)
+    vox2vox = np.asarray(vox2vox, dtype=np.float64)
+    mapped = (vox2vox @ homo_coords.T).T[:, :3]
+    mapped = np.rint(mapped).astype(np.int64, copy=False)
+    shape = mask_bool.shape
+    in_bounds = (
+        (mapped[:, 0] >= 0) & (mapped[:, 0] < shape[0])
+        & (mapped[:, 1] >= 0) & (mapped[:, 1] < shape[1])
+        & (mapped[:, 2] >= 0) & (mapped[:, 2] < shape[2])
+    )
+    mapped = mapped[in_bounds]
+    total = int(np.count_nonzero(mask_bool))
+    if mapped.size == 0 or total == 0:
+        if total == 0:
+            empty = np.empty((0, active_bold.shape[1], active_bold.shape[2]), dtype=np.float32)
+            return empty, 0, 0
+        placeholder = np.full(
+            (total, active_bold.shape[1], active_bold.shape[2]),
+            fill_value,
+            dtype=np.float32,
+        )
+        return placeholder, 0, total
+    src_idx = np.nonzero(in_bounds)[0]
+    mapped_flat = np.ravel_multi_index(mapped.T, shape)
+    unique_flat, first_pos = np.unique(mapped_flat, return_index=True)
+    src_for_unique = src_idx[first_pos]
+    mask_flat = np.flatnonzero(mask_bool.ravel())
+    pos = np.searchsorted(unique_flat, mask_flat)
+    valid = (pos < unique_flat.size) & (unique_flat[pos] == mask_flat)
+    active_bold_mni = np.full(
+        (mask_flat.size, active_bold.shape[1], active_bold.shape[2]),
+        fill_value,
+        dtype=np.float32,
+    )
+    if np.any(valid):
+        active_bold_mni[valid] = active_bold[src_for_unique[pos[valid]]]
+    return active_bold_mni, int(np.count_nonzero(valid)), mask_flat.size
+
+def _build_full_beta_volume(beta_filtered, nan_mask_flat, volume_shape):
+    nan_mask_flat = np.asarray(nan_mask_flat, dtype=bool)
+    if nan_mask_flat.size != int(np.prod(volume_shape)):
+        raise ValueError(
+            f"nan_mask_flat size {nan_mask_flat.size} does not match volume shape {volume_shape}"
+        )
+    beta_filtered = np.asarray(beta_filtered, dtype=np.float32)
+    volume = np.full(volume_shape + (beta_filtered.shape[1],), np.nan, dtype=np.float32)
+    volume[~nan_mask_flat.reshape(volume_shape)] = beta_filtered
+    return volume
+
+def _load_beta_volume(cleaned_beta_path, beta_filtered, nan_mask_flat, volume_shape):
+    if cleaned_beta_path and os.path.exists(cleaned_beta_path):
+        volume = np.load(cleaned_beta_path, mmap_mode="r")
+        volume = np.asarray(volume)
+        if volume.ndim != 4:
+            raise ValueError(f"Cleaned beta volume must be 4D, got shape {volume.shape}")
+        nan_voxels = np.all(np.isnan(volume), axis=-1)
+        return volume, nan_voxels
+    if beta_filtered is None or nan_mask_flat is None:
+        return None, None
+    volume = _build_full_beta_volume(beta_filtered, nan_mask_flat, volume_shape)
+    nan_voxels = np.asarray(nan_mask_flat, dtype=bool).reshape(volume_shape)
+    return volume, nan_voxels
+
+def _build_active_bold_volume(active_bold, active_coords, volume_shape):
+    if active_bold is None or active_coords is None:
+        return None
+    active_bold = np.asarray(active_bold, dtype=np.float32)
+    coords = tuple(np.asarray(axis, dtype=int) for axis in active_coords)
+    num_voxels, num_trials, trial_length = active_bold.shape
+    flat = active_bold.reshape(num_voxels, num_trials * trial_length)
+    volume = np.full(volume_shape + (flat.shape[1],), np.nan, dtype=np.float32)
+    volume[coords] = flat
+    return volume
+
+def _convert_run_to_mni(run_label, cleaned_beta_path, beta_filtered, nan_mask_flat, active_coords, active_bold,
+                        volume_shape, native_affine, mni_template, mat_path, flirt_path, cache_dir,
+                        assume_mni=False, fast_bold=False, anat_affine_native=None, template_affine=None):
+    cache_prefix = os.path.join(cache_dir, f"run{run_label}")
+    beta_filtered_path = f"{cache_prefix}_beta_filtered_mni.npy"
+    nan_mask_path = f"{cache_prefix}_nan_mask_flat_mni.npy"
+    coords_path = f"{cache_prefix}_active_coords_mni.npy"
+    bold_path = f"{cache_prefix}_active_bold_mni.npy"
+
+    if os.path.exists(beta_filtered_path) and os.path.exists(nan_mask_path) and os.path.exists(coords_path):
+        beta_filtered_mni = np.load(beta_filtered_path)
+        nan_mask_flat_mni = np.load(nan_mask_path)
+        active_coords_mni = np.load(coords_path, allow_pickle=True)
+        active_bold_mni = None
+        if os.path.exists(bold_path):
+            active_bold_mni = np.load(bold_path)
+        return {
+            "beta_filtered": beta_filtered_mni,
+            "nan_mask_flat": nan_mask_flat_mni,
+            "active_coords": active_coords_mni,
+            "active_bold": active_bold_mni,
+        }
+
+    beta_volume, nan_voxels = _load_beta_volume(cleaned_beta_path, beta_filtered, nan_mask_flat, volume_shape)
+    if beta_volume is None or nan_voxels is None:
+        return {
+            "beta_filtered": beta_filtered,
+            "nan_mask_flat": nan_mask_flat,
+            "active_coords": active_coords,
+            "active_bold": active_bold,
+        }
+
+    valid_mask = ~nan_voxels
+    beta_volume = np.nan_to_num(beta_volume, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    beta_native_path = f"{cache_prefix}_beta_native.nii.gz"
+    mask_native_path = f"{cache_prefix}_beta_mask_native.nii.gz"
+    nib.Nifti1Image(beta_volume, native_affine).to_filename(beta_native_path)
+    nib.Nifti1Image(valid_mask.astype(np.uint8), native_affine).to_filename(mask_native_path)
+
+    if assume_mni:
+        beta_img = nib.load(beta_native_path)
+        mask_img = nib.load(mask_native_path)
+        if mni_template:
+            template_img = nib.load(mni_template)
+            beta_img = _resample_to_template(beta_img, template_img, interpolation="continuous")
+            mask_img = _resample_to_template(mask_img, template_img, interpolation="nearest")
+    else:
+        if not flirt_path or not mat_path:
+            raise RuntimeError("FLIRT not available for MNI conversion.")
+        beta_mni_path = f"{cache_prefix}_beta_mni.nii.gz"
+        mask_mni_path = f"{cache_prefix}_beta_mask_mni.nii.gz"
+        _apply_flirt(beta_native_path, mni_template, mat_path, beta_mni_path, flirt_path, interp="trilinear")
+        _apply_flirt(mask_native_path, mni_template, mat_path, mask_mni_path, flirt_path, interp="nearestneighbour")
+        beta_img = nib.load(beta_mni_path)
+        mask_img = nib.load(mask_mni_path)
+
+    mask_data = mask_img.get_fdata(dtype=np.float32)
+    mask_bool = mask_data >= 0.5
+    beta_data = beta_img.get_fdata(dtype=np.float32)
+    beta_data[~mask_bool] = np.nan
+    nan_mask_flat_mni = ~mask_bool.ravel()
+
+    beta_filtered_mni = beta_data[mask_bool]
+    active_coords_mni = np.where(mask_bool)
+
+    np.save(beta_filtered_path, beta_filtered_mni)
+    np.save(nan_mask_path, nan_mask_flat_mni)
+    np.save(coords_path, active_coords_mni)
+
+    active_bold_mni = None
+    if active_bold is not None:
+        if fast_bold:
+            native_affine = np.asarray(native_affine, dtype=np.float64)
+            if assume_mni:
+                if template_affine is None:
+                    vox2vox = np.eye(4, dtype=np.float64)
+                else:
+                    vox2vox = np.linalg.inv(template_affine) @ native_affine
+            else:
+                if mat_path is None or anat_affine_native is None:
+                    raise RuntimeError("FAST_MNI_BOLD requires FLIRT matrix and anatomical affine.")
+                vox2vox = np.loadtxt(mat_path) @ np.linalg.inv(anat_affine_native) @ native_affine
+            active_bold_mni, mapped_count, total_voxels = _fast_map_active_bold_to_mni(
+                active_bold, active_coords, mask_bool, vox2vox, fill_value=0.0
+            )
+            if total_voxels:
+                coverage = (mapped_count / total_voxels) * 100.0
+                print(
+                    f"FAST_MNI_BOLD mapped {mapped_count}/{total_voxels} voxels ({coverage:.1f}%).",
+                    flush=True,
+                )
+            np.save(bold_path, active_bold_mni.astype(np.float32, copy=False))
+        else:
+            bold_volume = _build_active_bold_volume(active_bold, active_coords, volume_shape)
+            if bold_volume is not None:
+                bold_volume = np.nan_to_num(bold_volume, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+                bold_native_path = f"{cache_prefix}_bold_native.nii.gz"
+                nib.Nifti1Image(bold_volume, native_affine).to_filename(bold_native_path)
+                if assume_mni:
+                    bold_img = nib.load(bold_native_path)
+                    if mni_template:
+                        template_img = nib.load(mni_template)
+                        bold_img = _resample_to_template(bold_img, template_img, interpolation="continuous")
+                else:
+                    bold_mni_path = f"{cache_prefix}_bold_mni.nii.gz"
+                    _apply_flirt(bold_native_path, mni_template, mat_path, bold_mni_path, flirt_path, interp="trilinear")
+                    bold_img = nib.load(bold_mni_path)
+                bold_data = bold_img.get_fdata(dtype=np.float32)
+                bold_data[~mask_bool] = np.nan
+                flat = bold_data[mask_bool]
+                num_trials = active_bold.shape[1]
+                trial_length = active_bold.shape[2]
+                active_bold_mni = flat.reshape(beta_filtered_mni.shape[0], num_trials, trial_length)
+                np.save(bold_path, active_bold_mni.astype(np.float32, copy=False))
+
+    return {
+        "beta_filtered": beta_filtered_mni,
+        "nan_mask_flat": nan_mask_flat_mni,
+        "active_coords": active_coords_mni,
+        "active_bold": active_bold_mni,
+    }
+
+def _convert_inputs_to_mni(anat_path, brain_mask_path, csf_mask_path, gray_mask_path, cleaned_beta_paths,
+                           run_data, mni_template, cache_dir, assume_mni=False, fast_bold=False):
+    os.makedirs(cache_dir, exist_ok=True)
+    flirt_path = None
+    mat_path = None
+    anat_affine_native = None
+    template_affine = None
+    if not assume_mni:
+        flirt_path = _find_flirt()
+        if not flirt_path:
+            raise RuntimeError("FLIRT not found in PATH. Install FSL or set ASSUME_MNI=1.")
+        mni_template = _resolve_mni_template(mni_template, flirt_path)
+        if fast_bold:
+            anat_affine_native = nib.load(anat_path).affine
+        mat_path, anat_mni_path = _compute_anat_to_mni(anat_path, mni_template, cache_dir, flirt_path)
+        anat_img = nib.load(anat_mni_path)
+    else:
+        anat_img = nib.load(anat_path)
+        if mni_template:
+            mni_template = _resolve_mni_template(mni_template, None)
+            template_img = nib.load(mni_template)
+            if fast_bold:
+                template_affine = template_img.affine
+            anat_img = _resample_to_template(anat_img, template_img, interpolation="continuous")
+        elif fast_bold:
+            template_affine = None
+    if fast_bold and template_affine is None and mni_template:
+        template_affine = nib.load(mni_template).affine
+
+    def _warp_mask(mask_path, interp):
+        if assume_mni:
+            mask_img = nib.load(mask_path)
+            if mni_template:
+                template_img = nib.load(mni_template)
+                interp_name = "nearest" if interp.startswith("nearest") else "continuous"
+                mask_img = _resample_to_template(mask_img, template_img, interpolation=interp_name)
+            return mask_img.get_fdata().astype(np.float16)
+        mask_out = os.path.join(cache_dir, f"{os.path.basename(mask_path).replace('.nii.gz', '')}_mni.nii.gz")
+        _apply_flirt(mask_path, mni_template, mat_path, mask_out, flirt_path, interp=interp)
+        return nib.load(mask_out).get_fdata().astype(np.float16)
+
+    brain_mask = _warp_mask(brain_mask_path, "nearestneighbour")
+    csf_mask = _warp_mask(csf_mask_path, "nearestneighbour")
+    gray_mask = _warp_mask(gray_mask_path, "nearestneighbour")
+
+    mni_volume_shape = anat_img.shape[:3]
+
+    converted_runs = {}
+    for run_label, run_info in run_data.items():
+        native_affine = run_info["affine"]
+        converted_runs[run_label] = _convert_run_to_mni(
+            run_label=run_label,
+            cleaned_beta_path=cleaned_beta_paths.get(run_label),
+            beta_filtered=run_info.get("beta_filtered"),
+            nan_mask_flat=run_info.get("nan_mask_flat"),
+            active_coords=run_info.get("active_coords"),
+            active_bold=run_info.get("active_bold"),
+            volume_shape=run_info["volume_shape"],
+            native_affine=native_affine,
+            mni_template=mni_template,
+            mat_path=mat_path,
+            flirt_path=flirt_path,
+            cache_dir=cache_dir,
+            assume_mni=assume_mni,
+            fast_bold=fast_bold,
+            anat_affine_native=anat_affine_native,
+            template_affine=template_affine,
+        )
+
+    return {
+        "anat_img": anat_img,
+        "brain_mask": brain_mask,
+        "csf_mask": csf_mask,
+        "gray_mask": gray_mask,
+        "volume_shape": mni_volume_shape,
+        "converted_runs": converted_runs,
+    }
 
 def synchronize_beta_voxels(beta_run1, beta_run2, mask_run1, mask_run2):
     valid_run1, valid_run2 = ~mask_run1, ~mask_run2
@@ -184,6 +581,12 @@ trials_per_run = num_trials // 2
 
 # Save a quick visualization of the mean beta activation (averaged over trials) as an interactive HTML.
 
+USE_MNI = os.environ.get("USE_MNI", "1") != "0"
+ASSUME_MNI = os.environ.get("ASSUME_MNI", "0") == "1"
+MNI_TEMPLATE = os.environ.get("MNI_TEMPLATE")
+OUTPUT_TAG = os.environ.get("OUTPUT_TAG", "mni")
+FAST_MNI_BOLD = os.environ.get("FAST_MNI_BOLD", "0") == "1"
+
 
 data_base = os.environ.get(f"FMRI_OPT_DATA_DIR", "/scratch/st-mmckeown-1/zkavian/fmri_opt/Thesis_code_Glm_Opt/data")
 data_base = os.path.expanduser(data_base)
@@ -196,6 +599,7 @@ elif os.path.isdir(alt_sub_data_root):
 else:
     data_root = data_base
 base_path = data_root
+mni_cache_dir = os.environ.get("MNI_CACHE_DIR") or os.path.join(base_path, "mni_cache")
 
 def _resolve_existing_path(*candidates, glob_candidates=()):
     for candidate in candidates:
@@ -206,6 +610,12 @@ def _resolve_existing_path(*candidates, glob_candidates=()):
         if matches:
             return matches[0]
     raise FileNotFoundError("None of the candidate paths exist:\n" + "\n".join([f"- {c}" for c in candidates if c] + [f"- {p} (glob)" for p in glob_candidates if p]))
+
+def _optional_existing_path(*candidates, glob_candidates=()):
+    try:
+        return _resolve_existing_path(*candidates, glob_candidates=glob_candidates)
+    except FileNotFoundError:
+        return None
 
 def _resolve_numpy_path(*candidates, glob_candidates=()):
     return _resolve_existing_path(*candidates, glob_candidates=glob_candidates)
@@ -319,6 +729,22 @@ beta_filtered_run2 = _optional_numpy_load(join(base_path, f"beta_volume_filter_s
 if beta_filtered_run2 is None:
     beta_filtered_run2 = np.load(f"data/sub0{sub}_ses0{ses}/beta_volume_filter_sub0{sub}_ses{ses}_run2.npy")
 
+cleaned_beta_run1_path = _optional_existing_path(
+    join(base_path, f"cleaned_beta_volume_sub0{sub}_ses{ses}_run1.npy"),
+    f"data/sub0{sub}_ses0{ses}/cleaned_beta_volume_sub0{sub}_ses{ses}_run1.npy",
+)
+cleaned_beta_run2_path = _optional_existing_path(
+    join(base_path, f"cleaned_beta_volume_sub0{sub}_ses{ses}_run2.npy"),
+    f"data/sub0{sub}_ses0{ses}/cleaned_beta_volume_sub0{sub}_ses{ses}_run2.npy",
+)
+
+clean_active_bold_run1 = _optional_numpy_load(join(base_path, f"active_bold_sub0{sub}_ses{ses}_run1.npy"))
+if clean_active_bold_run1 is None:
+    clean_active_bold_run1 = _optional_numpy_load(f"data/sub0{sub}_ses0{ses}/active_bold_sub0{sub}_ses{ses}_run1.npy")
+clean_active_bold_run2 = _optional_numpy_load(join(base_path, f"active_bold_sub0{sub}_ses{ses}_run2.npy"))
+if clean_active_bold_run2 is None:
+    clean_active_bold_run2 = np.load(f"data/sub0{sub}_ses0{ses}/active_bold_sub0{sub}_ses{ses}_run2.npy")
+
 trial_keep_run1 = _optional_numpy_load(join(base_path, "trial_keep_run1.npy"))
 trial_keep_run2 = _optional_numpy_load(join(base_path, "trial_keep_run2.npy"))
 if trial_keep_run1 is None:
@@ -326,7 +752,7 @@ if trial_keep_run1 is None:
 if trial_keep_run2 is None:
     trial_keep_run2 = _load_trial_keep_mask(2, base_path)
 
-single_run_mode = nan_mask_flat_run1 is None or beta_filtered_run1 is None or active_coords_run1 is None
+has_run1 = nan_mask_flat_run1 is not None and beta_filtered_run1 is not None and active_coords_run1 is not None
 run2_bold_path = _resolve_existing_path(join(base_path, f"fmri_sub{sub}_ses{ses}_run2.nii.gz"),
     join(base_path, f"fmri_sub{sub}_ses{ses}_run2.npy"),
     glob_candidates=(join(base_path, f"sub-pd00{sub}_ses-{ses}_run-2*_bold*_reg.nii.gz"),))
@@ -334,13 +760,10 @@ bold_img_run2 = nib.load(run2_bold_path) if run2_bold_path.endswith((".nii", ".n
 if bold_img_run2 is None:
     bold_img_run2 = nib.Nifti1Image(np.load(run2_bold_path, mmap_mode="r"), affine=np.eye(4))
 volume_shape = bold_img_run2.shape[:3]
+run1_bold_path = None
+bold_img_run1 = None
 
-if single_run_mode:
-    print("WARNING: Run1 preprocessed arrays not found; running in single-run mode (run2 only).", flush=True)
-    shared_nan_mask_flat = nan_mask_flat_run2
-    nan_mask_flat = nan_mask_flat_run2.ravel()
-    beta_clean = beta_filtered_run2
-else:
+if has_run1:
     run1_bold_path = _resolve_existing_path(join(base_path, f"fmri_sub{sub}_ses{ses}_run1.nii.gz"),
         join(base_path, f"fmri_sub{sub}_ses{ses}_run1.npy"),
         glob_candidates=(join(base_path, f"sub-pd00{sub}_ses-{ses}_run-1*_bold*_reg.nii.gz"),))
@@ -349,16 +772,79 @@ else:
         bold_img_run1 = nib.Nifti1Image(np.load(run1_bold_path, mmap_mode="r"), affine=np.eye(4))
     volume_shape = bold_img_run1.shape[:3]
 
+if USE_MNI:
+    print(f"Converting inputs to MNI space (assume_mni={ASSUME_MNI}) using cache: {mni_cache_dir}", flush=True)
+    if FAST_MNI_BOLD:
+        print("FAST_MNI_BOLD=1: using coordinate mapping for active_bold (approximate).", flush=True)
+    if not ASSUME_MNI:
+        if run2_bold_path.endswith(".npy"):
+            raise RuntimeError("MNI conversion requires NIfTI BOLD input for run2; found .npy.")
+        if has_run1 and run1_bold_path and run1_bold_path.endswith(".npy"):
+            raise RuntimeError("MNI conversion requires NIfTI BOLD input for run1; found .npy.")
+
+    run_data = {
+        2: {
+            "beta_filtered": beta_filtered_run2,
+            "nan_mask_flat": nan_mask_flat_run2,
+            "active_coords": active_coords_run2,
+            "active_bold": clean_active_bold_run2,
+            "affine": bold_img_run2.affine,
+            "volume_shape": bold_img_run2.shape[:3],
+        }
+    }
+    if has_run1:
+        run_data[1] = {
+            "beta_filtered": beta_filtered_run1,
+            "nan_mask_flat": nan_mask_flat_run1,
+            "active_coords": active_coords_run1,
+            "active_bold": clean_active_bold_run1,
+            "affine": bold_img_run1.affine,
+            "volume_shape": bold_img_run1.shape[:3],
+        }
+
+    cleaned_beta_paths = {2: cleaned_beta_run2_path, 1: cleaned_beta_run1_path}
+    mni_outputs = _convert_inputs_to_mni(
+        anat_path=anat_path,
+        brain_mask_path=brain_mask_path,
+        csf_mask_path=csf_mask_path,
+        gray_mask_path=gray_mask_path,
+        cleaned_beta_paths=cleaned_beta_paths,
+        run_data=run_data,
+        mni_template=MNI_TEMPLATE,
+        cache_dir=mni_cache_dir,
+        assume_mni=ASSUME_MNI,
+        fast_bold=FAST_MNI_BOLD,
+    )
+    anat_img = mni_outputs["anat_img"]
+    brain_mask = mni_outputs["brain_mask"]
+    csf_mask = mni_outputs["csf_mask"]
+    gray_mask = mni_outputs["gray_mask"]
+    volume_shape = mni_outputs["volume_shape"]
+    run2_conv = mni_outputs["converted_runs"].get(2)
+    if run2_conv:
+        beta_filtered_run2 = run2_conv["beta_filtered"]
+        nan_mask_flat_run2 = run2_conv["nan_mask_flat"]
+        active_coords_run2 = run2_conv["active_coords"]
+        clean_active_bold_run2 = run2_conv["active_bold"]
+    if has_run1:
+        run1_conv = mni_outputs["converted_runs"].get(1)
+        if run1_conv:
+            beta_filtered_run1 = run1_conv["beta_filtered"]
+            nan_mask_flat_run1 = run1_conv["nan_mask_flat"]
+            active_coords_run1 = run1_conv["active_coords"]
+            clean_active_bold_run1 = run1_conv["active_bold"]
+
+single_run_mode = nan_mask_flat_run1 is None or beta_filtered_run1 is None or active_coords_run1 is None
+if single_run_mode:
+    print("WARNING: Run1 preprocessed arrays not found; running in single-run mode (run2 only).", flush=True)
+    shared_nan_mask_flat = nan_mask_flat_run2
+    nan_mask_flat = nan_mask_flat_run2.ravel()
+    beta_clean = beta_filtered_run2
+else:
     beta_filtered_run1, beta_filtered_run2, shared_nan_mask_flat, shared_flat_indices = synchronize_beta_voxels(
         beta_filtered_run1, beta_filtered_run2, nan_mask_flat_run1, nan_mask_flat_run2)
     beta_clean, nan_mask_flat = combine_filtered_betas(beta_filtered_run1, beta_filtered_run2,
         shared_nan_mask_flat.ravel(), shared_flat_indices)
-clean_active_bold_run1 = _optional_numpy_load(join(base_path, f"active_bold_sub0{sub}_ses{ses}_run1.npy"))
-if clean_active_bold_run1 is None:
-    clean_active_bold_run1 = _optional_numpy_load(f"data/sub0{sub}_ses0{ses}/active_bold_sub0{sub}_ses{ses}_run1.npy")
-clean_active_bold_run2 = _optional_numpy_load(join(base_path, f"active_bold_sub0{sub}_ses{ses}_run2.npy"))
-if clean_active_bold_run2 is None:
-    clean_active_bold_run2 = np.load(f"data/sub0{sub}_ses0{ses}/active_bold_sub0{sub}_ses{ses}_run2.npy")
 
 if single_run_mode:
     coords_tuple = tuple(axis for axis in active_coords_run2)
@@ -658,490 +1144,6 @@ def save_brain_map(correlations, active_coords, volume_shape, anat_img, file_pre
         # display.close()
     return
 
-def enhance_bold_visualization(input_file, anat_img=None, output_prefix=None,
-                               percentiles=(90, 95, 99), min_cluster_sizes=(100, 75, 50),
-                               vmax_percentile=99.9):
-    input_file = os.path.abspath(str(input_file))
-    if not os.path.exists(input_file):
-        raise FileNotFoundError(f"Input file not found: {input_file}")
-
-    if output_prefix is None:
-        base_name = os.path.basename(input_file)
-        if base_name.endswith(".nii.gz"):
-            base_name = base_name[:-7]
-        else:
-            base_name = os.path.splitext(base_name)[0]
-        output_prefix = os.path.join(os.path.dirname(input_file), f"{base_name}_bold")
-
-    if len(percentiles) != len(min_cluster_sizes):
-        raise ValueError("percentiles and min_cluster_sizes must be the same length.")
-
-    print("==============================================", flush=True)
-    print("Bold Visualization Enhancement", flush=True)
-    print("==============================================", flush=True)
-    print(f"Input file: {input_file}", flush=True)
-    print(f"Output prefix: {output_prefix}", flush=True)
-    print("", flush=True)
-    print("Applying bold visualization enhancements...", flush=True)
-    print("  - NO smoothing (preserves original activations only)", flush=True)
-    print("  - Cluster filtering (min_size=100/75/50 voxels)", flush=True)
-    print("  - Multiple threshold levels (90th/95th/99th percentile)", flush=True)
-    print("", flush=True)
-
-    img = nib.load(input_file)
-    data = img.get_fdata()
-    processed_data = data.copy()
-
-    finite_vals = processed_data[np.isfinite(processed_data) & (processed_data > 0)]
-    if finite_vals.size == 0:
-        raise ValueError("No finite positive values found in data.")
-
-    thresholds = [np.percentile(finite_vals, pct) for pct in percentiles]
-    vmax = float(np.percentile(finite_vals, vmax_percentile))
-
-    print("Thresholds:", flush=True)
-    for pct, thr in zip(percentiles, thresholds):
-        print(f"  {pct}th percentile: {thr:.3f}", flush=True)
-    print(f"  {vmax_percentile}th percentile (vmax): {vmax:.3f}", flush=True)
-
-    def _cluster_filter(data_in, threshold, min_cluster_size=50):
-        thresholded = data_in > threshold
-        labeled, num_features = ndimage.label(thresholded)
-        cluster_sizes = np.bincount(labeled.ravel())
-        small_clusters = cluster_sizes < min_cluster_size
-        keep_mask = thresholded & ~small_clusters[labeled]
-        result = np.zeros_like(data_in)
-        result[keep_mask] = data_in[keep_mask]
-        kept_clusters = int(num_features - np.sum(small_clusters[1:]))
-        total_kept_voxels = int(np.sum(keep_mask))
-        return result, kept_clusters, total_kept_voxels
-
-    filtered_results = []
-    for pct, thr, min_size in zip(percentiles, thresholds, min_cluster_sizes):
-        data_thr, clusters, voxels = _cluster_filter(processed_data, thr, min_cluster_size=min_size)
-        filtered_results.append((pct, thr, min_size, data_thr, clusters, voxels))
-
-    print("\nCluster-filtered results:", flush=True)
-    for pct, _, min_size, _, clusters, voxels in filtered_results:
-        print(f"  {pct}th pctl (min_size={min_size}): {clusters} clusters, {voxels} voxels", flush=True)
-
-    print("\nGenerating visualizations...", flush=True)
-    for pct, thr, min_size, data_thr, clusters, _ in filtered_results:
-        img_thr = nib.Nifti1Image(data_thr.astype(np.float32), img.affine, img.header)
-        view = plotting.view_img(
-            img_thr,
-            bg_img=anat_img,
-            cmap="hot",
-            symmetric_cmap=False,
-            threshold=thr,
-            vmax=vmax,
-            colorbar=True,
-            title=f"Precise Activation ({pct}th pctl, {clusters} clusters, min_size={min_size})",
-        )
-        out_html = f"{output_prefix}_thr{pct}.html"
-        view.save_as_html(out_html)
-        print(f"Saved: {out_html}", flush=True)
-
-        display = plotting.plot_stat_map(
-            img_thr,
-            bg_img=anat_img,
-            cmap="hot",
-            symmetric_cbar=False,
-            threshold=thr,
-            vmax=vmax,
-            colorbar=True,
-            title=f"Precise Activation ({pct}th pctl, {clusters} clusters)",
-            display_mode="ortho",
-        )
-        png_path = f"{output_prefix}_thr{pct}.png"
-        display.savefig(png_path, dpi=150)
-        display.close()
-        print(f"Saved: {png_path}", flush=True)
-
-        nii_path = f"{output_prefix}_thr{pct}.nii.gz"
-        img_thr.to_filename(nii_path)
-        print(f"Saved: {nii_path}", flush=True)
-
-    original_file = f"{output_prefix}_original.nii.gz"
-    nib.save(img, original_file)
-    print(f"\nSaved original activation map: {original_file}", flush=True)
-    print("\nProcessing complete!", flush=True)
-    print("==============================================", flush=True)
-    print("", flush=True)
-    return output_prefix
-
-def _normalize_label_list(labels):
-    normalized = []
-    for label in labels:
-        if isinstance(label, bytes):
-            label = label.decode("utf-8", errors="replace")
-        normalized.append(str(label))
-    return normalized
-
-def _fetch_ho_atlas(atlas_name, data_dir=None):
-    atlas = datasets.fetch_atlas_harvard_oxford(
-        atlas_name, data_dir=str(data_dir) if data_dir else None
-    )
-    atlas_img = atlas.maps if isinstance(atlas.maps, nib.Nifti1Image) else nib.load(atlas.maps)
-    labels = _normalize_label_list(atlas.labels)
-    atlas_path = atlas.maps if isinstance(atlas.maps, str) else None
-    return atlas_img, labels, atlas_path
-
-def _resolve_fsl_dir(flirt_path=None):
-    if flirt_path:
-        try:
-            flirt_path = os.path.realpath(flirt_path)
-        except OSError:
-            flirt_path = None
-    if flirt_path:
-        candidate = os.path.dirname(os.path.dirname(flirt_path))
-        if os.path.isdir(os.path.join(candidate, "data", "standard")):
-            return candidate
-    fsl_dir = os.environ.get("FSLDIR")
-    if fsl_dir:
-        return fsl_dir
-    return None
-
-def _default_mni_template(flirt_path=None):
-    fsl_dir = _resolve_fsl_dir(flirt_path)
-    if not fsl_dir:
-        return None
-    for name in ("MNI152_T1_2mm_brain.nii.gz", "MNI152_T1_1mm_brain.nii.gz"):
-        candidate = os.path.join(fsl_dir, "data", "standard", name)
-        if os.path.exists(candidate):
-            return candidate
-    return None
-
-def _find_flirt():
-    flirt_path = shutil.which("flirt")
-    if flirt_path:
-        return flirt_path
-    fsl_dir = os.environ.get("FSLDIR")
-    if not fsl_dir:
-        return None
-    candidate = os.path.join(fsl_dir, "bin", "flirt")
-    if os.path.exists(candidate):
-        return candidate
-    return None
-
-def _run_flirt(cmd):
-    env = os.environ.copy()
-    env.setdefault("FSLOUTPUTTYPE", "NIFTI_GZ")
-    subprocess.run(cmd, check=True, env=env)
-
-def _compute_mni_to_anat(mni_template, anat_path, out_dir, flirt_path):
-    os.makedirs(out_dir, exist_ok=True)
-    mat_path = os.path.join(out_dir, "mni_to_anat_flirt.mat")
-    warped_path = os.path.join(out_dir, "mni_template_in_anat.nii.gz")
-    if os.path.exists(mat_path) and os.path.exists(warped_path):
-        return mat_path, warped_path
-    cmd = [
-        flirt_path,
-        "-in",
-        mni_template,
-        "-ref",
-        anat_path,
-        "-omat",
-        mat_path,
-        "-out",
-        warped_path,
-        "-dof",
-        "12",
-    ]
-    _run_flirt(cmd)
-    return mat_path, warped_path
-
-def _apply_flirt(in_path, ref_path, mat_path, out_path, flirt_path, interp="nearestneighbour"):
-    if os.path.exists(out_path):
-        return out_path
-    cmd = [
-        flirt_path,
-        "-in",
-        in_path,
-        "-ref",
-        ref_path,
-        "-applyxfm",
-        "-init",
-        mat_path,
-        "-interp",
-        interp,
-        "-out",
-        out_path,
-    ]
-    _run_flirt(cmd)
-    return out_path
-
-def _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_dir, assume_mni=False, return_method=False):
-    use_flirt = False
-    flirt_path = None
-    mni_template = None
-    registration_method = "resample"
-
-    if not assume_mni:
-        flirt_path = _find_flirt()
-        mni_template = _default_mni_template(flirt_path)
-        if flirt_path and mni_template and os.path.exists(mni_template):
-            _compute_mni_to_anat(mni_template, anat_path, out_dir, flirt_path)
-            use_flirt = True
-            registration_method = "flirt"
-            print("Registered MNI template to anatomy with FLIRT.", flush=True)
-        else:
-            print("WARNING: FLIRT or MNI template not available; using header-based resampling.", flush=True)
-
-    if use_flirt:
-        mat_path = os.path.join(out_dir, "mni_to_anat_flirt.mat")
-        with tempfile.TemporaryDirectory(dir=out_dir) as tmpdir:
-            atlas_mni_path = os.path.join(tmpdir, "atlas_mni.nii.gz")
-            atlas_anat_path = os.path.join(tmpdir, "atlas_in_anat.nii.gz")
-            mni_template_img = nib.load(mni_template)
-            atlas_mni_img = image.resample_to_img(
-                atlas_img, mni_template_img, interpolation="nearest", force_resample=True, copy_header=True
-            )
-            atlas_mni_img.to_filename(atlas_mni_path)
-            _apply_flirt(atlas_mni_path, anat_path, mat_path, atlas_anat_path, flirt_path)
-            atlas_in_anat_img = nib.load(atlas_anat_path)
-            atlas_in_anat = nib.Nifti1Image(
-                atlas_in_anat_img.get_fdata(dtype=np.float32),
-                atlas_in_anat_img.affine,
-                atlas_in_anat_img.header,
-            )
-    else:
-        atlas_in_anat = image.resample_to_img(
-            atlas_img, anat_img, interpolation="nearest", force_resample=True, copy_header=True
-        )
-
-    if (atlas_in_anat.shape[:3] != ref_img.shape[:3] or not np.allclose(atlas_in_anat.affine, ref_img.affine)):
-        atlas_in_ref = image.resample_to_img(
-            atlas_in_anat, ref_img, interpolation="nearest", force_resample=True, copy_header=True
-        )
-    else:
-        atlas_in_ref = atlas_in_anat
-
-    if return_method:
-        return atlas_in_ref, registration_method
-    return atlas_in_ref
-
-def _combine_atlas_data(cort_data, cort_labels, sub_data, sub_labels):
-    if cort_data.shape != sub_data.shape:
-        raise ValueError("Cortical and subcortical atlas shapes do not match.")
-    combined = np.asarray(cort_data, dtype=np.int32).copy()
-    sub_data = np.asarray(sub_data, dtype=np.int32)
-    offset = len(cort_labels)
-    insert_mask = (combined == 0) & (sub_data > 0)
-    combined[insert_mask] = sub_data[insert_mask] + offset
-    combined_labels = list(cort_labels) + [f"sub:{label}" for label in sub_labels]
-    return combined, combined_labels
-
-def _select_label_indices(labels, label_patterns):
-    patterns = []
-    if label_patterns:
-        patterns = [p.strip().lower() for p in label_patterns if p and p.strip()]
-    indices = []
-    for idx, name in enumerate(labels):
-        if idx == 0 or name.strip().lower() == "background":
-            continue
-        if not patterns:
-            indices.append(idx)
-            continue
-        lname = name.lower()
-        if any(pattern in lname for pattern in patterns):
-            indices.append(idx)
-    return indices
-
-def _sanitize_region_key(label):
-    key = re.sub(r"[^a-zA-Z0-9]+", "_", label.strip().lower())
-    key = key.strip("_")
-    return key or "region"
-
-def _save_region_voxel_dict(region_voxels, output_prefix, tag):
-    if not region_voxels:
-        return None, None
-    key_map = {}
-    arrays = {}
-    for label, coords in region_voxels.items():
-        key = _sanitize_region_key(label)
-        base_key = key
-        suffix = 2
-        while key in arrays:
-            key = f"{base_key}_{suffix}"
-            suffix += 1
-        arrays[key] = np.asarray(coords, dtype=np.int32)
-        key_map[key] = label
-    npz_path = f"{output_prefix}_{tag}.npz"
-    np.savez(npz_path, **arrays)
-    label_path = f"{output_prefix}_{tag}_labels.json"
-    with open(label_path, "w", encoding="utf-8") as handle:
-        json.dump(key_map, handle, indent=2)
-    return npz_path, label_path
-
-def _prepare_atlas_context(anat_img, anat_path, ref_img, output_dir, atlas_threshold=25, data_dir=None, assume_mni=False):
-    output_dir = os.path.abspath(output_dir)
-    os.makedirs(output_dir, exist_ok=True)
-    atlas_cache_path = os.path.join(output_dir, f"atlas_thr{atlas_threshold}_combined.nii.gz")
-    labels_path = os.path.join(output_dir, f"atlas_thr{atlas_threshold}_combined_labels.json")
-
-    if os.path.exists(atlas_cache_path) and os.path.exists(labels_path):
-        atlas_img = nib.load(atlas_cache_path)
-        if atlas_img.shape[:3] == ref_img.shape[:3] and np.allclose(atlas_img.affine, ref_img.affine):
-            with open(labels_path, "r", encoding="utf-8") as handle:
-                labels = json.load(handle)
-            atlas_data = atlas_img.get_fdata(dtype=np.float32).astype(np.int32)
-            return {
-                "atlas_data": atlas_data,
-                "labels": labels,
-                "shape": atlas_img.shape[:3],
-                "affine": atlas_img.affine,
-                "path": atlas_cache_path,
-                "registration_method": "cached",
-                "atlas_threshold": atlas_threshold,
-            }
-
-    cort_name = f"cort-maxprob-thr{atlas_threshold}-2mm"
-    sub_name = f"sub-maxprob-thr{atlas_threshold}-2mm"
-    cort_img, cort_labels, _ = _fetch_ho_atlas(cort_name, data_dir=data_dir)
-    sub_img, sub_labels, _ = _fetch_ho_atlas(sub_name, data_dir=data_dir)
-
-    cort_in_ref, registration_method = _align_atlas_to_reference(
-        cort_img, anat_img, anat_path, ref_img, output_dir, assume_mni=assume_mni, return_method=True
-    )
-    sub_in_ref = _align_atlas_to_reference(
-        sub_img, anat_img, anat_path, ref_img, output_dir, assume_mni=assume_mni, return_method=False
-    )
-
-    cort_data = np.rint(cort_in_ref.get_fdata(dtype=np.float32)).astype(np.int32)
-    sub_data = np.rint(sub_in_ref.get_fdata(dtype=np.float32)).astype(np.int32)
-    combined_data, combined_labels = _combine_atlas_data(cort_data, cort_labels, sub_data, sub_labels)
-
-    combined_img = nib.Nifti1Image(combined_data.astype(np.int32), ref_img.affine, ref_img.header)
-    nib.save(combined_img, atlas_cache_path)
-    with open(labels_path, "w", encoding="utf-8") as handle:
-        json.dump(combined_labels, handle, indent=2)
-
-    return {
-        "atlas_data": combined_data,
-        "labels": combined_labels,
-        "shape": combined_img.shape[:3],
-        "affine": combined_img.affine,
-        "path": atlas_cache_path,
-        "registration_method": registration_method,
-        "atlas_threshold": atlas_threshold,
-    }
-
-def _analyze_weight_map_regions(
-    voxel_weights_path,
-    atlas_context,
-    output_prefix,
-    motor_label_patterns,
-    threshold_percentile=95,
-):
-    weights_img = nib.load(voxel_weights_path)
-    weights_data = weights_img.get_fdata(dtype=np.float32)
-    atlas_data = atlas_context["atlas_data"]
-    labels = atlas_context["labels"]
-
-    if atlas_data.shape != weights_data.shape:
-        raise ValueError(
-            f"Atlas/weights shape mismatch: atlas={atlas_data.shape}, weights={weights_data.shape}"
-        )
-
-    active_mask = np.isfinite(weights_data)
-    if not np.any(active_mask):
-        print("WARNING: No finite voxels found in voxel-weights map.", flush=True)
-        return None
-
-    active_values = np.abs(weights_data[active_mask])
-    active_values = active_values[np.isfinite(active_values)]
-    if active_values.size == 0:
-        print("WARNING: No finite weights available for percentile thresholding.", flush=True)
-        return None
-
-    threshold_value = float(np.percentile(active_values, threshold_percentile))
-    suprath_mask = active_mask & (np.abs(weights_data) >= threshold_value)
-
-    active_labels = atlas_data[active_mask]
-    active_labels = active_labels[(active_labels > 0) & (active_labels < len(labels))]
-    active_counts = np.bincount(active_labels, minlength=len(labels))
-
-    suprath_labels = atlas_data[suprath_mask]
-    suprath_labels = suprath_labels[(suprath_labels > 0) & (suprath_labels < len(labels))]
-    suprath_counts = np.bincount(suprath_labels, minlength=len(labels))
-
-    total_suprath = int(np.sum(suprath_counts))
-    total_active = int(np.sum(active_counts))
-
-    motor_indices = _select_label_indices(labels, motor_label_patterns) if motor_label_patterns else []
-    motor_region_voxels = {}
-    for idx in motor_indices:
-        label_name = labels[idx]
-        region_mask = active_mask & (atlas_data == idx)
-        coords = np.column_stack(np.nonzero(region_mask))
-        motor_region_voxels[label_name] = coords
-
-    _save_region_voxel_dict(motor_region_voxels, output_prefix, "motor_region_voxels")
-
-    records = []
-    for idx in range(1, len(labels)):
-        active_count = int(active_counts[idx]) if idx < active_counts.size else 0
-        suprath_count = int(suprath_counts[idx]) if idx < suprath_counts.size else 0
-        if active_count == 0 and suprath_count == 0:
-            continue
-        records.append({
-            "label_index": idx,
-            "label": labels[idx],
-            "active_voxels": active_count,
-            "suprathreshold_voxels": suprath_count,
-            "pct_suprathreshold": (suprath_count / total_suprath * 100.0) if total_suprath else 0.0,
-            "pct_of_active_region": (suprath_count / active_count * 100.0) if active_count else 0.0,
-        })
-
-    if records:
-        summary_df = pd.DataFrame(records).sort_values(
-            "suprathreshold_voxels", ascending=False
-        )
-    else:
-        summary_df = pd.DataFrame(
-            columns=[
-                "label_index",
-                "label",
-                "active_voxels",
-                "suprathreshold_voxels",
-                "pct_suprathreshold",
-                "pct_of_active_region",
-            ]
-        )
-    summary_csv = f"{output_prefix}_atlas_region_distribution_thr{int(threshold_percentile)}.csv"
-    summary_df.to_csv(summary_csv, index=False)
-
-    motor_suprath = int(np.sum([suprath_counts[idx] for idx in motor_indices])) if motor_indices else 0
-    motor_active = int(np.sum([active_counts[idx] for idx in motor_indices])) if motor_indices else 0
-    motor_pct = (motor_suprath / total_suprath * 100.0) if total_suprath else 0.0
-    motor_region_pct = (motor_suprath / motor_active * 100.0) if motor_active else 0.0
-
-    summary_json = f"{output_prefix}_atlas_region_distribution_thr{int(threshold_percentile)}.json"
-    summary_payload = {
-        "voxel_weights_path": voxel_weights_path,
-        "atlas_path": atlas_context.get("path"),
-        "atlas_threshold": atlas_context.get("atlas_threshold"),
-        "atlas_registration_method": atlas_context.get("registration_method"),
-        "threshold_percentile": float(threshold_percentile),
-        "threshold_value": threshold_value,
-        "total_active_voxels": total_active,
-        "total_suprathreshold_voxels": total_suprath,
-        "motor_suprathreshold_voxels": motor_suprath,
-        "motor_suprathreshold_pct": motor_pct,
-        "motor_active_voxels": motor_active,
-        "motor_active_suprath_pct": motor_region_pct,
-        "motor_label_patterns": list(motor_label_patterns) if motor_label_patterns else [],
-    }
-    with open(summary_json, "w", encoding="utf-8") as handle:
-        json.dump(summary_payload, handle, indent=2)
-
-    print(
-        f"Atlas summary saved: {summary_csv} (thr={threshold_value:.4f}, suprath={total_suprath}, motor={motor_pct:.1f}%)",
-        flush=True,
-    )
-    return summary_payload
-
 def _load_projection_series(series_path):
     if not os.path.exists(series_path):
         return {}
@@ -1207,11 +1209,8 @@ def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smoo
 def _build_objective_matrices(total_penalty, corr_num, corr_den, gamma_value, eps=1e-8):
     A_mat = gamma_value * total_penalty - 0 * corr_num
     A_mat = 0.5 * (A_mat + A_mat.T)
-    eye = np.eye(A_mat.shape[0], dtype=np.float64)
-    if gamma_value == 0:
-        B_mat = eye
-        return A_mat + eps * eye, B_mat
     B_mat = 0.5 * (corr_den + corr_den.T)
+    eye = np.eye(A_mat.shape[0], dtype=np.float64)
     return A_mat + eps * eye, B_mat + eps * eye
 
 def _total_loss_from_penalty(weights, total_penalty, gamma_value, corr_num=None, corr_den=None, penalty_terms=None, label=None, A_mat=None, B_mat=None):
@@ -1816,7 +1815,7 @@ ridge_penalty = 1e-3
 solver_name = "MOSEK"
 # penalty_sweep = [(0.8, 1, 0.5, 1.2), (0, 1, 0.5, 1.2), (0.8, 0, 0.5, 1.2), (0.8, 1, 0, 1.2), (0.8, 1, 0.5, 0)]
 # penalty_sweep = [(0.8, 0, 0, 0), (0, 0.8, 0, 0), (0, 0, 0.5, 0), (0, 0, 0, 1),(0.8, 0.8, 0.5, 1)]
-penalty_sweep = [(0.8, 1, 0.5, 1.2), (0.8, 0, 0, 0), (0, 1, 0, 0), (0, 0, 0.5, 0), (0, 0, 0, 1.2)] #for sub09
+penalty_sweep = [(0.8, 1, 0.5, 1.2), (0, 1, 0.5, 1.2), (0.8, 0, 0.5, 1.2), (0.8, 1, 0, 1.2), (0.8, 1, 0.5, 0)] #for sub09
 # penalty_sweep = [(0.5, 0.8, 0.3, 1.5), (1.0, 2.0, 1.0, 3.0)] #for sub10
 # penalty_sweep = [(0.7, 0.7, 0.25, 0.1)]
 alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha, "smooth_penalty": smooth_alpha} for task_alpha, bold_alpha, beta_alpha, smooth_alpha in penalty_sweep]
@@ -1859,6 +1858,8 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
         for alpha_setting in alpha_settings:
             task_alpha, bold_alpha, beta_alpha, smooth_alpha = alpha_setting["task_penalty"], alpha_setting["bold_penalty"], alpha_setting["beta_penalty"], alpha_setting["smooth_penalty"]
             alpha_prefix = f"fold{fold_idx}_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}"
+            if OUTPUT_TAG:
+                alpha_prefix = f"{alpha_prefix}_{OUTPUT_TAG}"
 
             for gamma_value in gamma_values:
                 metrics_key = (task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value)
@@ -1996,6 +1997,8 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value = metrics_key
             combo_label = (f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, smooth={smooth_alpha:g}, gamma={gamma_value:g}")
             metrics_prefix = (f"foldmetrics_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}_gamma{gamma_value:g}")
+            if OUTPUT_TAG:
+                metrics_prefix = f"{metrics_prefix}_{OUTPUT_TAG}"
             
             metric_records = fold_metric_records[metrics_key]
             train_loss_entries = metric_records.get("train_total_loss", [])
@@ -2030,27 +2033,13 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
         active_coords = projection_data.get("active_coords")
         volume_shape = anat_img.shape[:3]
         fold_avg_projection_series = defaultdict(list)
-        atlas_context = None
-        atlas_analysis_enabled = os.environ.get("FMRI_ATLAS_ANALYSIS", "1").strip().lower() not in ("0", "false", "no")
-        atlas_threshold = int(os.environ.get("FMRI_ATLAS_THRESHOLD", "25"))
-        motor_label_patterns = os.environ.get(
-            "FMRI_MOTOR_LABEL_PATTERNS",
-            "precentral,supplementary motor,cerebellum",
-        )
-        motor_label_patterns = [p.strip() for p in motor_label_patterns.split(",") if p.strip()]
-        atlas_assume_mni = os.environ.get("FMRI_ATLAS_ASSUME_MNI", "0").strip().lower() in ("1", "true", "yes")
-        atlas_data_dir = os.environ.get("FMRI_ATLAS_DIR")
-        if atlas_data_dir:
-            atlas_data_dir = os.path.expanduser(atlas_data_dir)
-        else:
-            atlas_data_dir = os.path.join(base_path, "atlas_cache")
-        if atlas_analysis_enabled:
-            os.makedirs(atlas_data_dir, exist_ok=True)
 
         for metrics_key in sorted(fold_output_tracker.keys()):
             task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value = metrics_key
             fold_outputs = fold_output_tracker[metrics_key]
             avg_prefix = f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}_gamma{gamma_value:g}"
+            if OUTPUT_TAG:
+                avg_prefix = f"{avg_prefix}_{OUTPUT_TAG}"
 
             # comp_weights_stack = np.stack(fold_outputs["component_weights"], axis=0)
             # comp_weights_icc = _compute_matrix_icc(comp_weights_stack)
@@ -2063,44 +2052,6 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             weights_title = f"ICC={weights_icc:.3f}"
             save_brain_map(weights_avg * 1000, active_coords, volume_shape, anat_img, avg_prefix, result_prefix="voxel_weights_mean", map_title=weights_title,
                 display_threshold_ratio=0.8)
-            voxel_weights_path = f"voxel_weights_mean_{avg_prefix}.nii.gz"
-            if os.path.exists(voxel_weights_path):
-                try:
-                    enhance_bold_visualization(voxel_weights_path, anat_img=anat_img)
-                except Exception as exc:
-                    print(f"  Bold viz enhancement failed for {voxel_weights_path}: {exc}", flush=True)
-                if atlas_analysis_enabled:
-                    try:
-                        weights_img = nib.load(voxel_weights_path)
-                        if (
-                            atlas_context is None
-                            or atlas_context.get("shape") != weights_img.shape[:3]
-                            or not np.allclose(atlas_context.get("affine"), weights_img.affine)
-                        ):
-                            atlas_context = _prepare_atlas_context(
-                                anat_img,
-                                anat_path,
-                                weights_img,
-                                os.getcwd(),
-                                atlas_threshold=atlas_threshold,
-                                data_dir=atlas_data_dir,
-                                assume_mni=atlas_assume_mni,
-                            )
-                        output_prefix = f"voxel_weights_mean_{avg_prefix}"
-                        _analyze_weight_map_regions(
-                            voxel_weights_path,
-                            atlas_context,
-                            output_prefix,
-                            motor_label_patterns,
-                            threshold_percentile=95,
-                        )
-                    except Exception as exc:
-                        print(
-                            f"  WARNING: Atlas region analysis failed for {voxel_weights_path}: {exc}",
-                            flush=True,
-                        )
-            else:
-                print(f"  WARNING: Expected voxel weights map not found: {voxel_weights_path}", flush=True)
 
             bold_corr_stack = np.stack(np.abs(fold_outputs["bold_corr"]), axis=0)
             bold_corr_avg = np.nanmean(bold_corr_stack, axis=0)
