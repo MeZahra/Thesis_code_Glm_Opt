@@ -793,9 +793,9 @@ def main():
         nonzero_mask = np.where(mask)
         gray_mask_data = gray_mask > args.gray_threshold
         keep_voxels = gray_mask_data[nonzero_mask]
-            
-    bold_flat = bold_data[nonzero_mask]
-    masked_bold = bold_flat[keep_voxels].astype(np.float32, copy=False)
+        beta_subset_mask = None
+    # bold_flat = bold_data[nonzero_mask]
+    # masked_bold = bold_flat[keep_voxels].astype(np.float32)
     masked_coords = tuple(ax[keep_voxels] for ax in nonzero_mask)
     # Free large intermediates early.
     del bold_data, bold_flat, bold_imgs
@@ -847,11 +847,11 @@ def main():
         elif beta.shape[0] == keep_voxels_count:
             # Beta is already filtered somehow
             pass
-    if beta.shape[0] != masked_bold.shape[0]:
-        raise ValueError(
-            f"Beta voxels ({beta.shape[0]}) do not match masked BOLD ({masked_bold.shape[0]})."
-        )
-    bold_data_reshape = _extract_trial_segments(masked_bold, trial_len=TRIAL_LEN, num_trials=total_trials, rest_every=30, rest_len=20)
+    # if beta.shape[0] != masked_bold.shape[0]:
+    #     raise ValueError(
+    #         f"Beta voxels ({beta.shape[0]}) do not match masked BOLD ({masked_bold.shape[0]})."
+    #     )
+    # bold_data_reshape = _extract_trial_segments(masked_bold, trial_len=TRIAL_LEN, num_trials=total_trials, rest_every=30, rest_len=20)
     print("Remove NaN voxels...")
     nan_voxels = np.isnan(beta).all(axis=1)
     if np.any(nan_voxels):
