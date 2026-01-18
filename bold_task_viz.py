@@ -403,11 +403,12 @@ def main():
     viz_group.add_argument(
         "--bold-path",
         type=Path,
+        default= '/scratch/st-mmckeown-1/zkavian/fmri_opt/Thesis_code_Glm_Opt/data/sub09_ses01/sub-pd009_ses-1_run-1_task-mv_bold_corrected_smoothed_reg.nii.gz',
         help="Path to BOLD data (.npy or NIfTI). When set, run trial visualization pipeline.",
     )
     viz_group.add_argument(
         "--mask-path",
-        type=Path,
+        type=Path, 
         help="Optional mask (.npy or NIfTI) to select voxels.",
     )
     viz_group.add_argument("--num-trials", type=int, default=90, help="Number of trials (default: 90).")
