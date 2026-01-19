@@ -1895,13 +1895,13 @@ ridge_penalty = 1e-3
 solver_name = "MOSEK"
 # penalty_sweep = [(0.8, 1, 0.5, 1.2), (0, 1, 0.5, 1.2), (0.8, 0, 0.5, 1.2), (0.8, 1, 0, 1.2), (0.8, 1, 0.5, 0)]
 # penalty_sweep = [(0.8, 0, 0, 0), (0, 0.8, 0, 0), (0, 0, 0.5, 0), (0, 0, 0, 1),(0.8, 0.8, 0.5, 1)]
-penalty_sweep = [(0.8, 1, 0.5, 1.2), (0, 1, 0.5, 1.2), (0.8, 0, 0.5, 1.2), (0.8, 1, 0, 1.2), (0.8, 1, 0.5, 0)] #for sub09
+penalty_sweep = [(0.8, 1, 0.5, 1.2)] #for sub09
 # penalty_sweep = [(0.5, 0.8, 0.3, 1.5), (1.0, 2.0, 1.0, 3.0)] #for sub10
 # penalty_sweep = [(0.7, 0.7, 0.25, 0.1)]
 alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha, "smooth_penalty": smooth_alpha} for task_alpha, bold_alpha, beta_alpha, smooth_alpha in penalty_sweep]
 # gamma_sweep = [0, 0.2, 0.8]
 # gamma_sweep = [1, 2]
-gamma_sweep= [0, 1.5]
+gamma_sweep= [1.5]
 # SAVE_PER_FOLD_VOXEL_MAPS = False  # disable individual fold voxel-weight plots; averages saved later
 
 projection_data = build_pca_dataset(bold_clean, beta_clean, behavior_matrix, nan_mask_flat, active_coords, active_flat_idx, trial_len, num_trials)

@@ -1204,19 +1204,19 @@ def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smoo
 #     total_loss = gamma_value * penalty_value - corr_ratio
 #     return total_loss, penalty_value, corr_ratio, corr_num, corr_den
 
-def _build_objective_matrices(total_penalty, corr_num, corr_den, gamma_value, eps=1e-8):
-    A_mat = gamma_value * total_penalty - 0 * corr_num
+def _build_objective_matrices(total_penalty, corr_num, corr_den, gamma_value, corr_weight=1.0, eps=1e-8):
+    A_mat = gamma_value * total_penalty - corr_weight * corr_num
     A_mat = 0.5 * (A_mat + A_mat.T)
     eye = np.eye(A_mat.shape[0], dtype=np.float64)
-    if gamma_value == 0:
+    if corr_weight == 0:
         B_mat = eye
         return A_mat + eps * eye, B_mat
     B_mat = 0.5 * (corr_den + corr_den.T)
     return A_mat + eps * eye, B_mat + eps * eye
 
-def _total_loss_from_penalty(weights, total_penalty, gamma_value, corr_num=None, corr_den=None, penalty_terms=None, label=None, A_mat=None, B_mat=None):
+def _total_loss_from_penalty(weights, total_penalty, gamma_value, corr_weight=1.0, corr_num=None, corr_den=None, penalty_terms=None, label=None, A_mat=None, B_mat=None):
     weights = np.where(np.isfinite(weights), weights, 0.0)
-    A_mat, B_mat = _build_objective_matrices(total_penalty, corr_num, corr_den, gamma_value)
+    A_mat, B_mat = _build_objective_matrices(total_penalty, corr_num, corr_den, gamma_value, corr_weight=corr_weight)
     numerator = float(weights.T @ A_mat @ weights)
     denominator = float(weights.T @ B_mat @ weights)
     if penalty_terms:
@@ -1441,13 +1441,13 @@ def prepare_data_func(projection_data, trial_indices, trial_length, run_boundary
         "C_corr_num": C_corr_num, "C_corr_den": C_corr_den,
         "active_bold": bold_subset, "trial_indices": trial_indices, "num_trials": effective_num_trials}
 
-def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth, gamma):
+def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth, gamma, corr_weight=1.0):
     beta_centered = run_data["beta_centered"]
     n_components = beta_centered.shape[0]
     penalty_matrices, total_penalty = calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth)
 
     corr_num, corr_den = run_data["C_corr_num"], run_data["C_corr_den"]
-    A_mat, B_mat = _build_objective_matrices(total_penalty, corr_num, corr_den, gamma)
+    A_mat, B_mat = _build_objective_matrices(total_penalty, corr_num, corr_den, gamma, corr_weight=corr_weight)
 
     def _objective_with_grad(weights):
         numerator = weights.T @ A_mat @ weights
@@ -1484,7 +1484,7 @@ def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth
     gamma_penalty_ratio = gamma_penalty_value / denominator_value
     numerator_value = solution_weights.T @ A_mat @ solution_weights
     correlation_numerator = solution_weights.T @ corr_num @ solution_weights
-    total_loss = _total_loss_from_penalty(solution_weights, total_penalty, gamma, corr_num=corr_num, corr_den=corr_den, A_mat=A_mat, B_mat=B_mat)
+    total_loss = _total_loss_from_penalty(solution_weights, total_penalty, gamma, corr_weight=corr_weight, corr_num=corr_num, corr_den=corr_den, A_mat=A_mat, B_mat=B_mat)
     fractional_objective = numerator_value / denominator_value
     correlation_ratio = correlation_numerator / denominator_value
 
@@ -1493,13 +1493,13 @@ def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth
             "penalty_value": penalty_value, "gamma_penalty": gamma_penalty_value, "gamma_penalty_ratio": gamma_penalty_ratio}
 
 #%%
-def solve_soc_problem_eig(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth, gamma):
+def solve_soc_problem_eig(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth, gamma, corr_weight=1.0):
     beta_centered = run_data["beta_centered"]
     n_components = beta_centered.shape[0]
     penalty_matrices, total_penalty = calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth)
 
     corr_num, corr_den = run_data["C_corr_num"], run_data["C_corr_den"]
-    A_mat, B_mat = _build_objective_matrices(total_penalty, corr_num, corr_den, gamma)
+    A_mat, B_mat = _build_objective_matrices(total_penalty, corr_num, corr_den, gamma, corr_weight=corr_weight)
     A_mat = 0.5 * (A_mat + A_mat.T)
     B_mat = 0.5 * (B_mat + B_mat.T)
 
@@ -1529,7 +1529,7 @@ def solve_soc_problem_eig(run_data, alpha_task, alpha_bold, alpha_beta, alpha_sm
     numerator_value = float(solution_weights.T @ A_mat @ solution_weights)
     correlation_numerator = float(solution_weights.T @ corr_num @ solution_weights)
     gamma_penalty_ratio = gamma_penalty_value / denominator_value
-    total_loss = _total_loss_from_penalty(solution_weights, total_penalty, gamma, corr_num=corr_num, corr_den=corr_den, A_mat=A_mat, B_mat=B_mat)
+    total_loss = _total_loss_from_penalty(solution_weights, total_penalty, gamma, corr_weight=corr_weight, corr_num=corr_num, corr_den=corr_den, A_mat=A_mat, B_mat=B_mat)
     fractional_objective = numerator_value / denominator_value
     correlation_ratio = correlation_numerator / denominator_value
 
@@ -1814,13 +1814,15 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
 # # %%
 ridge_penalty = 1e-3
 solver_name = "MOSEK"
-# penalty_sweep = [(0.8, 1, 0.5, 1.2), (0, 1, 0.5, 1.2), (0.8, 0, 0.5, 1.2), (0.8, 1, 0, 1.2), (0.8, 1, 0.5, 0)]
-# penalty_sweep = [(0.8, 0, 0, 0), (0, 0.8, 0, 0), (0, 0, 0.5, 0), (0, 0, 0, 1),(0.8, 0.8, 0.5, 1)]
-# penalty_sweep = [(0.8, 1, 0.5, 1.2), (0.8, 0, 0, 0), (0, 1, 0, 0), (0, 0, 0.5, 0), (0, 0, 0, 1.2)] #for sub09
-penalty_sweep = [(0.8, 1, 0.5, 1.2)] #for sub09
-# penalty_sweep = [(0.5, 0.8, 0.3, 1.5), (1.0, 2.0, 1.0, 3.0)] #for sub10
-# penalty_sweep = [(0.7, 0.7, 0.25, 0.1)]
-alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha, "smooth_penalty": smooth_alpha} for task_alpha, bold_alpha, beta_alpha, smooth_alpha in penalty_sweep]
+# penalty_sweep = [(0.8, 1, 0.5, 1.2, 1.0), (0, 1, 0.5, 1.2, 1.0), (0.8, 0, 0.5, 1.2, 1.0), (0.8, 1, 0, 1.2, 1.0), (0.8, 1, 0.5, 0, 1.0)]
+# penalty_sweep = [(0.8, 0, 0, 0, 1.0), (0, 0.8, 0, 0, 1.0), (0, 0, 0.5, 0, 1.0), (0, 0, 0, 1, 1.0), (0.8, 0.8, 0.5, 1, 1.0)]
+penalty_sweep = [(0.8, 1, 0.5, 1.2, 1.0), (0.8, 0, 0, 0, 0), (0, 1, 0, 0, 0), (0, 0, 0.5, 0, 0), (0, 0, 0, 1.2, 0)] #for sub09
+# penalty_sweep = [(0.8, 1, 0.5, 1.2, 1.0)] #for sub09
+# penalty_sweep = [(0.5, 0.8, 0.3, 1.5, 1.0), (1.0, 2.0, 1.0, 3.0, 1.0)] #for sub10
+# penalty_sweep = [(0.7, 0.7, 0.25, 0.1, 1.0)]
+alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha,
+    "smooth_penalty": smooth_alpha, "corr_weight": corr_weight}
+    for task_alpha, bold_alpha, beta_alpha, smooth_alpha, corr_weight in penalty_sweep]
 # gamma_sweep = [0, 0.2, 0.8]
 # gamma_sweep = [1, 2]
 gamma_sweep= [1.5]
@@ -1859,15 +1861,18 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
 
         for alpha_setting in alpha_settings:
             task_alpha, bold_alpha, beta_alpha, smooth_alpha = alpha_setting["task_penalty"], alpha_setting["bold_penalty"], alpha_setting["beta_penalty"], alpha_setting["smooth_penalty"]
+            corr_weight = float(alpha_setting.get("corr_weight", 1.0))
             alpha_prefix = f"fold{fold_idx}_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}"
 
             for gamma_value in gamma_values:
-                metrics_key = (task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value)
-                combo_label = (f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, smooth={smooth_alpha:g}, gamma={gamma_value:g}")
+                metrics_key = (task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value, corr_weight)
+                combo_label = (f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, smooth={smooth_alpha:g}, "
+                               f"gamma={gamma_value:g}")
                 file_prefix = f"{alpha_prefix}_gamma{gamma_value:g}"
-                print(f"Fold {fold_idx}: optimization with task={task_alpha}, bold={bold_alpha}, beta={beta_alpha}, smooth={smooth_alpha}, gamma={gamma_value}", flush=True)
+                print(f"Fold {fold_idx}: optimization with task={task_alpha}, bold={bold_alpha}, beta={beta_alpha}, "
+                      f"smooth={smooth_alpha}, gamma={gamma_value}", flush=True)
                 try:
-                    solution = solve_soc_problem(train_data, task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value)
+                    solution = solve_soc_problem(train_data, task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value, corr_weight=corr_weight)
                 except Exception as exc:
                     print(f"  Fold {fold_idx}: optimization failed for {combo_label} -> {exc}", flush=True)
                     continue
@@ -1902,7 +1907,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 test_metrics = evaluate_projection_corr(test_data, component_weights)
 
                 train_penalties, total_penalty_train = calcu_penalty_terms(train_data, task_alpha, bold_alpha, beta_alpha, smooth_alpha)
-                train_A, train_B = _build_objective_matrices(total_penalty_train, train_data["C_corr_num"], train_data["C_corr_den"], gamma_value)
+                train_A, train_B = _build_objective_matrices(total_penalty_train, train_data["C_corr_num"], train_data["C_corr_den"], gamma_value, corr_weight=corr_weight)
                 train_total_loss = solution.get("total_loss")
                 train_numerator = float(component_weights.T @ train_A @ component_weights)
                 train_denominator = float(component_weights.T @ train_B @ component_weights)
@@ -1912,9 +1917,8 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 train_corr_ratio = train_corr_num_quad / train_denominator if np.isfinite(train_denominator) and train_denominator > 0 else np.nan
 
                 test_penalties, total_penalty_test = calcu_penalty_terms(test_data, task_alpha, bold_alpha, beta_alpha, smooth_alpha)
-                test_total_loss = _total_loss_from_penalty(solution["weights"], total_penalty_test, gamma_value, corr_num=test_data["C_corr_num"], 
-                                                           corr_den=test_data["C_corr_den"], penalty_terms=test_penalties, label="test")
-                test_A, test_B = _build_objective_matrices(total_penalty_test, test_data["C_corr_num"], test_data["C_corr_den"], gamma_value)
+                test_total_loss = _total_loss_from_penalty(solution["weights"], total_penalty_test, gamma_value, corr_weight=corr_weight, corr_num=test_data["C_corr_num"], corr_den=test_data["C_corr_den"], penalty_terms=test_penalties, label="test")
+                test_A, test_B = _build_objective_matrices(total_penalty_test, test_data["C_corr_num"], test_data["C_corr_den"], gamma_value, corr_weight=corr_weight)
                 test_numerator = float(component_weights.T @ test_A @ component_weights)
                 test_denominator = float(component_weights.T @ test_B @ component_weights)
                 test_corr_num_quad = float(component_weights.T @ test_data["C_corr_num"] @ component_weights)
@@ -1942,6 +1946,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                     "run2_test_span": run2_desc,
                     "alphas": {"task": task_alpha, "bold": bold_alpha, "beta": beta_alpha, "smooth": smooth_alpha},
                     "gamma": gamma_value,
+                    "corr_weight": corr_weight,
                     "numerator": numerator_value,
                     "denominator": denominator_value,
                     "fractional_objective": solution.get("fractional_objective"),
@@ -1970,7 +1975,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                     "weight_stats": weight_stats}
                 _append_run_log(log_entry)
 
-                metrics_key = (task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value)
+                metrics_key = (task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value, corr_weight)
                 bucket = aggregate_metrics[metrics_key]
                 bucket["train_corr"].append(np.abs(train_metrics["pearson"]))
                 bucket["train_p"].append(train_metrics["pearson_p"])
@@ -1994,7 +1999,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
     if fold_metric_records:
         print("\n===== Saving fold-wise metric box plots =====", flush=True)
         for metrics_key in sorted(fold_metric_records.keys()):
-            task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value = metrics_key
+            task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value, corr_weight = metrics_key
             combo_label = (f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, smooth={smooth_alpha:g}, gamma={gamma_value:g}")
             metrics_prefix = (f"foldmetrics_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}_gamma{gamma_value:g}")
             
@@ -2049,9 +2054,9 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             os.makedirs(atlas_data_dir, exist_ok=True)
 
         for metrics_key in sorted(fold_output_tracker.keys()):
-            task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value = metrics_key
+            task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value, corr_weight = metrics_key
             fold_outputs = fold_output_tracker[metrics_key]
-            avg_prefix = f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}_gamma{gamma_value:g}"
+            avg_prefix = (f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}_gamma{gamma_value:g}")
 
             # comp_weights_stack = np.stack(fold_outputs["component_weights"], axis=0)
             # comp_weights_icc = _compute_matrix_icc(comp_weights_stack)
@@ -2073,33 +2078,14 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 if atlas_analysis_enabled:
                     try:
                         weights_img = nib.load(voxel_weights_path)
-                        if (
-                            atlas_context is None
-                            or atlas_context.get("shape") != weights_img.shape[:3]
-                            or not np.allclose(atlas_context.get("affine"), weights_img.affine)
-                        ):
-                            atlas_context = _prepare_atlas_context(
-                                anat_img,
-                                anat_path,
-                                weights_img,
-                                os.getcwd(),
-                                atlas_threshold=atlas_threshold,
-                                data_dir=atlas_data_dir,
-                                assume_mni=atlas_assume_mni,
-                            )
+                        if (atlas_context is None or atlas_context.get("shape") != weights_img.shape[:3]
+                            or not np.allclose(atlas_context.get("affine"), weights_img.affine)):
+                            atlas_context = _prepare_atlas_context(anat_img, anat_path, weights_img, os.getcwd(), atlas_threshold=atlas_threshold,
+                                                                   data_dir=atlas_data_dir, assume_mni=atlas_assume_mni)
                         output_prefix = f"voxel_weights_mean_{avg_prefix}"
-                        _analyze_weight_map_regions(
-                            voxel_weights_path,
-                            atlas_context,
-                            output_prefix,
-                            motor_label_patterns,
-                            threshold_percentile=95,
-                        )
+                        _analyze_weight_map_regions(voxel_weights_path, atlas_context, output_prefix, motor_label_patterns, threshold_percentile=95)
                     except Exception as exc:
-                        print(
-                            f"  WARNING: Atlas region analysis failed for {voxel_weights_path}: {exc}",
-                            flush=True,
-                        )
+                        print(f" WARNING: Atlas region analysis failed for {voxel_weights_path}: {exc}", flush=True)
             else:
                 print(f"  WARNING: Expected voxel weights map not found: {voxel_weights_path}", flush=True)
 
@@ -2120,7 +2106,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                            display_threshold_ratio=0.8)
 
             projection_avg = _compute_projection(weights_avg, projection_data["beta_clean"])
-            avg_series_key = (task_alpha, bold_alpha, beta_alpha, smooth_alpha)
+            avg_series_key = (task_alpha, bold_alpha, beta_alpha, smooth_alpha, corr_weight)
             fold_avg_projection_series[avg_series_key].append((gamma_value, projection_avg))
 
             bold_clean_full = projection_data.get("bold_clean")
@@ -2134,9 +2120,9 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
 
         if fold_avg_projection_series:
             for avg_series_key in sorted(fold_avg_projection_series.keys()):
-                task_alpha, bold_alpha, beta_alpha, smooth_alpha = avg_series_key
+                task_alpha, bold_alpha, beta_alpha, smooth_alpha, corr_weight = avg_series_key
                 gamma_series = fold_avg_projection_series[avg_series_key]
-                avg_base_prefix = f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}"
+                avg_base_prefix = (f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}")
                 avg_series_storage = f"gamma_series_voxel_{avg_base_prefix}.npy"
                 existing_avg = _load_projection_series(avg_series_storage)
                 merged_avg = _merge_projection_series(existing_avg, gamma_series)
@@ -2148,7 +2134,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
     if aggregate_metrics:
         print("\n===== Cross-fold average metrics =====", flush=True)
         for metrics_key in sorted(aggregate_metrics.keys()):
-            task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value = metrics_key
+            task_alpha, bold_alpha, beta_alpha, smooth_alpha, gamma_value, corr_weight = metrics_key
             bucket = aggregate_metrics[metrics_key]
 
             train_corr_mean = np.nanmean(np.abs(bucket["train_corr"]))
@@ -2162,7 +2148,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             fold_count = len(bucket["test_corr"])
 
             combo_label = (f"task={task_alpha:g}\n bold={bold_alpha:g}\n beta={beta_alpha:g}\n smooth={smooth_alpha:g}\n gamma={gamma_value:g}")
-            print(f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, smooth={smooth_alpha:g}, gamma={gamma_value:g} "
+            print(f"task={task_alpha:g}, bold={bold_alpha:g}, beta={beta_alpha:g}, smooth={smooth_alpha:g}, gamma={gamma_value:g}"
                 f"(folds contributing={fold_count}): "
                 f"train corr={train_corr_mean:.4f} (p={train_p_mean:.4f}), "
                 f"test corr={test_corr_mean:.4f} (p={test_p_mean:.4f}), "
