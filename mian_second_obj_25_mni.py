@@ -184,6 +184,50 @@ def _resample_to_template(img, template_img, interpolation):
         img, template_img, interpolation=interpolation, force_resample=True, copy_header=True
     )
 
+def _prepare_mni_visualization_context(anat_path, mni_template, cache_dir, assume_mni=False, tag="mni"):
+    os.makedirs(cache_dir, exist_ok=True)
+    if assume_mni:
+        template_path = None
+        template_img = None
+        if mni_template:
+            template_path = _resolve_mni_template(mni_template, None)
+        else:
+            template_path = _default_mni_template(None)
+        if template_path:
+            template_img = nib.load(template_path)
+            anat_img = nib.load(anat_path)
+            anat_mni_img = _resample_to_template(anat_img, template_img, interpolation="continuous")
+        else:
+            anat_mni_img = nib.load(anat_path)
+        return {
+            "assume_mni": True,
+            "flirt_path": None,
+            "mni_template": template_path,
+            "template_img": template_img,
+            "mat_path": None,
+            "anat_mni_img": anat_mni_img,
+            "tag": tag,
+        }
+
+    flirt_path = _find_flirt()
+    if not flirt_path:
+        raise RuntimeError(
+            "FLIRT not found in PATH. Install FSL or set USE_MNI=0 (or ASSUME_MNI=1 if already in MNI)."
+        )
+    template_path = _resolve_mni_template(mni_template, flirt_path)
+    mat_path, anat_mni_path = _compute_anat_to_mni(anat_path, template_path, cache_dir, flirt_path)
+    anat_mni_img = nib.load(anat_mni_path)
+    template_img = nib.load(template_path)
+    return {
+        "assume_mni": False,
+        "flirt_path": flirt_path,
+        "mni_template": template_path,
+        "template_img": template_img,
+        "mat_path": mat_path,
+        "anat_mni_img": anat_mni_img,
+        "tag": tag,
+    }
+
 def _fast_map_active_bold_to_mni(active_bold, active_coords, mask_bool, vox2vox, fill_value=0.0):
     if active_bold is None:
         return None, 0, int(np.count_nonzero(mask_bool))
@@ -579,13 +623,12 @@ trial_len = 9
 behave_indice = 1 #1/RT
 trials_per_run = num_trials // 2
 
-# Save a quick visualization of the mean beta activation (averaged over trials) as an interactive HTML.
-
+# Analysis stays in native space; USE_MNI controls optional MNI-space visualization at the end.
 USE_MNI = os.environ.get("USE_MNI", "1") != "0"
 ASSUME_MNI = os.environ.get("ASSUME_MNI", "0") == "1"
 MNI_TEMPLATE = os.environ.get("MNI_TEMPLATE")
-OUTPUT_TAG = os.environ.get("OUTPUT_TAG", "mni")
-FAST_MNI_BOLD = os.environ.get("FAST_MNI_BOLD", "0") == "1"
+OUTPUT_TAG = os.environ.get("OUTPUT_TAG", "native")
+MNI_OUTPUT_TAG = os.environ.get("MNI_OUTPUT_TAG", "mni")
 
 
 data_base = os.environ.get(f"FMRI_OPT_DATA_DIR", "/scratch/st-mmckeown-1/zkavian/fmri_opt/Thesis_code_Glm_Opt/data")
@@ -703,6 +746,20 @@ brain_mask = nib.load(brain_mask_path).get_fdata().astype(np.float16)
 csf_mask = nib.load(csf_mask_path).get_fdata().astype(np.float16)
 gray_mask = nib.load(gray_mask_path).get_fdata().astype(np.float16)
 
+mni_context = None
+if USE_MNI:
+    print(
+        f"Preparing MNI visualization outputs (assume_mni={ASSUME_MNI}) using cache: {mni_cache_dir}",
+        flush=True,
+    )
+    mni_context = _prepare_mni_visualization_context(
+        anat_path=anat_path,
+        mni_template=MNI_TEMPLATE,
+        cache_dir=mni_cache_dir,
+        assume_mni=ASSUME_MNI,
+        tag=MNI_OUTPUT_TAG,
+    )
+
 # glm_dict = np.load(f"{base_path}/TYPED_FITHRF_GLMDENOISE_RR_sub{sub}_ses{ses}.npy", allow_pickle=True).item()
 # beta_glm = glm_dict["betasmd"]
 
@@ -771,68 +828,6 @@ if has_run1:
     if bold_img_run1 is None:
         bold_img_run1 = nib.Nifti1Image(np.load(run1_bold_path, mmap_mode="r"), affine=np.eye(4))
     volume_shape = bold_img_run1.shape[:3]
-
-if USE_MNI:
-    print(f"Converting inputs to MNI space (assume_mni={ASSUME_MNI}) using cache: {mni_cache_dir}", flush=True)
-    if FAST_MNI_BOLD:
-        print("FAST_MNI_BOLD=1: using coordinate mapping for active_bold (approximate).", flush=True)
-    if not ASSUME_MNI:
-        if run2_bold_path.endswith(".npy"):
-            raise RuntimeError("MNI conversion requires NIfTI BOLD input for run2; found .npy.")
-        if has_run1 and run1_bold_path and run1_bold_path.endswith(".npy"):
-            raise RuntimeError("MNI conversion requires NIfTI BOLD input for run1; found .npy.")
-
-    run_data = {
-        2: {
-            "beta_filtered": beta_filtered_run2,
-            "nan_mask_flat": nan_mask_flat_run2,
-            "active_coords": active_coords_run2,
-            "active_bold": clean_active_bold_run2,
-            "affine": bold_img_run2.affine,
-            "volume_shape": bold_img_run2.shape[:3],
-        }
-    }
-    if has_run1:
-        run_data[1] = {
-            "beta_filtered": beta_filtered_run1,
-            "nan_mask_flat": nan_mask_flat_run1,
-            "active_coords": active_coords_run1,
-            "active_bold": clean_active_bold_run1,
-            "affine": bold_img_run1.affine,
-            "volume_shape": bold_img_run1.shape[:3],
-        }
-
-    cleaned_beta_paths = {2: cleaned_beta_run2_path, 1: cleaned_beta_run1_path}
-    mni_outputs = _convert_inputs_to_mni(
-        anat_path=anat_path,
-        brain_mask_path=brain_mask_path,
-        csf_mask_path=csf_mask_path,
-        gray_mask_path=gray_mask_path,
-        cleaned_beta_paths=cleaned_beta_paths,
-        run_data=run_data,
-        mni_template=MNI_TEMPLATE,
-        cache_dir=mni_cache_dir,
-        assume_mni=ASSUME_MNI,
-        fast_bold=FAST_MNI_BOLD,
-    )
-    anat_img = mni_outputs["anat_img"]
-    brain_mask = mni_outputs["brain_mask"]
-    csf_mask = mni_outputs["csf_mask"]
-    gray_mask = mni_outputs["gray_mask"]
-    volume_shape = mni_outputs["volume_shape"]
-    run2_conv = mni_outputs["converted_runs"].get(2)
-    if run2_conv:
-        beta_filtered_run2 = run2_conv["beta_filtered"]
-        nan_mask_flat_run2 = run2_conv["nan_mask_flat"]
-        active_coords_run2 = run2_conv["active_coords"]
-        clean_active_bold_run2 = run2_conv["active_bold"]
-    if has_run1:
-        run1_conv = mni_outputs["converted_runs"].get(1)
-        if run1_conv:
-            beta_filtered_run1 = run1_conv["beta_filtered"]
-            nan_mask_flat_run1 = run1_conv["nan_mask_flat"]
-            active_coords_run1 = run1_conv["active_coords"]
-            clean_active_bold_run1 = run1_conv["active_bold"]
 
 single_run_mode = nan_mask_flat_run1 is None or beta_filtered_run1 is None or active_coords_run1 is None
 if single_run_mode:
@@ -1118,11 +1113,12 @@ def _compute_matrix_icc(data):
     return icc2.iloc[0]
 
 def save_brain_map(correlations, active_coords, volume_shape, anat_img, file_prefix, result_prefix="active_bold_corr",
-                   map_title=None, display_threshold_ratio=None):
+                   map_title=None, display_threshold_ratio=None, mni_context=None):
     coord_arrays = tuple(np.asarray(axis, dtype=int) for axis in active_coords)
     display_values = np.abs(correlations.ravel())
     volume = np.full(volume_shape, np.nan)
     colorbar_max = None
+    threshold_value = None
     if coord_arrays and coord_arrays[0].size:
         volume[coord_arrays] = display_values
         finite_values = display_values[np.isfinite(display_values)]
@@ -1139,9 +1135,93 @@ def save_brain_map(correlations, active_coords, volume_shape, anat_img, file_pre
         threshold_value = colorbar_max * clamped_ratio
         display_volume[display_volume < threshold_value] = 0.0
         display_img = nib.Nifti1Image(display_volume, anat_img.affine, anat_img.header)
-        display = plotting.view_img(display_img, bg_img=anat_img, colorbar=True, symmetric_cmap=False,cmap='jet', threshold=threshold_value)
+        display = plotting.view_img(
+            display_img,
+            bg_img=anat_img,
+            colorbar=True,
+            symmetric_cmap=False,
+            cmap="jet",
+            threshold=threshold_value,
+        )
         display.save_as_html(f"{result_prefix}_{file_prefix}.html")
         # display.close()
+
+    if mni_context:
+        mni_tag = mni_context.get("tag") or "mni"
+        mni_file_prefix = f"{file_prefix}_{mni_tag}"
+        mni_volume_path = f"{result_prefix}_{mni_file_prefix}.nii.gz"
+
+        if mni_context.get("assume_mni"):
+            template_img = mni_context.get("template_img")
+            if template_img is not None:
+                mni_corr_img = _resample_to_template(corr_img, template_img, interpolation="continuous")
+            else:
+                mni_corr_img = corr_img
+            nib.save(mni_corr_img, mni_volume_path)
+        else:
+            flirt_path = mni_context.get("flirt_path")
+            mat_path = mni_context.get("mat_path")
+            mni_template = mni_context.get("mni_template")
+            if not (flirt_path and mat_path and mni_template):
+                raise RuntimeError("MNI visualization requested but FLIRT configuration is incomplete.")
+            _apply_flirt(volume_path, mni_template, mat_path, mni_volume_path, flirt_path, interp="trilinear")
+            mni_corr_img = nib.load(mni_volume_path)
+
+        if np.any(np.isfinite(display_values)):
+            mni_data = mni_corr_img.get_fdata(dtype=np.float32)
+            mni_display = np.nan_to_num(mni_data, nan=0.0, posinf=0.0, neginf=0.0)
+            if colorbar_max is not None:
+                mni_display = np.clip(mni_display, 0.0, colorbar_max)
+            if threshold_value is not None:
+                mni_display[mni_display < threshold_value] = 0.0
+            mni_display_img = nib.Nifti1Image(mni_display, mni_corr_img.affine, mni_corr_img.header)
+            display = plotting.view_img(
+                mni_display_img,
+                bg_img=mni_context.get("anat_mni_img"),
+                colorbar=True,
+                symmetric_cmap=False,
+                cmap="jet",
+                threshold=threshold_value,
+            )
+            display.save_as_html(f"{result_prefix}_{mni_file_prefix}.html")
+            # display.close()
+
+            try:
+                resampled = image.resample_to_img(mni_corr_img, corr_img, interpolation="continuous")
+                native_vals = corr_img.get_fdata(dtype=np.float32)
+                mni_vals = resampled.get_fdata(dtype=np.float32)
+                finite_mask = np.isfinite(native_vals) & np.isfinite(mni_vals)
+                if np.any(finite_mask):
+                    native_flat = native_vals[finite_mask].ravel()
+                    mni_flat = mni_vals[finite_mask].ravel()
+                    native_flat = native_flat - native_flat.mean()
+                    mni_flat = mni_flat - mni_flat.mean()
+                    denom = np.sqrt(np.dot(native_flat, native_flat) * np.dot(mni_flat, mni_flat))
+                    corr_value = float(np.dot(native_flat, mni_flat) / denom) if denom > 0 else np.nan
+                    dice_value = np.nan
+                    native_count = 0
+                    mni_count = 0
+                    overlap = 0
+                    if threshold_value is not None:
+                        native_mask = native_vals >= threshold_value
+                        mni_mask = mni_vals >= threshold_value
+                        native_count = int(np.count_nonzero(native_mask))
+                        mni_count = int(np.count_nonzero(mni_mask))
+                        overlap = int(np.count_nonzero(native_mask & mni_mask))
+                        denom_dice = native_count + mni_count
+                        if denom_dice:
+                            dice_value = 2.0 * overlap / denom_dice
+                    print(
+                        f"MNI/native similarity for {result_prefix}_{file_prefix}: corr={corr_value:.4f}, "
+                        f"dice={dice_value:.4f}, native_vox={native_count}, mni_vox={mni_count}, "
+                        f"overlap={overlap}",
+                        flush=True,
+                    )
+            except Exception as exc:
+                print(
+                    f"WARNING: MNI/native similarity check failed for {result_prefix}_{file_prefix}: {exc}",
+                    flush=True,
+                )
     return
 
 def _load_projection_series(series_path):
@@ -2050,24 +2130,51 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             weights_icc = _compute_matrix_icc(weights_stack)
             print(f"  ICC (weights across folds/voxels): {weights_icc:.4f}" if np.isfinite(weights_icc) else "  ICC (weights) could not be computed", flush=True)
             weights_title = f"ICC={weights_icc:.3f}"
-            save_brain_map(weights_avg * 1000, active_coords, volume_shape, anat_img, avg_prefix, result_prefix="voxel_weights_mean", map_title=weights_title,
-                display_threshold_ratio=0.8)
+            save_brain_map(
+                weights_avg * 1000,
+                active_coords,
+                volume_shape,
+                anat_img,
+                avg_prefix,
+                result_prefix="voxel_weights_mean",
+                map_title=weights_title,
+                display_threshold_ratio=0.8,
+                mni_context=mni_context,
+            )
 
             bold_corr_stack = np.stack(np.abs(fold_outputs["bold_corr"]), axis=0)
             bold_corr_avg = np.nanmean(bold_corr_stack, axis=0)
             bold_corr_icc = _compute_matrix_icc(bold_corr_stack)
             print(f"  ICC (bold corr across folds/voxels): {bold_corr_icc:.4f}" if np.isfinite(bold_corr_icc) else "  ICC (bold corr) could not be computed", flush=True)
             bold_title = f"ICC={bold_corr_icc:.3f}"
-            save_brain_map(bold_corr_avg, active_coords, volume_shape, anat_img, avg_prefix, result_prefix="active_bold_corr_mean", map_title=bold_title,
-                           display_threshold_ratio=0.8)
+            save_brain_map(
+                bold_corr_avg,
+                active_coords,
+                volume_shape,
+                anat_img,
+                avg_prefix,
+                result_prefix="active_bold_corr_mean",
+                map_title=bold_title,
+                display_threshold_ratio=0.8,
+                mni_context=mni_context,
+            )
 
             beta_corr_stack = np.stack(np.abs(fold_outputs["beta_corr"]), axis=0)
             beta_corr_avg = np.nanmean(beta_corr_stack, axis=0)
             beta_corr_icc = _compute_matrix_icc(beta_corr_stack)
             print(f"  ICC (beta corr across folds/voxels): {beta_corr_icc:.4f}" if np.isfinite(beta_corr_icc) else "  ICC (beta corr) could not be computed", flush=True)
             beta_title = f"ICC={beta_corr_icc:.3f}"
-            save_brain_map(beta_corr_avg, active_coords, volume_shape, anat_img, avg_prefix, result_prefix=f"active_beta_corr_mean", map_title=beta_title,
-                           display_threshold_ratio=0.8)
+            save_brain_map(
+                beta_corr_avg,
+                active_coords,
+                volume_shape,
+                anat_img,
+                avg_prefix,
+                result_prefix="active_beta_corr_mean",
+                map_title=beta_title,
+                display_threshold_ratio=0.8,
+                mni_context=mni_context,
+            )
 
             projection_avg = _compute_projection(weights_avg, projection_data["beta_clean"])
             avg_series_key = (task_alpha, bold_alpha, beta_alpha, smooth_alpha)
