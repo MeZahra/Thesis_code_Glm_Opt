@@ -3,10 +3,8 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Optional, Union
 
 import matplotlib
-import nibabel as nib
 import numpy as np
 from scipy import stats
 
@@ -21,64 +19,72 @@ if str(GLMSINGLE_ROOT) not in sys.path:
 from glmsingle.design.convolve_design import convolve_design
 
 
-def _parse_runs(runs_csv) -> list[int]:
+def _parse_runs(runs_csv):
+    """Parse comma-separated run numbers into a list of ints."""
     runs = []
     for item in runs_csv.split(","):
         item = item.strip()
         if not item:
             continue
-        try:
-            runs.append(int(item))
-        except ValueError as exc:
-            raise ValueError(f"Invalid run value: {item!r}") from exc
-    if not runs:
-        raise ValueError("No runs specified.")
+        runs.append(int(item))
     return runs
 
 
-def _load_design(design_path: Path):
+def _resolve_path(path):
+    """Resolve a path relative to the repository root."""
+    path = Path(path)
+    if not path.is_absolute():
+        path = (REPO_ROOT / path).resolve()
+    return path
+
+
+def _load_design(design_path):
+    """Load GLMsingle design matrix and HRF library."""
     designinfo = np.load(design_path, allow_pickle=True).item()
-    if "designSINGLE" not in designinfo:
-        raise KeyError("DESIGNINFO missing designSINGLE.")
-    if "params" not in designinfo:
-        raise KeyError("DESIGNINFO missing params.")
     params = designinfo["params"]
-    if "hrflibrary" not in params:
-        raise KeyError("DESIGNINFO params missing hrflibrary.")
     return designinfo["designSINGLE"], params["hrflibrary"]
 
 
-def _load_model(model_path: Path):
+def _load_model(model_path):
+    """Load GLMsingle model betas and HRF indices."""
     model = np.load(model_path, allow_pickle=True).item()
-    if "betasmd" not in model:
-        raise KeyError("Model missing betasmd.")
-    if "HRFindexrun" not in model:
-        raise KeyError("Model missing HRFindexrun.")
     return model["betasmd"], model["HRFindexrun"]
 
 
-def _flatten_betas(betasmd: np.ndarray) -> tuple[np.ndarray, int]:
+def _flatten_betas(betasmd):
+    """Reshape beta volume to (voxels, trials) and return volume shape."""
     if betasmd.ndim < 2:
-        raise ValueError(f"Unexpected betasmd shape: {betasmd.shape}")
+        raise ValueError(f"betasmd must be at least 2D, got shape {betasmd.shape}.")
     numtrials = betasmd.shape[-1]
-    voxels = int(np.prod(betasmd.shape[:-1]))
+    if betasmd.ndim == 2:
+        voxels = betasmd.shape[0]
+        volume_shape = (voxels,)
+        betas = betasmd.astype(np.float32, copy=False)
+        return betas, numtrials, volume_shape
+    volume_shape = betasmd.shape[:-1]
+    voxels = int(np.prod(volume_shape))
     betas = betasmd.reshape((voxels, numtrials)).astype(np.float32, copy=False)
-    return betas, numtrials
+    return betas, numtrials, volume_shape
 
 
-def _flatten_hrfindex(hrfindexrun: np.ndarray, numruns: int) -> np.ndarray:
-    if hrfindexrun.ndim < 2:
-        raise ValueError(f"Unexpected HRFindexrun shape: {hrfindexrun.shape}")
-    if hrfindexrun.shape[-1] != numruns:
-        raise ValueError(
-            f"HRFindexrun last dim ({hrfindexrun.shape[-1]}) "
-            f"does not match numruns ({numruns})."
-        )
+def _flatten_hrfindex(hrfindexrun, numruns, voxels_expected):
+    """Flatten HRF index array to (voxels, runs)."""
+    if hrfindexrun.ndim == 2:
+        if hrfindexrun.shape != (voxels_expected, numruns):
+            raise ValueError(
+                f"HRF index shape {hrfindexrun.shape} does not match ({voxels_expected}, {numruns})."
+            )
+        return hrfindexrun.astype(np.int64, copy=False)
     voxels = int(np.prod(hrfindexrun.shape[:-1]))
+    if voxels != voxels_expected:
+        raise ValueError(
+            f"HRF index voxel count {voxels} does not match betas {voxels_expected}."
+        )
     return hrfindexrun.reshape((voxels, numruns)).astype(np.int64, copy=False)
 
 
-def _convolve_by_hrf(design_single: np.ndarray, hrflibrary: np.ndarray) -> list[np.ndarray]:
+def _convolve_by_hrf(design_single, hrflibrary):
+    """Convolve the design matrix with each HRF in the library."""
     num_hrf = hrflibrary.shape[1]
     conv = []
     for h in range(num_hrf):
@@ -87,10 +93,36 @@ def _convolve_by_hrf(design_single: np.ndarray, hrflibrary: np.ndarray) -> list[
     return conv
 
 
-def _write_task_prediction(betas: np.ndarray, hrf_idx_run: np.ndarray, conv_by_hrf: list[np.ndarray], out_path: Path, chunk_size: int):
-    voxels, numtrials = betas.shape
-    ntime = conv_by_hrf[0].shape[0]
-    pred = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.float32, shape=(voxels, ntime))
+def _normalize_hrf_indices(hrf_idx_run, num_hrf):
+    """Normalize HRF indices to 0-based when they look 1-based."""
+    hrf_idx_run = np.asarray(hrf_idx_run)
+    if hrf_idx_run.size == 0:
+        return hrf_idx_run
+    finite = hrf_idx_run[np.isfinite(hrf_idx_run)]
+    if finite.size == 0:
+        return hrf_idx_run
+    min_idx = int(np.min(finite))
+    max_idx = int(np.max(finite))
+    if min_idx >= 1 and max_idx == num_hrf:
+        return hrf_idx_run - 1
+    return hrf_idx_run
+
+
+def _predict_run_timeseries(betas_run, hrf_idx_run, design_single, hrflibrary, chunk_size):
+    """Predict a run's BOLD time series for all voxels."""
+    if betas_run.shape[1] != design_single.shape[1]:
+        raise ValueError(f"Betas trials {betas_run.shape[1]} do not match design trials {design_single.shape[1]}.")
+    conv_by_hrf = _convolve_by_hrf(design_single, hrflibrary)
+    voxels = betas_run.shape[0]
+    timepoints = conv_by_hrf[0].shape[0]
+    pred = np.zeros((voxels, timepoints), dtype=np.float32)
+
+    num_hrf = hrflibrary.shape[1]
+    hrf_idx_run = _normalize_hrf_indices(hrf_idx_run, num_hrf)
+    invalid = (hrf_idx_run < 0) | (hrf_idx_run >= num_hrf)
+    if np.any(invalid):
+        invalid_count = int(np.count_nonzero(invalid))
+        print(f"Warning: {invalid_count} voxels have invalid HRF indices for this run.", flush=True)
 
     for h, conv in enumerate(conv_by_hrf):
         voxel_idx = np.flatnonzero(hrf_idx_run == h)
@@ -99,273 +131,86 @@ def _write_task_prediction(betas: np.ndarray, hrf_idx_run: np.ndarray, conv_by_h
         conv_t = conv.T
         for start in range(0, voxel_idx.size, chunk_size):
             chunk = voxel_idx[start : start + chunk_size]
-            pred[chunk, :] = betas[chunk, :] @ conv_t
-
-    pred.flush()
-
-
-def _parse_int_list(values_csv: str, allow_empty: bool, label: str) -> list[int]:
-    values = []
-    for item in values_csv.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        values.append(int(item))
-    if not values and not allow_empty:
-        raise ValueError(f"No {label} specified.")
-    return values
+            pred[chunk, :] = betas_run[chunk, :] @ conv_t
+    return pred
 
 
-def _is_nifti(path: Path) -> bool:
-    if path.suffix == ".nii":
-        return True
-    suffixes = path.suffixes
-    return len(suffixes) >= 2 and suffixes[-2:] == [".nii", ".gz"]
-
-
-def _load_numpy_or_nifti(path: Path) -> np.ndarray:
-    if _is_nifti(path):
-        img = nib.load(str(path))
-        return img.get_fdata(dtype=np.float32)
-    if path.suffix == ".npy":
-        return np.load(path, mmap_mode="r")
-    raise ValueError(f"Unsupported file type: {path}")
-
-
-def _load_mask(mask_path, expected_size, expected_shape):
-    mask_data = _load_numpy_or_nifti(mask_path)
-    mask = np.asarray(mask_data)
-    if mask.ndim == 3:
-        if expected_shape is not None and mask.shape != expected_shape:
-            raise ValueError(
-                f"Mask shape {mask.shape} does not match expected {expected_shape}."
-            )
-        mask_flat = mask.reshape(-1).astype(bool)
-    elif mask.ndim == 1:
-        mask_flat = mask.astype(bool)
-    else:
-        raise ValueError(f"Mask must be 1D or 3D, got shape {mask.shape}.")
-    if expected_size is not None and mask_flat.size != expected_size:
-        raise ValueError(
-            f"Mask has {mask_flat.size} voxels, expected {expected_size}."
-        )
-    if not np.any(mask_flat):
-        raise ValueError("Mask has no nonzero voxels.")
-    return mask_flat
-
-
-def _load_bold_data(
-    bold_path: Path,
-    mask_path: Optional[Path],
-    expected_timepoints: Optional[int],
-    return_meta: bool = False):
-    bold_data = _load_numpy_or_nifti(bold_path)
-    bold = np.asarray(bold_data)
-    volume_shape = None
-    mask_flat = None
-    if bold.ndim == 2:
-        if expected_timepoints is not None:
-            if bold.shape[1] != expected_timepoints and bold.shape[0] == expected_timepoints:
-                bold = bold.T
-                print("Transposed BOLD array to (voxels, timepoints) layout.", flush=True)
-        if mask_path is not None:
-            mask_data = _load_numpy_or_nifti(mask_path)
-            mask = np.asarray(mask_data)
-            if mask.ndim == 3:
-                volume_shape = mask.shape
-            mask_flat = _load_mask(mask_path, expected_size=bold.shape[0], expected_shape=volume_shape)
-            bold = bold[mask_flat]
-        bold = bold.astype(np.float32, copy=False)
-        if return_meta:
-            return bold, volume_shape, mask_flat
-        return bold
-    if bold.ndim == 4:
-        volume_shape = bold.shape[:3]
-        timepoints = bold.shape[3]
-        bold_2d = bold.reshape(-1, timepoints)
-        if mask_path is not None:
-            mask_flat = _load_mask(
-                mask_path, expected_size=bold_2d.shape[0], expected_shape=volume_shape
-            )
-            bold_2d = bold_2d[mask_flat]
-        bold_2d = bold_2d.astype(np.float32, copy=False)
-        if return_meta:
-            return bold_2d, volume_shape, mask_flat
-        return bold_2d
-    raise ValueError(f"BOLD data must be 2D or 4D, got shape {bold.shape}.")
-
-
-def _extract_trial_segments(
-    bold_data: np.ndarray,
-    trial_len: int,
-    num_trials: int,
-    rest_after: list[int],
-    rest_len: int):
-    num_voxels, num_timepoints = bold_data.shape
-    segments = np.full((num_voxels, num_trials, trial_len), np.nan, dtype=np.float32)
-    start = 0
-    rest_after_set = set(rest_after)
-    for trial_idx in range(num_trials):
-        end = start + trial_len
-        if end > num_timepoints:
-            raise ValueError(
-                f"Not enough timepoints for trial {trial_idx + 1}: need {end}, have {num_timepoints}."
-            )
-        segments[:, trial_idx, :] = bold_data[:, start:end]
-        start = end
-        if (trial_idx + 1) in rest_after_set:
-            start += rest_len
-    if start > num_timepoints:
-        raise ValueError(
-            f"Rest blocks exceed data length: ended at {start}, but data has {num_timepoints}."
-        )
-    return segments
-
-
-def _offset_step(trials: np.ndarray) -> float:
-    finite = trials[np.isfinite(trials)]
-    if finite.size == 0:
-        return 1.0
-    p05, p95 = np.percentile(finite, [5, 95])
-    span = float(p95 - p05)
-    if span <= 0:
-        span = float(np.max(finite) - np.min(finite))
-    if span <= 0:
-        span = 1.0
-    return span * 1.2
-
-
-def _plot_single_voxel_trials(
-    trials: np.ndarray,
-    voxel_idx: int,
-    out_path: Path,
-    tr: float):
-    num_trials, trial_len = trials.shape
-    timepoints = np.arange(1, trial_len + 1, dtype=np.int64)
-    step = _offset_step(trials)
-    fig_height = max(6.0, num_trials * 0.12)
-    fig, ax = plt.subplots(figsize=(8.0, fig_height))
+def _trial_onsets_from_design(design_single, eps=1e-6):
+    """Get per-trial onset indices from a design matrix."""
+    design = np.asarray(design_single)
+    if design.ndim != 2:
+        raise ValueError(f"Design matrix must be 2D, got shape {design.shape}.")
+    num_trials = design.shape[1]
+    onsets = np.empty(num_trials, dtype=np.int64)
+    missing = 0
     for idx in range(num_trials):
-        ax.plot(
-            timepoints,
-            trials[idx] + step * idx,
-            color="black",
-            linewidth=0.6,
-            alpha=0.7,
-        )
-    ax.set_title(f"Voxel {voxel_idx} trials (n={num_trials})")
-    ax.set_xlabel(f"Timepoints (TR={tr:g}s)")
-    ax.set_ylabel("Trial (offset)")
-    ax.set_xticks(timepoints)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
+        nz = np.flatnonzero(np.abs(design[:, idx]) > eps)
+        if nz.size == 0:
+            onsets[idx] = -1
+            missing += 1
+        else:
+            onsets[idx] = int(nz[0])
+    if missing:
+        print(f"Warning: {missing} trials have no nonzero onset in design.", flush=True)
+    return onsets
 
 
-def _plot_variance_heatmap(
-    variance: np.ndarray,
-    voxel_indices: np.ndarray,
-    out_path: Path):
-    data = variance[voxel_indices, :]
-    fig, ax = plt.subplots(figsize=(8.0, 6.0))
-    im = ax.imshow(data, aspect="auto", interpolation="nearest", cmap="viridis")
-    ax.set_xlabel("Timepoints")
-    ax.set_ylabel("Voxel")
-    ax.set_xticks(np.arange(data.shape[1]))
-    ax.set_xticklabels(np.arange(1, data.shape[1] + 1))
-    ax.set_yticks(np.arange(data.shape[0]))
-    ax.set_yticklabels(voxel_indices)
-    cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label("Variance across trials")
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
+def _accumulate_trial_stats(sum_vals, sumsq_vals, count_vals, segment):
+    """Accumulate sums for variance estimation with NaN handling."""
+    finite = np.isfinite(segment)
+    if not finite.all():
+        segment = np.where(finite, segment, 0.0)
+    sum_vals += segment
+    sumsq_vals += segment * segment
+    count_vals += finite.astype(np.int64)
 
 
-def _path_stem(path: Path) -> str:
-    name = path.name
-    if name.endswith(".nii.gz"):
-        return name[:-7]
-    return path.stem
+def _compute_trial_variance(sum_vals, sumsq_vals, count_vals):
+    """Compute variance across trials from running sums."""
+    variance = np.full(sum_vals.shape, np.nan, dtype=np.float32)
+    valid = count_vals > 1
+    if np.any(valid):
+        numerator = sumsq_vals - (sum_vals ** 2) / np.maximum(count_vals, 1)
+        variance[valid] = (numerator[valid] / (count_vals[valid] - 1)).astype(np.float32, copy=False)
+    return variance
 
 
-def _parse_str_list(values_csv: str) -> list[str]:
-    values = []
-    for item in values_csv.split(","):
-        item = item.strip()
-        if item:
-            values.append(item)
-    return values
-
-
-def _load_selected_mask(selected_path: Path) -> tuple[np.ndarray, tuple[int, int, int]]:
-    img = nib.load(str(selected_path))
-    data = img.get_fdata(dtype=np.float32)
-    if data.ndim != 3:
-        raise ValueError(f"Selected map must be 3D, got shape {data.shape}.")
-    mask = np.isfinite(data) & (data > 0)
-    if not np.any(mask):
-        raise ValueError("Selected map has no positive voxels.")
-    return mask.reshape(-1), data.shape
-
-
-def _load_motor_coords(npz_path: Path, include_keys: Optional[list[str]]):
+def _load_indices_npz(npz_path, volume_shape):
+    """Load voxel indices from an npz file (coords or flat indices)."""
     loaded = np.load(npz_path)
-    available_keys = sorted(loaded.files)
-    keys = available_keys
-    if include_keys:
-        missing = [key for key in include_keys if key not in available_keys]
-        if missing:
-            missing_str = ", ".join(missing)
-            raise ValueError(f"Motor keys not found in {npz_path}: {missing_str}")
-        keys = include_keys
-    coords_list = []
-    key_counts = {}
-    for key in keys:
-        coords = np.asarray(loaded[key])
-        if coords.size == 0:
-            key_counts[key] = 0
-            continue
-        if coords.ndim != 2 or coords.shape[1] != 3:
-            raise ValueError(f"Motor coords for {key} must be (N, 3), got {coords.shape}.")
-        coords = coords.astype(np.int64, copy=False)
-        coords_list.append(coords)
-        key_counts[key] = int(coords.shape[0])
-    if not coords_list:
-        raise ValueError("Motor region npz has no voxel coordinates.")
-    return np.vstack(coords_list), key_counts
+    key = None
+    for candidate in ("indices", "coords", "voxel_indices"):
+        if candidate in loaded.files:
+            key = candidate
+            break
+    if key is None:
+        if len(loaded.files) == 1:
+            key = loaded.files[0]
+        else:
+            raise ValueError(f"Could not find indices array in {npz_path}; keys={loaded.files}.")
+    indices = np.asarray(loaded[key])
+    if indices.ndim == 2 and indices.shape[1] == 3:
+        if len(volume_shape) != 3:
+            raise ValueError(f"Cannot map 3D coords to flat indices with volume shape {volume_shape}.")
+        flat = np.ravel_multi_index(indices.T, volume_shape)
+    elif indices.ndim == 1:
+        flat = indices.astype(np.int64, copy=False)
+    else:
+        raise ValueError(f"Indices must be (N, 3) coords or flat 1D, got shape {indices.shape}.")
+    return np.unique(flat)
 
 
-def _coords_to_mask(coords: np.ndarray, volume_shape: tuple[int, int, int]) -> np.ndarray:
-    mask_flat = np.zeros(int(np.prod(volume_shape)), dtype=bool)
-    coords = np.asarray(coords)
-    if coords.size == 0:
-        return mask_flat
-    if coords.ndim != 2 or coords.shape[1] != 3:
-        raise ValueError(f"Coords must be (N, 3), got {coords.shape}.")
-    coords = coords.astype(np.int64, copy=False)
-    if np.any(coords < 0):
-        raise ValueError("Coords contain negative indices.")
-    if np.any(coords[:, 0] >= volume_shape[0]) or np.any(coords[:, 1] >= volume_shape[1]) or np.any(
-        coords[:, 2] >= volume_shape[2]
-    ):
-        raise ValueError("Coords fall outside the selected map volume.")
-    flat_idx = np.ravel_multi_index(coords.T, volume_shape)
-    mask_flat[flat_idx] = True
-    return mask_flat
+def _validate_indices(indices, voxels, label):
+    """Validate indices against voxel count."""
+    if indices.size == 0:
+        raise ValueError(f"{label} indices are empty.")
+    if np.min(indices) < 0 or np.max(indices) >= voxels:
+        raise ValueError(f"{label} indices are out of bounds for {voxels} voxels.")
+    return indices
 
 
-def _align_mask_to_bold(mask_flat, bold_mask_flat, bold_voxels):
-    if bold_mask_flat is None:
-        if mask_flat.size != bold_voxels:
-            raise ValueError(f"Mask size ({mask_flat.size}) does not match bold voxels ({bold_voxels}).")
-        return mask_flat
-    if mask_flat.size != bold_mask_flat.size:
-        raise ValueError(f"Mask size ({mask_flat.size}) does not match bold mask ({bold_mask_flat.size}).")
-    return mask_flat[bold_mask_flat]
-
-
-def _cohens_d(sample_a: np.ndarray, sample_b: np.ndarray) -> float:
+def _cohens_d(sample_a, sample_b):
+    """Compute Cohen's d effect size between two samples."""
     n_a = int(sample_a.size)
     n_b = int(sample_b.size)
     if n_a < 2 or n_b < 2:
@@ -380,18 +225,8 @@ def _cohens_d(sample_a: np.ndarray, sample_b: np.ndarray) -> float:
     return (mean_a - mean_b) / np.sqrt(pooled)
 
 
-def _bootstrap_mean_diff(sample_a, sample_b, num_boot, rng: np.random.Generator):
-    diffs = np.empty(num_boot, dtype=np.float64)
-    n_a = sample_a.size
-    n_b = sample_b.size
-    for idx in range(num_boot):
-        boot_a = rng.choice(sample_a, size=n_a, replace=True)
-        boot_b = rng.choice(sample_b, size=n_b, replace=True)
-        diffs[idx] = float(np.mean(boot_a) - np.mean(boot_b))
-    return diffs
-
-
 def _resample_control_means(control_values, target_size, num_resamples, rng):
+    """Resample control means for a null distribution."""
     if num_resamples <= 0:
         return np.array([], dtype=np.float64)
     replace = control_values.size < target_size
@@ -402,421 +237,325 @@ def _resample_control_means(control_values, target_size, num_resamples, rng):
     return means
 
 
-def _mean_sem(data: np.ndarray, axis: int = 0) -> tuple[np.ndarray, np.ndarray]:
-    mean = np.nanmean(data, axis=axis)
-    count = np.sum(np.isfinite(data), axis=axis)
-    std = np.nanstd(data, axis=axis, ddof=1)
-    denom = np.sqrt(np.maximum(count, 1))
-    sem = std / denom
-    if np.isscalar(sem):
-        sem = np.array(sem)
-    sem = np.where(count > 1, sem, np.nan)
-    return mean, sem
-
-
-def _plot_metric_distributions(selected_metric, control_metric, out_path):
-    fig, ax = plt.subplots(figsize=(6.5, 4.5))
-    ax.violinplot([selected_metric, control_metric], showmeans=True, showmedians=False, showextrema=False)
-    ax.set_xticks([1, 2])
-    ax.set_xticklabels(["Selected", "Control"])
-    ax.set_ylabel("Mean trial variance")
-    ax.set_title("Per-voxel mean variance")
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-def _plot_resample_distribution(resample_means, selected_mean, out_path):
-    fig, ax = plt.subplots(figsize=(6.5, 4.5))
-    ax.hist(resample_means, bins=30, color="steelblue", alpha=0.7, label="Control resamples")
-    ax.axvline(selected_mean, color="crimson", linewidth=2, label="Selected mean")
-    ax.set_xlabel("Mean trial variance")
-    ax.set_ylabel("Resample count")
-    ax.set_title("Control resample means")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-def _plot_variance_timecourse(selected_variance, control_variance, out_path, tr):
-    mean_sel, sem_sel = _mean_sem(selected_variance, axis=0)
-    mean_ctrl, sem_ctrl = _mean_sem(control_variance, axis=0)
-    timepoints = np.arange(1, mean_sel.shape[0] + 1, dtype=np.int64)
-    fig, ax = plt.subplots(figsize=(7.0, 4.5))
-    ax.plot(timepoints, mean_sel, color="crimson", label="Selected")
-    ax.fill_between(timepoints, mean_sel - sem_sel, mean_sel + sem_sel, color="crimson", alpha=0.2)
-    ax.plot(timepoints, mean_ctrl, color="navy", label="Control")
-    ax.fill_between(timepoints, mean_ctrl - sem_ctrl, mean_ctrl + sem_ctrl, color="navy", alpha=0.2)
-    ax.set_xlabel(f"Timepoints (TR={tr:g}s)")
-    ax.set_ylabel("Variance across trials")
-    ax.set_title("Mean trial variance by timepoint")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-
-
-def _run_selection_analysis(args, bold_data, trial_variance, trials, bold_mask_flat, volume_shape, out_dir):
-    if args.selected_map is None:
-        return
-
-    selected_path = Path(args.selected_map)
-    if not selected_path.is_absolute():
-        selected_path = (REPO_ROOT / selected_path).resolve()
-    if not selected_path.exists():
-        raise FileNotFoundError(f"Selected map not found: {selected_path}")
-
-    if args.motor_voxels_npz is None:
-        raise ValueError("Selection analysis requires --motor-voxels-npz.")
-    motor_path = Path(args.motor_voxels_npz)
-    if not motor_path.is_absolute():
-        motor_path = (REPO_ROOT / motor_path).resolve()
-    if not motor_path.exists():
-        raise FileNotFoundError(f"Motor voxels npz not found: {motor_path}")
-
-    analysis_dir = Path(args.selection_out_dir)
-    if not analysis_dir.is_absolute():
-        analysis_dir = out_dir / analysis_dir
-    analysis_dir.mkdir(parents=True, exist_ok=True)
-
-    analysis_prefix = _path_stem(selected_path)
-
-    selected_mask_flat, selected_shape = _load_selected_mask(selected_path)
-    if volume_shape is not None and volume_shape != selected_shape:
-        raise ValueError(f"BOLD volume shape {volume_shape} does not match selected map {selected_shape}.")
-
-    motor_keys = _parse_str_list(args.motor_keys) if args.motor_keys else []
-    coords, motor_key_counts = _load_motor_coords(motor_path, motor_keys or None)
-    motor_mask_flat = _coords_to_mask(coords, selected_shape)
-
-    restrict_to_motor = args.restrict_to_motor
-    if restrict_to_motor is None:
-        restrict_to_motor = True
-
-    selected_in_motor = selected_mask_flat & motor_mask_flat
-    selected_mask_use = selected_in_motor if restrict_to_motor else selected_mask_flat
-    control_mask_flat = motor_mask_flat & ~selected_in_motor
-
-    selected_mask = _align_mask_to_bold(selected_mask_use, bold_mask_flat, bold_data.shape[0])
-    control_mask = _align_mask_to_bold(control_mask_flat, bold_mask_flat, bold_data.shape[0])
-
-    selected_indices = np.flatnonzero(selected_mask)
-    control_indices = np.flatnonzero(control_mask)
-
-    if selected_indices.size == 0:
-        raise ValueError("No selected voxels remain after motor restriction/masking.")
-    if control_indices.size == 0:
-        raise ValueError("No control voxels remain after motor restriction/masking.")
-
-    mean_variance = np.nanmean(trial_variance, axis=1)
-    selected_metric = mean_variance[selected_indices]
-    control_metric = mean_variance[control_indices]
-
-    selected_finite = np.isfinite(selected_metric)
-    control_finite = np.isfinite(control_metric)
-    selected_metric = selected_metric[selected_finite]
-    control_metric = control_metric[control_finite]
-    selected_indices = selected_indices[selected_finite]
-    control_indices = control_indices[control_finite]
-
-    if selected_metric.size == 0:
-        raise ValueError("Selected voxels have no finite variance metrics.")
-    if control_metric.size == 0:
-        raise ValueError("Control voxels have no finite variance metrics.")
-
-    mean_selected = float(np.mean(selected_metric))
-    mean_control = float(np.mean(control_metric))
-    diff_mean = mean_selected - mean_control
-
-    ttest = stats.ttest_ind(selected_metric, control_metric, equal_var=False, nan_policy="omit")
-    t_stat = float(ttest.statistic) if np.isfinite(ttest.statistic) else float("nan")
-    p_two = float(ttest.pvalue) if np.isfinite(ttest.pvalue) else float("nan")
-    if np.isfinite(t_stat) and np.isfinite(p_two):
-        p_one = p_two / 2.0 if t_stat < 0 else 1.0 - p_two / 2.0
-    else:
-        p_one = float("nan")
-
-    effect_d = _cohens_d(selected_metric, control_metric)
-
-    analysis_seed = args.analysis_seed if args.analysis_seed is not None else args.seed
-    rng = np.random.default_rng(analysis_seed)
-
-    resample_means = _resample_control_means(control_metric, selected_metric.size, args.control_resamples, rng)
-    resample_mean = float(np.mean(resample_means)) if resample_means.size else float("nan")
-    resample_std = float(np.std(resample_means, ddof=1)) if resample_means.size > 1 else float("nan")
-    if resample_means.size:
-        p_resample = (np.sum(resample_means <= mean_selected) + 1) / (resample_means.size + 1)
-    else:
-        p_resample = float("nan")
-
-    boot_diffs = np.array([], dtype=np.float64)
-    ci_low = float("nan")
-    ci_high = float("nan")
-    if args.bootstrap_samples > 0:
-        boot_diffs = _bootstrap_mean_diff(selected_metric, control_metric, args.bootstrap_samples, rng)
-        ci_low, ci_high = np.percentile(boot_diffs, [2.5, 97.5])
-
-    selected_variance = trial_variance[selected_indices]
-    control_variance = trial_variance[control_indices]
-
-    metric_plot = analysis_dir / f"{analysis_prefix}_metric_distribution.png"
-    _plot_metric_distributions(selected_metric, control_metric, metric_plot)
-    if resample_means.size:
-        resample_plot = analysis_dir / f"{analysis_prefix}_control_resample_means.png"
-        _plot_resample_distribution(resample_means, mean_selected, resample_plot)
-
-    timecourse_plot = analysis_dir / f"{analysis_prefix}_variance_timecourse.png"
-    _plot_variance_timecourse(selected_variance, control_variance, timecourse_plot, args.tr)
-
-    if args.selection_variance_voxel_count > 0:
-        sel_count = min(args.selection_variance_voxel_count, selected_indices.size)
-        ctrl_count = min(args.selection_variance_voxel_count, control_indices.size)
-        sel_indices = rng.choice(selected_indices, size=sel_count, replace=False)
-        ctrl_indices = rng.choice(control_indices, size=ctrl_count, replace=False)
-        selected_heatmap = analysis_dir / f"{analysis_prefix}_variance_heatmap_selected.png"
-        control_heatmap = analysis_dir / f"{analysis_prefix}_variance_heatmap_control.png"
-        _plot_variance_heatmap(trial_variance, sel_indices, selected_heatmap)
-        _plot_variance_heatmap(trial_variance, ctrl_indices, control_heatmap)
-
-    if args.selection_example_voxel_count > 0:
-        sel_count = min(args.selection_example_voxel_count, selected_indices.size)
-        ctrl_count = min(args.selection_example_voxel_count, control_indices.size)
-        sel_indices = rng.choice(selected_indices, size=sel_count, replace=False)
-        ctrl_indices = rng.choice(control_indices, size=ctrl_count, replace=False)
-        sel_dir = analysis_dir / f"{analysis_prefix}_examples_selected"
-        ctrl_dir = analysis_dir / f"{analysis_prefix}_examples_control"
-        sel_dir.mkdir(parents=True, exist_ok=True)
-        ctrl_dir.mkdir(parents=True, exist_ok=True)
-        for voxel_idx in sel_indices:
-            out_path = sel_dir / f"voxel_{int(voxel_idx)}_trials.png"
-            _plot_single_voxel_trials(trials[voxel_idx], int(voxel_idx), out_path, args.tr)
-        for voxel_idx in ctrl_indices:
-            out_path = ctrl_dir / f"voxel_{int(voxel_idx)}_trials.png"
-            _plot_single_voxel_trials(trials[voxel_idx], int(voxel_idx), out_path, args.tr)
-
-    metrics_path = analysis_dir / f"{analysis_prefix}_selection_metrics.npz"
-    np.savez(metrics_path, selected_metric=selected_metric, control_metric=control_metric,
-        control_resample_means=resample_means, bootstrap_diffs=boot_diffs, selected_indices=selected_indices, control_indices=control_indices)
-
-    summary = {"selected_map": str(selected_path),
-        "motor_voxels_npz": str(motor_path),
-        "analysis_prefix": analysis_prefix,
-        "restrict_to_motor": bool(restrict_to_motor),
-        "motor_keys": motor_keys,
-        "motor_key_counts": motor_key_counts,
-        "selected_voxels_total": int(np.count_nonzero(selected_mask_flat)),
-        "selected_voxels_motor": int(np.count_nonzero(selected_in_motor)),
-        "selected_voxels_used": int(np.count_nonzero(selected_mask_use)),
-        "motor_voxels_total": int(np.count_nonzero(motor_mask_flat)),
-        "control_voxels_total": int(np.count_nonzero(control_mask_flat)),
-        "selected_metric_count": int(selected_metric.size),
-        "control_metric_count": int(control_metric.size),
-        "selected_mean": mean_selected,
-        "control_mean": mean_control,
-        "mean_diff": diff_mean,
-        "t_stat": t_stat,
-        "p_two_sided": p_two,
-        "p_one_sided": p_one,
-        "cohens_d": effect_d,
-        "control_resample_mean": resample_mean,
-        "control_resample_std": resample_std,
-        "control_resample_p_one_sided": p_resample,
-        "bootstrap_samples": int(args.bootstrap_samples),
-        "bootstrap_ci_95": [float(ci_low), float(ci_high)],
-        "control_resamples": int(args.control_resamples),
-        "analysis_seed": analysis_seed,
+def _compare_groups(selected_vals, motor_vals, rng, num_resamples):
+    """Compute statistics and resampling-based sanity checks."""
+    summary = {
+        "selected_count": int(selected_vals.size),
+        "motor_count": int(motor_vals.size),
+        "selected_mean": float(np.mean(selected_vals)),
+        "motor_mean": float(np.mean(motor_vals)),
+        "selected_median": float(np.median(selected_vals)),
+        "motor_median": float(np.median(motor_vals)),
+        "selected_std": float(np.std(selected_vals, ddof=1)) if selected_vals.size > 1 else float("nan"),
+        "motor_std": float(np.std(motor_vals, ddof=1)) if motor_vals.size > 1 else float("nan"),
     }
-    summary_path = analysis_dir / f"{analysis_prefix}_selection_summary.json"
-    with open(summary_path, "w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2)
+    summary["mean_diff"] = summary["selected_mean"] - summary["motor_mean"]
 
-    print(f"Selection analysis complete: selected={selected_metric.size}, control={control_metric.size}", flush=True)
-    print(f"Mean variance: selected={mean_selected:.6f}, control={mean_control:.6f}, diff={diff_mean:.6f}", flush=True)
-    print(f"t={t_stat:.3f}, p(one-sided)={p_one:.3g}, d={effect_d:.3f}, resample p={p_resample:.3g}", flush=True)
+    ttest = stats.ttest_ind(selected_vals, motor_vals, equal_var=False, nan_policy="omit")
+    summary["t_stat"] = float(ttest.statistic) if np.isfinite(ttest.statistic) else float("nan")
+    summary["p_two_sided"] = float(ttest.pvalue) if np.isfinite(ttest.pvalue) else float("nan")
+    if np.isfinite(summary["t_stat"]) and np.isfinite(summary["p_two_sided"]):
+        summary["p_one_sided"] = summary["p_two_sided"] / 2.0 if summary["t_stat"] > 0 else 1.0 - summary["p_two_sided"] / 2.0
+    else:
+        summary["p_one_sided"] = float("nan")
+
+    summary["cohens_d"] = _cohens_d(selected_vals, motor_vals)
+
+    ks = stats.ks_2samp(selected_vals, motor_vals, alternative="two-sided", mode="auto")
+    summary["ks_stat"] = float(ks.statistic)
+    summary["ks_pvalue"] = float(ks.pvalue)
+
+    resample_means = _resample_control_means(motor_vals, selected_vals.size, num_resamples, rng)
+    if resample_means.size:
+        resample_mean = float(np.mean(resample_means))
+        resample_std = float(np.std(resample_means, ddof=1)) if resample_means.size > 1 else float("nan")
+        diff = summary["selected_mean"] - summary["motor_mean"]
+        if diff >= 0:
+            p_one = (np.sum(resample_means >= summary["selected_mean"]) + 1) / (resample_means.size + 1)
+        else:
+            p_one = (np.sum(resample_means <= summary["selected_mean"]) + 1) / (resample_means.size + 1)
+        p_two = (np.sum(np.abs(resample_means - summary["motor_mean"]) >= abs(diff)) + 1) / (resample_means.size + 1)
+        percentile = float(stats.percentileofscore(resample_means, summary["selected_mean"], kind="mean"))
+    else:
+        resample_mean = float("nan")
+        resample_std = float("nan")
+        p_one = float("nan")
+        p_two = float("nan")
+        percentile = float("nan")
+
+    summary["resample_mean"] = resample_mean
+    summary["resample_std"] = resample_std
+    summary["resample_p_one_sided"] = float(p_one)
+    summary["resample_p_two_sided"] = float(p_two)
+    summary["resample_selected_percentile"] = percentile
+
+    motor_std = summary["motor_std"]
+    if np.isfinite(motor_std) and motor_std > 0:
+        summary["selected_mean_z"] = (summary["selected_mean"] - summary["motor_mean"]) / motor_std
+    else:
+        summary["selected_mean_z"] = float("nan")
+
+    return summary, resample_means
 
 
-def _run_trial_viz(args):
-    bold_path = Path(args.bold_path)
-    if not bold_path.is_absolute():
-        bold_path = (REPO_ROOT / bold_path).resolve()
-    if not bold_path.exists():
-        raise FileNotFoundError(f"BOLD data not found: {bold_path}")
-
-    mask_path = None
-    if args.mask_path:
-        mask_path = Path(args.mask_path)
-        if not mask_path.is_absolute():
-            mask_path = (REPO_ROOT / mask_path).resolve()
-        if not mask_path.exists():
-            raise FileNotFoundError(f"Mask not found: {mask_path}")
-
-    out_dir = Path(args.out_dir)
-    if not out_dir.is_absolute():
-        out_dir = (REPO_ROOT / out_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.trial_len <= 0 or args.num_trials <= 0:
-        raise ValueError("trial_len and num_trials must be positive.")
-    if args.rest_len < 0:
-        raise ValueError("rest_len must be >= 0.")
-
-    rest_after = _parse_int_list(args.rest_after, allow_empty=True, label="rest-after")
-    rest_after = sorted(set(rest_after))
-    for trial_idx in rest_after:
-        if trial_idx <= 0 or trial_idx >= args.num_trials:
-            raise ValueError(
-                f"rest-after entries must be between 1 and {args.num_trials - 1}, got {trial_idx}."
-            )
-
-    expected_timepoints = args.num_trials * args.trial_len + args.rest_len * len(rest_after)
-    bold_data, volume_shape, bold_mask_flat = _load_bold_data(bold_path, mask_path, expected_timepoints, return_meta=True)
-    num_voxels, num_timepoints = bold_data.shape
-    if num_timepoints != expected_timepoints:
-        raise ValueError(
-            f"BOLD data has {num_timepoints} timepoints, expected {expected_timepoints} "
-            f"(trials={args.num_trials}, trial_len={args.trial_len}, "
-            f"rest_after={rest_after}, rest_len={args.rest_len})."
-        )
-    print(f"Loaded BOLD data: {bold_data.shape}", flush=True)
-
-    trials = _extract_trial_segments(
-        bold_data,
-        trial_len=args.trial_len,
-        num_trials=args.num_trials,
-        rest_after=rest_after,
-        rest_len=args.rest_len,
-    )
-    print(f"Reshaped trials: {trials.shape}", flush=True)
-
-    trial_variance = np.nanvar(trials, axis=1).astype(np.float32, copy=False)
-    variance_path = Path(args.variance_out)
-    if not variance_path.is_absolute():
-        variance_path = out_dir / variance_path
-    np.save(variance_path, trial_variance)
-    print(f"Saved trial variance: {variance_path}", flush=True)
-
-    if num_voxels == 0:
-        raise ValueError("No voxels available after masking.")
-
-    rng = np.random.default_rng(args.seed)
-
-    if args.single_voxel_count > 0:
-        voxel_count = min(args.single_voxel_count, num_voxels)
-        voxel_indices = rng.choice(num_voxels, size=voxel_count, replace=False)
-        single_voxel_dir = Path(args.single_voxel_dir)
-        if not single_voxel_dir.is_absolute():
-            single_voxel_dir = out_dir / single_voxel_dir
-        single_voxel_dir.mkdir(parents=True, exist_ok=True)
-        for voxel_idx in voxel_indices:
-            out_path = single_voxel_dir / f"voxel_{voxel_idx}_trials.png"
-            _plot_single_voxel_trials(trials[voxel_idx], int(voxel_idx), out_path, args.tr)
-        print(f"Saved {voxel_count} single-voxel trial plots in {single_voxel_dir}.", flush=True)
-
-    if args.variance_voxel_count > 0:
-        voxel_count = min(args.variance_voxel_count, num_voxels)
-        voxel_indices = rng.choice(num_voxels, size=voxel_count, replace=False)
-        variance_fig = Path(args.variance_fig)
-        if not variance_fig.is_absolute():
-            variance_fig = out_dir / variance_fig
-        _plot_variance_heatmap(trial_variance, voxel_indices, variance_fig)
-        print(f"Saved variance heatmap: {variance_fig}", flush=True)
-
-    _run_selection_analysis(args, bold_data, trial_variance, trials, bold_mask_flat, volume_shape, out_dir)
+def _plot_histogram_comparison(selected_vals, motor_vals, bins, out_path, selected_mean, motor_mean, title_note=""):
+    """Plot two normalized histograms with shared bins."""
+    fig, ax = plt.subplots(figsize=(7.0, 4.5))
+    ax.hist(selected_vals, bins=bins, density=True, alpha=0.6, color="crimson",
+            label=f"Selected (n={selected_vals.size})")
+    ax.hist(motor_vals, bins=bins, density=True, alpha=0.6, color="navy",
+            label=f"Motor-only (n={motor_vals.size})")
+    ax.axvline(selected_mean, color="crimson", linestyle="--", linewidth=1)
+    ax.axvline(motor_mean, color="navy", linestyle="--", linewidth=1)
+    ax.set_xlabel("Mean variance across trials")
+    ax.set_ylabel("Density")
+    title = "Voxel variability comparison"
+    if title_note:
+        title = f"{title}\n{title_note}"
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 def main():
-    parser = argparse.ArgumentParser(description=( "Compute X_task * beta_task from GLMsingle outputs, "
-            "or visualize trial-wise BOLD when --bold-path is set."))
+    """Run the end-to-end workflow: predict BOLD, compute variance, and compare groups."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compute predicted BOLD from GLMsingle outputs, estimate per-voxel trial variance, "
+            "and compare selected vs motor voxel variability."
+        )
+    )
     parser.add_argument("--runs", default="1,2", help="Comma-separated run numbers (1-based).")
     parser.add_argument("--model-path", default="data/sub09_ses01/TYPED_FITHRF_GLMDENOISE_RR.npy")
     parser.add_argument("--design-path", default="data/sub09_ses01/DESIGNINFO.npy")
     parser.add_argument("--out-dir", default="data/sub09_ses01")
+    parser.add_argument("--output-prefix", default="voxel_weights_mean_sub09_ses01",
+                        help="Prefix used to locate indices files and name outputs.")
+    parser.add_argument("--trial-len", type=int, default=9, help="Number of TRs per trial segment.")
     parser.add_argument("--chunk-size", type=int, default=2048, help="Voxel chunk size for matrix multiplies.")
-    viz_group = parser.add_argument_group("Trial visualization")
-    viz_group.add_argument("--bold-path", type=Path, default= '/scratch/st-mmckeown-1/zkavian/fmri_opt/Thesis_code_Glm_Opt/data/sub09_ses01/sub-pd009_ses-1_run-1_task-mv_bold_corrected_smoothed_reg.nii.gz',
-        help="Path to BOLD data (.npy or NIfTI). When set, run trial visualization pipeline.")
-    viz_group.add_argument("--mask-path", type=Path,  help="Optional mask (.npy or NIfTI) to select voxels.")
-    viz_group.add_argument("--num-trials", type=int, default=90, help="Number of trials (default: 90).")
-    viz_group.add_argument("--trial-len", type=int, default=9, help="Timepoints per trial (default: 9).")
-    viz_group.add_argument("--rest-after", default="30,60",
-        help="Comma-separated trial indices after which rest blocks occur (default: 30,60).")
-    viz_group.add_argument("--rest-len", type=int, default=20, help="Rest block length in timepoints.")
-    viz_group.add_argument("--tr", type=float, default=1.0, help="TR in seconds (default: 1.0).")
-    viz_group.add_argument("--single-voxel-count", type=int, default=10, help="Number of random voxels for per-trial plots (default: 10).")
-    viz_group.add_argument("--variance-voxel-count", type=int, default=20,
-        help="Number of random voxels for variance heatmap (default: 20).")
-    viz_group.add_argument("--variance-out", default="trial_variance.npy",
-        help="Output path for variance array (default: trial_variance.npy).")
-    viz_group.add_argument("--variance-fig", default="trial_variance_heatmap.png",
-        help="Output path for variance heatmap (default: trial_variance_heatmap.png).")
-    viz_group.add_argument("--single-voxel-dir", default="single_voxel_trials",
-        help="Directory for single-voxel trial plots (default: single_voxel_trials).")
-    viz_group.add_argument("--seed", type=int, default=None, help="Random seed for voxel selection (default: random).")
-    analysis_group = parser.add_argument_group("Selection analysis")
-    analysis_group.add_argument("--selected-map", type=Path, help="Path to voxel_weights_mean_<avg_prefix>_bold_thr95.nii.gz (or similar).")
-    analysis_group.add_argument("--motor-voxels-npz", type=Path, help="Path to voxel_weights_mean_<avg_prefix>_motor_region_voxels.npz.")
-    analysis_group.add_argument("--motor-keys", default="", help="Comma-separated keys from motor npz to include (default: all).")
-    analysis_group.add_argument("--restrict-to-motor", dest="restrict_to_motor", action="store_true", default=None, help="Restrict selected voxels to motor region (default: True when motor npz provided).")
-    analysis_group.add_argument("--no-restrict-to-motor", dest="restrict_to_motor", action="store_false", help="Do not restrict selected voxels to motor region.")
-    analysis_group.add_argument("--selection-out-dir", default="selection_analysis", help="Output directory for selection analysis plots/metrics.")
-    analysis_group.add_argument("--control-resamples", type=int, default=1000, help="Number of control resamples for null distribution (default: 1000).")
-    analysis_group.add_argument("--bootstrap-samples", type=int, default=2000, help="Number of bootstrap samples for CI (default: 2000).")
-    analysis_group.add_argument("--selection-example-voxel-count", type=int, default=5, help="Example voxels per group for trial plots (default: 5).")
-    analysis_group.add_argument("--selection-variance-voxel-count", type=int, default=20, help="Voxels per group for variance heatmaps (default: 20).")
-    analysis_group.add_argument("--analysis-seed", type=int, default=None, help="Random seed for selection analysis resampling (default: --seed).")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for resampling.")
+    parser.add_argument("--num-resamples", type=int, default=5000,
+                        help="Number of control resamples for sanity checks.")
+    parser.add_argument("--hist-bins", type=int, default=30, help="Histogram bin count.")
+    parser.add_argument("--hist-subsample", dest="hist_subsample", action="store_true", default=True,
+                        help="Subsample motor-only voxels for histogram to match selected count.")
+    parser.add_argument("--no-hist-subsample", dest="hist_subsample", action="store_false",
+                        help="Do not subsample motor-only voxels for histogram.")
     args = parser.parse_args()
 
-    if args.bold_path is not None:
-        _run_trial_viz(args)
-        return
+    runs = _parse_runs(args.runs)
+    if not runs:
+        raise ValueError("No runs specified.")
 
-    out_dir = Path(args.out_dir)
-    if not out_dir.is_absolute():
-        out_dir = (REPO_ROOT / out_dir).resolve()
+    out_dir = _resolve_path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    output_prefix_path = _resolve_path(args.output_prefix)
+    output_tag = output_prefix_path.name
 
-    model_path = Path(args.model_path)
-    if not model_path.is_absolute():
-        model_path = (REPO_ROOT / model_path).resolve()
-    design_path = Path(args.design_path)
-    if not design_path.is_absolute():
-        design_path = (REPO_ROOT / design_path).resolve()
+    model_path = _resolve_path(args.model_path)
+    design_path = _resolve_path(args.design_path)
 
     design_single_list, hrflibrary = _load_design(design_path)
     betasmd, hrfindexrun = _load_model(model_path)
 
-    betas, numtrials = _flatten_betas(betasmd)
+    betas, numtrials, volume_shape = _flatten_betas(betasmd)
+    voxels = betas.shape[0]
     numruns = len(design_single_list)
-    hrfindex_flat = _flatten_hrfindex(hrfindexrun, numruns)
+    hrfindex_flat = _flatten_hrfindex(hrfindexrun, numruns, voxels)
 
-    if hrflibrary.ndim != 2:
-        raise ValueError(f"Unexpected hrflibrary shape: {hrflibrary.shape}")
+    run_indices = [run - 1 for run in runs]
+    if min(run_indices) < 0 or max(run_indices) >= numruns:
+        raise ValueError(f"Runs must be between 1 and {numruns}, got {runs}.")
 
-    if design_single_list[0].shape[1] != numtrials:
+    trial_counts = [design.shape[1] for design in design_single_list]
+    total_trials = int(np.sum(trial_counts))
+    if numtrials == total_trials:
+        run_offsets = np.cumsum([0] + trial_counts)
+        slice_betas = True
+    elif all(numtrials == trial_counts[idx] for idx in run_indices):
+        run_offsets = None
+        slice_betas = False
+    else:
         raise ValueError(
-            f"Design has {design_single_list[0].shape[1]} trials, "
-            f"but betasmd has {numtrials} trials."
+            f"Betas trials ({numtrials}) do not match design trials ({trial_counts})."
         )
 
-    runs = _parse_runs(args.runs)
-    for run in runs:
-        run_idx = run - 1
-        if run_idx < 0 or run_idx >= numruns:
-            raise ValueError(f"Run {run} is out of range for {numruns} runs.")
+    run_timepoints = [design_single_list[idx].shape[0] for idx in run_indices]
+    total_timepoints = int(np.sum(run_timepoints))
+    if args.trial_len <= 0:
+        raise ValueError("trial-len must be positive.")
 
+    xbeta_path = out_dir / f"{output_tag}_X_beta.npy"
+    xbeta = np.lib.format.open_memmap(
+        xbeta_path, mode="w+", dtype=np.float32, shape=(voxels, total_timepoints)
+    )
+
+    sum_vals = np.zeros((voxels, args.trial_len), dtype=np.float64)
+    sumsq_vals = np.zeros((voxels, args.trial_len), dtype=np.float64)
+    count_vals = np.zeros((voxels, args.trial_len), dtype=np.int64)
+
+    time_offset = 0
+    total_used = 0
+    total_skipped = 0
+    for run_idx, run in zip(run_indices, runs):
         design_single = design_single_list[run_idx]
-        conv_by_hrf = _convolve_by_hrf(design_single, hrflibrary)
+        run_trials = design_single.shape[1]
+        run_timepoints = design_single.shape[0]
+        if args.trial_len > run_timepoints:
+            raise ValueError(
+                f"trial-len ({args.trial_len}) exceeds run timepoints ({run_timepoints}) for run {run}."
+            )
+        if slice_betas:
+            start = int(run_offsets[run_idx])
+            end = int(run_offsets[run_idx + 1])
+            betas_run = betas[:, start:end]
+        else:
+            betas_run = betas
+        if betas_run.shape[1] != run_trials:
+            raise ValueError(
+                f"Run {run} betas trials {betas_run.shape[1]} do not match design trials {run_trials}."
+            )
 
-        out_path = out_dir / f"Xtask_beta_task_run{run}.npy"
-        _write_task_prediction(
-            betas,
-            hrfindex_flat[:, run_idx],
-            conv_by_hrf,
-            out_path,
-            args.chunk_size,
+        hrf_idx_run = hrfindex_flat[:, run_idx]
+        pred = _predict_run_timeseries(
+            betas_run, hrf_idx_run, design_single, hrflibrary, args.chunk_size
         )
-        print(f"Saved task prediction: {out_path}")
+        xbeta[:, time_offset : time_offset + run_timepoints] = pred
+
+        onsets = _trial_onsets_from_design(design_single)
+        used = 0
+        skipped = 0
+        for onset in onsets:
+            if onset < 0:
+                skipped += 1
+                continue
+            end = onset + args.trial_len
+            if end > run_timepoints:
+                skipped += 1
+                continue
+            segment = pred[:, onset:end]
+            _accumulate_trial_stats(sum_vals, sumsq_vals, count_vals, segment)
+            used += 1
+
+        time_offset += run_timepoints
+        total_used += used
+        total_skipped += skipped
+        print(
+            f"Run {run}: predicted {pred.shape}, trials used={used}, skipped={skipped}.",
+            flush=True,
+        )
+
+    if time_offset != total_timepoints:
+        raise RuntimeError("Timepoints written do not match expected total.")
+    xbeta.flush()
+    print(f"Saved predicted BOLD: {xbeta_path}", flush=True)
+
+    trial_variance = _compute_trial_variance(sum_vals, sumsq_vals, count_vals)
+    trial_var_path = out_dir / f"{output_tag}_trial_variance.npy"
+    np.save(trial_var_path, trial_variance)
+    print(f"Saved trial variance: {trial_var_path}", flush=True)
+
+    voxel_var = np.nanmean(trial_variance, axis=1, keepdims=True).astype(np.float32, copy=False)
+    voxel_var_path = out_dir / f"{output_tag}_voxel_var.npy"
+    np.save(voxel_var_path, voxel_var)
+    print(f"Saved voxel variance: {voxel_var_path}", flush=True)
+
+    count_path = out_dir / f"{output_tag}_trial_counts.npy"
+    np.save(count_path, count_vals.astype(np.int32, copy=False))
+
+    motor_path = _resolve_path(f"{args.output_prefix}_motor_voxel_indicies.npz")
+    selected_path = _resolve_path(f"{args.output_prefix}_selected_voxel_indicies.npz")
+    if not motor_path.exists():
+        raise FileNotFoundError(f"Motor indices file not found: {motor_path}")
+    if not selected_path.exists():
+        raise FileNotFoundError(f"Selected indices file not found: {selected_path}")
+
+    motor_indices = _validate_indices(_load_indices_npz(motor_path, volume_shape), voxels, "Motor")
+    selected_indices = _validate_indices(_load_indices_npz(selected_path, volume_shape), voxels, "Selected")
+
+    overlap = np.intersect1d(selected_indices, motor_indices)
+    motor_only = np.setdiff1d(motor_indices, selected_indices)
+    selected_not_in_motor = np.setdiff1d(selected_indices, motor_indices)
+    if motor_only.size == 0:
+        raise ValueError("Motor-only voxel set is empty after removing selected voxels.")
+
+    voxel_var_flat = voxel_var.reshape(-1)
+    selected_vals = voxel_var_flat[selected_indices]
+    motor_vals = voxel_var_flat[motor_only]
+    selected_vals = selected_vals[np.isfinite(selected_vals)]
+    motor_vals = motor_vals[np.isfinite(motor_vals)]
+    if selected_vals.size == 0 or motor_vals.size == 0:
+        raise ValueError("No finite voxel variance values for selected or motor voxels.")
+
+    rng = np.random.default_rng(args.seed)
+    hist_motor_vals = motor_vals
+    hist_note = ""
+    if args.hist_subsample and motor_vals.size > selected_vals.size:
+        hist_motor_vals = rng.choice(motor_vals, size=selected_vals.size, replace=False)
+        hist_note = "Motor-only histogram subsampled to match selected count."
+
+    bins = np.histogram_bin_edges(np.concatenate([selected_vals, motor_vals]), bins=args.hist_bins)
+    stats_summary, resample_means = _compare_groups(
+        selected_vals, motor_vals, rng, args.num_resamples
+    )
+
+    stats_summary.update({
+        "run_list": runs,
+        "trial_len": args.trial_len,
+        "total_trials_used": int(total_used),
+        "total_trials_skipped": int(total_skipped),
+        "total_timepoints": int(total_timepoints),
+        "voxel_count": int(voxels),
+        "motor_indices_path": str(motor_path),
+        "selected_indices_path": str(selected_path),
+        "motor_count_total": int(motor_indices.size),
+        "motor_only_count": int(motor_only.size),
+        "selected_overlap_with_motor": int(overlap.size),
+        "selected_not_in_motor": int(selected_not_in_motor.size),
+        "hist_subsample": bool(args.hist_subsample),
+        "hist_motor_count": int(hist_motor_vals.size),
+    })
+
+    hist_path = out_dir / f"{output_tag}_voxel_var_hist.png"
+    _plot_histogram_comparison(
+        selected_vals,
+        hist_motor_vals,
+        bins,
+        hist_path,
+        stats_summary["selected_mean"],
+        stats_summary["motor_mean"],
+        title_note=hist_note,
+    )
+    print(f"Saved histogram: {hist_path}", flush=True)
+
+    metrics_path = out_dir / f"{output_tag}_variance_comparison.npz"
+    np.savez(
+        metrics_path,
+        selected_values=selected_vals,
+        motor_values=motor_vals,
+        motor_hist_values=hist_motor_vals,
+        resample_means=resample_means,
+        selected_indices=selected_indices,
+        motor_indices=motor_indices,
+        motor_only_indices=motor_only,
+    )
+
+    summary_path = out_dir / f"{output_tag}_variance_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(stats_summary, handle, indent=2)
+
+    print(
+        "Variance comparison complete: "
+        f"selected={stats_summary['selected_count']}, "
+        f"motor_only={stats_summary['motor_only_count']}, "
+        f"mean_diff={stats_summary['mean_diff']:.6f}, "
+        f"t={stats_summary['t_stat']:.3f}, "
+        f"p_one={stats_summary['p_one_sided']:.3g}, "
+        f"d={stats_summary['cohens_d']:.3f}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

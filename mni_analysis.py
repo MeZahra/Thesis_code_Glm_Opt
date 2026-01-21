@@ -18,11 +18,13 @@ from pathlib import Path
 
 
 def run(cmd, env=None, cwd=None):
+    """Run a subprocess command with optional env/cwd, echoing the command."""
     print("+ " + " ".join(str(c) for c in cmd), flush=True)
     subprocess.run(cmd, check=True, env=env, cwd=cwd)
 
 
 def resolve_native_dir(data_dir, sub_tag, ses, sub_zero):
+    """Find the native data directory by checking expected anatomy file locations."""
     data_dir = Path(data_dir).expanduser().resolve()
     direct = data_dir / f"{sub_tag}_ses-{ses}_T1w_brain.nii.gz"
     if direct.exists():
@@ -44,6 +46,7 @@ def resolve_native_dir(data_dir, sub_tag, ses, sub_zero):
 
 
 def ensure_native_inputs(native_dir, sub_tag, ses, runs):
+    """Verify required native anatomy/mask and run-specific BOLD inputs exist."""
     required = [
         native_dir / f"{sub_tag}_ses-{ses}_T1w_brain.nii.gz",
         native_dir / f"{sub_tag}_ses-{ses}_T1w_brain_mask.nii.gz",
@@ -63,6 +66,7 @@ def ensure_native_inputs(native_dir, sub_tag, ses, runs):
 
 
 def _safe_symlink(src, dest):
+    """Create or update a symlink without overwriting a non-symlink target."""
     src = Path(src).resolve()
     dest = Path(dest)
     if dest.is_symlink():
@@ -75,50 +79,8 @@ def _safe_symlink(src, dest):
     os.symlink(str(src), str(dest))
 
 
-def _resolve_behavior_file(native_dir, sub, sub_zero, ses_int):
-    state = "OFF" if ses_int == 1 else "ON"
-    expected_name = f"PSPD00{sub}_{state}_behav_metrics.mat"
-    candidates = [
-        native_dir / expected_name,
-        native_dir / f"PSPD0{sub_zero}_{state}_behav_metrics.mat",
-        native_dir / f"PSPD{sub:03d}_{state}_behav_metrics.mat",
-        native_dir / f"PSPD{sub:02d}_{state}_behav_metrics.mat",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate, expected_name
-    for candidate in native_dir.glob(f"PSPD*{sub}*_{state}_behav_metrics.mat"):
-        return candidate, expected_name
-    return None, expected_name
-
-
-def _resolve_glmsingle_file(explicit_path, native_dir, sub, sub_zero, ses):
-    if explicit_path:
-        explicit = Path(explicit_path).expanduser().resolve()
-        if not explicit.exists():
-            raise FileNotFoundError(f"GLMsingle file not found: {explicit}")
-        return explicit
-    candidates = [
-        native_dir / "TYPED_FITHRF_GLMDENOISE_RR.npy",
-        native_dir / "GLMsingle" / f"GLMOutputs-sub{sub}-ses{ses}-std" / "TYPED_FITHRF_GLMDENOISE_RR.npy",
-        native_dir / "GLMsingle" / f"GLMOutputs-sub{sub_zero}-ses{ses}-std" / "TYPED_FITHRF_GLMDENOISE_RR.npy",
-    ]
-    parent = native_dir.parent
-    if parent and parent != native_dir:
-        candidates.extend(
-            [
-                parent / "TYPED_FITHRF_GLMDENOISE_RR.npy",
-                parent / "GLMsingle" / f"GLMOutputs-sub{sub}-ses{ses}-std" / "TYPED_FITHRF_GLMDENOISE_RR.npy",
-                parent / "GLMsingle" / f"GLMOutputs-sub{sub_zero}-ses{ses}-std" / "TYPED_FITHRF_GLMDENOISE_RR.npy",
-            ]
-        )
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return None
-
-
 def _stage_inputs(native_dir, analysis_data_dir, sub_tag, sub_tag_main, ses, runs, sub):
+    """Symlink anatomy/BOLD inputs into the analysis workspace with needed aliases."""
     inputs = [
         f"{sub_tag}_ses-{ses}_T1w_brain.nii.gz",
         f"{sub_tag}_ses-{ses}_T1w_brain_mask.nii.gz",
@@ -144,6 +106,7 @@ def _stage_inputs(native_dir, analysis_data_dir, sub_tag, sub_tag_main, ses, run
 
 
 def _stage_trial_keep(native_dir, analysis_data_dir, runs):
+    """Symlink trial_keep_run*.npy files into the analysis workspace if present."""
     for run in runs:
         src = native_dir / f"trial_keep_run{run}.npy"
         if src.exists():
@@ -151,6 +114,7 @@ def _stage_trial_keep(native_dir, analysis_data_dir, runs):
 
 
 def _ensure_output_aliases(data_dir, beta_prefix, main_prefix, ses, runs):
+    """Alias preprocessing outputs from beta_prefix to main_prefix when needed."""
     if beta_prefix == main_prefix:
         return
     patterns = [
@@ -169,6 +133,7 @@ def _ensure_output_aliases(data_dir, beta_prefix, main_prefix, ses, runs):
 
 
 def _map_runs_for_main(runs):
+    """Map provided runs into the 1-2 run slots expected by mian_second_obj_25.py."""
     unique = sorted(set(runs))
     if len(unique) == 1:
         return {2: unique[0]}
@@ -181,6 +146,7 @@ def _map_runs_for_main(runs):
 
 
 def _alias_run_outputs(data_dir, prefix, ses, run_map):
+    """Create run-number aliases for preprocessing outputs based on run_map."""
     patterns = [
         "nan_mask_flat_{prefix}_ses{ses}_run{run}.npy",
         "beta_volume_filter_{prefix}_ses{ses}_run{run}.npy",
@@ -201,6 +167,7 @@ def _alias_run_outputs(data_dir, prefix, ses, run_map):
 
 
 def _alias_bold_runs(data_dir, sub, ses, run_map):
+    """Alias fmri_sub* BOLD files to the target runs for main analysis."""
     for target_run, source_run in run_map.items():
         if target_run == source_run:
             continue
@@ -212,6 +179,7 @@ def _alias_bold_runs(data_dir, sub, ses, run_map):
 
 
 def _alias_trial_keep(data_dir, run_map):
+    """Alias trial_keep_run*.npy files to target runs when available."""
     for target_run, source_run in run_map.items():
         if target_run == source_run:
             continue
@@ -223,6 +191,7 @@ def _alias_trial_keep(data_dir, run_map):
 
 
 def _verify_main_second_outputs(data_dir, main_prefix, ses, target_runs):
+    """Ensure preprocessing outputs exist for all target runs."""
     required = []
     for run in target_runs:
         required.extend(
@@ -241,11 +210,13 @@ def _verify_main_second_outputs(data_dir, main_prefix, ses, target_runs):
 
 
 def _default_analysis_dir(native_dir, sub_zero, ses):
+    """Generate a timestamped analysis workspace path under native_dir/mni_analysis."""
     stamp = datetime.utcnow().strftime("run_%Y%m%d_%H%M%S")
     return (native_dir / "mni_analysis" / f"sub{sub_zero}_ses{ses}" / stamp).resolve()
 
 
 def _parse_runs(runs_str):
+    """Parse --runs CSV into a list of ints and validate non-empty."""
     runs = [int(r.strip()) for r in str(runs_str).split(",") if r.strip()]
     if not runs:
         raise ValueError("No runs provided; use --runs like '1,2'.")
@@ -253,6 +224,7 @@ def _parse_runs(runs_str):
 
 
 def main():
+    """Parse args, stage inputs, run preprocessing, then main analysis in mni_space."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--sub", default=os.environ.get("SUB", "9"))
     parser.add_argument("--ses", default=os.environ.get("SES", "1"))
@@ -298,13 +270,15 @@ def main():
     _stage_inputs(native_dir, mni_space_dir, sub_tag, sub_tag_main, ses, runs, sub)
     _stage_trial_keep(native_dir, mni_space_dir, runs)
 
-    behavior_src, behavior_name = _resolve_behavior_file(native_dir, sub, sub_zero, ses_int)
-    if behavior_src is None:
+    state = "OFF" if ses_int == 1 else "ON"
+    behavior_name = f"PSPD{sub:03d}_{state}_behav_metrics.mat"
+    behavior_src = native_dir / behavior_name
+    if not behavior_src.exists():
         raise FileNotFoundError(
             "\n".join(
                 [
                     "Could not locate behavior metrics file.",
-                    f"Expected name in workspace: {analysis_data_dir / behavior_name}",
+                    f"Expected name in workspace: {mni_space_dir / behavior_name}",
                     f"Searched in: {native_dir}",
                 ]
             )
@@ -313,13 +287,22 @@ def main():
 
     glmsingle_src = None
     if args.glmsingle_file:
-        glmsingle_src = _resolve_glmsingle_file(args.glmsingle_file, native_dir, sub, sub_zero, ses)
+        glmsingle_src = Path(args.glmsingle_file).expanduser().resolve()
+        if not glmsingle_src.exists():
+            raise FileNotFoundError(f"GLMsingle file not found: {glmsingle_src}")
     else:
         existing_glm = mni_space_dir / "TYPED_FITHRF_GLMDENOISE_RR.npy"
         if existing_glm.exists():
             glmsingle_src = existing_glm
         else:
-            glmsingle_src = _resolve_glmsingle_file(None, native_dir, sub, sub_zero, ses)
+            glmsingle_src = (
+                native_dir
+                / "GLMsingle"
+                / f"GLMOutputs-sub{sub_zero}-ses{ses}-std"
+                / "TYPED_FITHRF_GLMDENOISE_RR.npy"
+            )
+            if not glmsingle_src.exists():
+                glmsingle_src = None
 
     glmsingle_staged = None
     if glmsingle_src is not None:
@@ -333,7 +316,8 @@ def main():
             "\n".join(
                 [
                     "GLMsingle output not found.",
-                    "Provide --glmsingle-file or place TYPED_FITHRF_GLMDENOISE_RR.npy in the input directory.",
+                    f"Expected name in: {native_dir / 'GLMsingle' / f'GLMOutputs-sub{sub_zero}-ses{ses}-std'}",
+                    "Provide --glmsingle-file or stage TYPED_FITHRF_GLMDENOISE_RR.npy in the input directory.",
                     f"Searched in: {native_dir}",
                 ]
             )

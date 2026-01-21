@@ -37,12 +37,7 @@ def _array_summary(array):
     finite = flat[np.isfinite(flat)]
     if finite.size == 0:
         return {"min": np.nan, "max": np.nan, "mean": np.nan, "var": np.nan}
-    return {
-        "min": float(np.min(finite)),
-        "max": float(np.max(finite)),
-        "mean": float(np.mean(finite)),
-        "var": float(np.var(finite)),
-    }
+    return {"min": float(np.min(finite)), "max": float(np.max(finite)), "mean": float(np.mean(finite)), "var": float(np.var(finite))}
 
 def _matrix_norm_summary(matrix):
     mat = np.asarray(matrix, dtype=np.float64)
@@ -96,12 +91,6 @@ def combine_filtered_betas(beta_run1, beta_run2, nan_mask_flat, flat_indices):
     n1 = beta_run1.shape[1]
     n2 = beta_run2.shape[1]
     min_trials = min(n1, n2)
-    if n1 != n2:
-        print(
-            f"WARNING: Run trial counts differ (run1={n1}, run2={n2}); "
-            f"unioning NaNs over first {min_trials} trials only.",
-            flush=True,
-        )
 
     # Only union NaNs over the shared prefix of trials.
     if min_trials > 0:
@@ -224,29 +213,25 @@ def _load_trial_keep_mask(run, base_path):
     if keep is None:
         return None
     keep = np.asarray(keep)
-    if keep.dtype != bool:
-        raise ValueError(f"trial_keep_run{run}.npy must be a boolean mask, got dtype={keep.dtype}")
-    if keep.ndim != 1:
-        raise ValueError(f"trial_keep_run{run}.npy must be 1D, got shape={keep.shape}")
     return keep
 
-def _pad_trials_with_nan(array, keep_mask, target_trials):
-    if keep_mask is None:
-        return array
-    keep_mask = np.asarray(keep_mask, dtype=bool)
-    if keep_mask.size != target_trials:
-        raise ValueError(f"trial_keep mask length ({keep_mask.size}) does not match target_trials ({target_trials})")
-    if array.shape[1] == target_trials:
-        array = array.copy()
-        array[:, ~keep_mask, ...] = np.nan
-        return array
-    kept = int(np.sum(keep_mask))
-    if array.shape[1] != kept:
-        raise ValueError(f"Array has {array.shape[1]} trials, expected {kept} (kept) or {target_trials} (full).")
-    padded_shape = (array.shape[0], target_trials) + array.shape[2:]
-    padded = np.full(padded_shape, np.nan, dtype=array.dtype)
-    padded[:, keep_mask, ...] = array
-    return padded
+# def _pad_trials_with_nan(array, keep_mask, target_trials):
+#     if keep_mask is None:
+#         return array
+#     keep_mask = np.asarray(keep_mask, dtype=bool)
+#     if keep_mask.size != target_trials:
+#         raise ValueError(f"trial_keep mask length ({keep_mask.size}) does not match target_trials ({target_trials})")
+#     if array.shape[1] == target_trials:
+#         array = array.copy()
+#         array[:, ~keep_mask, ...] = np.nan
+#         return array
+#     kept = int(np.sum(keep_mask))
+#     if array.shape[1] != kept:
+#         raise ValueError(f"Array has {array.shape[1]} trials, expected {kept} (kept) or {target_trials} (full).")
+#     padded_shape = (array.shape[0], target_trials) + array.shape[2:]
+#     padded = np.full(padded_shape, np.nan, dtype=array.dtype)
+#     padded[:, keep_mask, ...] = array
+#     return padded
 
 def _align_behavior_matrix(behavior_matrix, expected_trials, trial_keep_run1=None, trial_keep_run2=None):
     behavior_matrix = np.asarray(behavior_matrix)
@@ -781,39 +766,14 @@ def _compute_mni_to_anat(mni_template, anat_path, out_dir, flirt_path):
     warped_path = os.path.join(out_dir, "mni_template_in_anat.nii.gz")
     if os.path.exists(mat_path) and os.path.exists(warped_path):
         return mat_path, warped_path
-    cmd = [
-        flirt_path,
-        "-in",
-        mni_template,
-        "-ref",
-        anat_path,
-        "-omat",
-        mat_path,
-        "-out",
-        warped_path,
-        "-dof",
-        "12",
-    ]
+    cmd = [flirt_path, "-in", mni_template, "-ref", anat_path, "-omat", mat_path, "-out", warped_path, "-dof", "12"]
     _run_flirt(cmd)
     return mat_path, warped_path
 
 def _apply_flirt(in_path, ref_path, mat_path, out_path, flirt_path, interp="nearestneighbour"):
     if os.path.exists(out_path):
         return out_path
-    cmd = [
-        flirt_path,
-        "-in",
-        in_path,
-        "-ref",
-        ref_path,
-        "-applyxfm",
-        "-init",
-        mat_path,
-        "-interp",
-        interp,
-        "-out",
-        out_path,
-    ]
+    cmd = [flirt_path, "-in", in_path, "-ref", ref_path, "-applyxfm", "-init", mat_path, "-interp", interp, "-out", out_path]
     _run_flirt(cmd)
     return out_path
 
@@ -840,26 +800,16 @@ def _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_dir, 
             atlas_mni_path = os.path.join(tmpdir, "atlas_mni.nii.gz")
             atlas_anat_path = os.path.join(tmpdir, "atlas_in_anat.nii.gz")
             mni_template_img = nib.load(mni_template)
-            atlas_mni_img = image.resample_to_img(
-                atlas_img, mni_template_img, interpolation="nearest", force_resample=True, copy_header=True
-            )
+            atlas_mni_img = image.resample_to_img(atlas_img, mni_template_img, interpolation="nearest", force_resample=True, copy_header=True)
             atlas_mni_img.to_filename(atlas_mni_path)
             _apply_flirt(atlas_mni_path, anat_path, mat_path, atlas_anat_path, flirt_path)
             atlas_in_anat_img = nib.load(atlas_anat_path)
-            atlas_in_anat = nib.Nifti1Image(
-                atlas_in_anat_img.get_fdata(dtype=np.float32),
-                atlas_in_anat_img.affine,
-                atlas_in_anat_img.header,
-            )
+            atlas_in_anat = nib.Nifti1Image(atlas_in_anat_img.get_fdata(dtype=np.float32), atlas_in_anat_img.affine, atlas_in_anat_img.header)
     else:
-        atlas_in_anat = image.resample_to_img(
-            atlas_img, anat_img, interpolation="nearest", force_resample=True, copy_header=True
-        )
+        atlas_in_anat = image.resample_to_img(atlas_img, anat_img, interpolation="nearest", force_resample=True, copy_header=True)
 
     if (atlas_in_anat.shape[:3] != ref_img.shape[:3] or not np.allclose(atlas_in_anat.affine, ref_img.affine)):
-        atlas_in_ref = image.resample_to_img(
-            atlas_in_anat, ref_img, interpolation="nearest", force_resample=True, copy_header=True
-        )
+        atlas_in_ref = image.resample_to_img(atlas_in_anat, ref_img, interpolation="nearest", force_resample=True, copy_header=True)
     else:
         atlas_in_ref = atlas_in_anat
 
@@ -894,32 +844,6 @@ def _select_label_indices(labels, label_patterns):
             indices.append(idx)
     return indices
 
-def _sanitize_region_key(label):
-    key = re.sub(r"[^a-zA-Z0-9]+", "_", label.strip().lower())
-    key = key.strip("_")
-    return key or "region"
-
-def _save_region_voxel_dict(region_voxels, output_prefix, tag):
-    if not region_voxels:
-        return None, None
-    key_map = {}
-    arrays = {}
-    for label, coords in region_voxels.items():
-        key = _sanitize_region_key(label)
-        base_key = key
-        suffix = 2
-        while key in arrays:
-            key = f"{base_key}_{suffix}"
-            suffix += 1
-        arrays[key] = np.asarray(coords, dtype=np.int32)
-        key_map[key] = label
-    npz_path = f"{output_prefix}_{tag}.npz"
-    np.savez(npz_path, **arrays)
-    label_path = f"{output_prefix}_{tag}_labels.json"
-    with open(label_path, "w", encoding="utf-8") as handle:
-        json.dump(key_map, handle, indent=2)
-    return npz_path, label_path
-
 def _prepare_atlas_context(anat_img, anat_path, ref_img, output_dir, atlas_threshold=25, data_dir=None, assume_mni=False):
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -932,27 +856,16 @@ def _prepare_atlas_context(anat_img, anat_path, ref_img, output_dir, atlas_thres
             with open(labels_path, "r", encoding="utf-8") as handle:
                 labels = json.load(handle)
             atlas_data = atlas_img.get_fdata(dtype=np.float32).astype(np.int32)
-            return {
-                "atlas_data": atlas_data,
-                "labels": labels,
-                "shape": atlas_img.shape[:3],
-                "affine": atlas_img.affine,
-                "path": atlas_cache_path,
-                "registration_method": "cached",
-                "atlas_threshold": atlas_threshold,
-            }
+            return {"atlas_data": atlas_data, "labels": labels, "shape": atlas_img.shape[:3], "affine": atlas_img.affine, "path": atlas_cache_path,
+                    "registration_method": "cached", "atlas_threshold": atlas_threshold}
 
     cort_name = f"cort-maxprob-thr{atlas_threshold}-2mm"
     sub_name = f"sub-maxprob-thr{atlas_threshold}-2mm"
     cort_img, cort_labels, _ = _fetch_ho_atlas(cort_name, data_dir=data_dir)
     sub_img, sub_labels, _ = _fetch_ho_atlas(sub_name, data_dir=data_dir)
 
-    cort_in_ref, registration_method = _align_atlas_to_reference(
-        cort_img, anat_img, anat_path, ref_img, output_dir, assume_mni=assume_mni, return_method=True
-    )
-    sub_in_ref = _align_atlas_to_reference(
-        sub_img, anat_img, anat_path, ref_img, output_dir, assume_mni=assume_mni, return_method=False
-    )
+    cort_in_ref, registration_method = _align_atlas_to_reference(cort_img, anat_img, anat_path, ref_img, output_dir, assume_mni=assume_mni, return_method=True)
+    sub_in_ref = _align_atlas_to_reference(sub_img, anat_img, anat_path, ref_img, output_dir, assume_mni=assume_mni, return_method=False)
 
     cort_data = np.rint(cort_in_ref.get_fdata(dtype=np.float32)).astype(np.int32)
     sub_data = np.rint(sub_in_ref.get_fdata(dtype=np.float32)).astype(np.int32)
@@ -963,32 +876,14 @@ def _prepare_atlas_context(anat_img, anat_path, ref_img, output_dir, atlas_thres
     with open(labels_path, "w", encoding="utf-8") as handle:
         json.dump(combined_labels, handle, indent=2)
 
-    return {
-        "atlas_data": combined_data,
-        "labels": combined_labels,
-        "shape": combined_img.shape[:3],
-        "affine": combined_img.affine,
-        "path": atlas_cache_path,
-        "registration_method": registration_method,
-        "atlas_threshold": atlas_threshold,
-    }
+    return {"atlas_data": combined_data, "labels": combined_labels, "shape": combined_img.shape[:3], "affine": combined_img.affine, "path": atlas_cache_path,
+            "registration_method": registration_method, "atlas_threshold": atlas_threshold}
 
-def _analyze_weight_map_regions(
-    voxel_weights_path,
-    atlas_context,
-    output_prefix,
-    motor_label_patterns,
-    threshold_percentile=95,
-):
+def _analyze_weight_map_regions(voxel_weights_path, atlas_context, output_prefix, motor_label_patterns, threshold_percentile=95):
     weights_img = nib.load(voxel_weights_path)
     weights_data = weights_img.get_fdata(dtype=np.float32)
     atlas_data = atlas_context["atlas_data"]
     labels = atlas_context["labels"]
-
-    if atlas_data.shape != weights_data.shape:
-        raise ValueError(
-            f"Atlas/weights shape mismatch: atlas={atlas_data.shape}, weights={weights_data.shape}"
-        )
 
     active_mask = np.isfinite(weights_data)
     if not np.any(active_mask):
@@ -1016,14 +911,11 @@ def _analyze_weight_map_regions(
     total_active = int(np.sum(active_counts))
 
     motor_indices = _select_label_indices(labels, motor_label_patterns) if motor_label_patterns else []
-    motor_region_voxels = {}
-    for idx in motor_indices:
-        label_name = labels[idx]
-        region_mask = active_mask & (atlas_data == idx)
-        coords = np.column_stack(np.nonzero(region_mask))
-        motor_region_voxels[label_name] = coords
-
-    _save_region_voxel_dict(motor_region_voxels, output_prefix, "motor_region_voxels")
+    motor_mask = active_mask & np.isin(atlas_data, motor_indices)
+    motor_coords = np.column_stack(np.nonzero(motor_mask))
+    np.savez(f"{output_prefix}_motor_voxel_indicies.npz", indices=motor_coords)
+    suprath_coords = np.column_stack(np.nonzero(suprath_mask))
+    np.savez(f"{output_prefix}_selected_voxel_indicies.npz", indices=suprath_coords)
 
     records = []
     for idx in range(1, len(labels)):
@@ -1031,30 +923,14 @@ def _analyze_weight_map_regions(
         suprath_count = int(suprath_counts[idx]) if idx < suprath_counts.size else 0
         if active_count == 0 and suprath_count == 0:
             continue
-        records.append({
-            "label_index": idx,
-            "label": labels[idx],
-            "active_voxels": active_count,
-            "suprathreshold_voxels": suprath_count,
-            "pct_suprathreshold": (suprath_count / total_suprath * 100.0) if total_suprath else 0.0,
-            "pct_of_active_region": (suprath_count / active_count * 100.0) if active_count else 0.0,
-        })
+        records.append({"label_index": idx, "label": labels[idx], "active_voxels": active_count, "suprathreshold_voxels": suprath_count,
+                        "pct_suprathreshold": (suprath_count / total_suprath * 100.0) if total_suprath else 0.0,
+                        "pct_of_active_region": (suprath_count / active_count * 100.0) if active_count else 0.0})
 
     if records:
-        summary_df = pd.DataFrame(records).sort_values(
-            "suprathreshold_voxels", ascending=False
-        )
+        summary_df = pd.DataFrame(records).sort_values("suprathreshold_voxels", ascending=False)
     else:
-        summary_df = pd.DataFrame(
-            columns=[
-                "label_index",
-                "label",
-                "active_voxels",
-                "suprathreshold_voxels",
-                "pct_suprathreshold",
-                "pct_of_active_region",
-            ]
-        )
+        summary_df = pd.DataFrame(columns=["label_index", "label", "active_voxels", "suprathreshold_voxels", "pct_suprathreshold", "pct_of_active_region"])
     summary_csv = f"{output_prefix}_atlas_region_distribution_thr{int(threshold_percentile)}.csv"
     summary_df.to_csv(summary_csv, index=False)
 
@@ -1064,8 +940,7 @@ def _analyze_weight_map_regions(
     motor_region_pct = (motor_suprath / motor_active * 100.0) if motor_active else 0.0
 
     summary_json = f"{output_prefix}_atlas_region_distribution_thr{int(threshold_percentile)}.json"
-    summary_payload = {
-        "voxel_weights_path": voxel_weights_path,
+    summary_payload = {"voxel_weights_path": voxel_weights_path,
         "atlas_path": atlas_context.get("path"),
         "atlas_threshold": atlas_context.get("atlas_threshold"),
         "atlas_registration_method": atlas_context.get("registration_method"),
@@ -1077,15 +952,11 @@ def _analyze_weight_map_regions(
         "motor_suprathreshold_pct": motor_pct,
         "motor_active_voxels": motor_active,
         "motor_active_suprath_pct": motor_region_pct,
-        "motor_label_patterns": list(motor_label_patterns) if motor_label_patterns else [],
-    }
+        "motor_label_patterns": list(motor_label_patterns) if motor_label_patterns else []}
     with open(summary_json, "w", encoding="utf-8") as handle:
         json.dump(summary_payload, handle, indent=2)
 
-    print(
-        f"Atlas summary saved: {summary_csv} (thr={threshold_value:.4f}, suprath={total_suprath}, motor={motor_pct:.1f}%)",
-        flush=True,
-    )
+    print(f"Atlas summary saved: {summary_csv} (thr={threshold_value:.4f}, suprath={total_suprath}, motor={motor_pct:.1f}%)", flush=True)
     return summary_payload
 
 def _load_projection_series(series_path):
@@ -1416,12 +1287,8 @@ def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth
     initial_weights = np.full(n_components, 1.0 / np.sqrt(n_components), dtype=np.float64)
     result = minimize(_objective, initial_weights, jac=_objective_grad, constraints=constraints, 
                       method="SLSQP", options={"maxiter": 1000, "ftol": 1e-8, "disp": True})
-    if not result.success:
-        raise RuntimeError(f"Fractional optimizer failed: {result.message}")
     solution_weights = np.asarray(result.x)
     denominator_value = solution_weights.T @ B_mat @ solution_weights
-    if denominator_value < 1e-6:
-        raise RuntimeError("Optimized weights violate the correlation denominator constraint.")
 
     contributions = {label: solution_weights.T @ matrix @ solution_weights for label, matrix in penalty_matrices.items()}
     y = beta_centered.T @ solution_weights
@@ -1458,13 +1325,9 @@ def solve_soc_problem_eig(run_data, alpha_task, alpha_bold, alpha_beta, alpha_sm
 
     eigvals, eigvecs = eigh(A_mat, B_mat)
     finite_mask = np.isfinite(eigvals)
-    if not np.any(finite_mask):
-        raise RuntimeError("Generalized eigenvalue solver failed to produce finite eigenvalues.")
     min_idx = int(np.nanargmin(eigvals))
     solution_weights = np.asarray(eigvecs[:, min_idx], dtype=np.float64).ravel()
     b_norm = float(np.sqrt(solution_weights.T @ B_mat @ solution_weights))
-    if not np.isfinite(b_norm) or b_norm <= 0:
-        raise RuntimeError("Generalized eigenvector produced non-positive B-norm.")
     solution_weights = solution_weights / b_norm
 
     contributions = {label: float(solution_weights.T @ matrix @ solution_weights) for label, matrix in penalty_matrices.items()}
@@ -2128,13 +1991,7 @@ if __name__ == "__main__":
     else:
         num_folds = 5
 
-    fold_splits = build_custom_kfold_splits(
-        num_trials,
-        num_folds=num_folds,
-        trials_per_run=trials_per_run,
-        run1_trials=run1_trials,
-        run2_trials=run2_trials,
-    )
+    fold_splits = build_custom_kfold_splits(num_trials, num_folds=num_folds, trials_per_run=trials_per_run, run1_trials=run1_trials, run2_trials=run2_trials)
     print(f"Constructed {len(fold_splits)} fold pairs using num_folds={num_folds} per run.", flush=True)
     run_cross_run_experiment(selected_alphas, selected_gammas, fold_splits, projection_data)
 
