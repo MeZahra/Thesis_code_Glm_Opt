@@ -235,18 +235,14 @@ def _pad_trials_with_nan(array, keep_mask, target_trials):
         return array
     keep_mask = np.asarray(keep_mask, dtype=bool)
     if keep_mask.size != target_trials:
-        raise ValueError(
-            f"trial_keep mask length ({keep_mask.size}) does not match target_trials ({target_trials})"
-        )
+        raise ValueError(f"trial_keep mask length ({keep_mask.size}) does not match target_trials ({target_trials})")
     if array.shape[1] == target_trials:
         array = array.copy()
         array[:, ~keep_mask, ...] = np.nan
         return array
     kept = int(np.sum(keep_mask))
     if array.shape[1] != kept:
-        raise ValueError(
-            f"Array has {array.shape[1]} trials, expected {kept} (kept) or {target_trials} (full)."
-        )
+        raise ValueError(f"Array has {array.shape[1]} trials, expected {kept} (kept) or {target_trials} (full).")
     padded_shape = (array.shape[0], target_trials) + array.shape[2:]
     padded = np.full(padded_shape, np.nan, dtype=array.dtype)
     padded[:, keep_mask, ...] = array
@@ -269,16 +265,11 @@ def _align_behavior_matrix(behavior_matrix, expected_trials, trial_keep_run1=Non
             if kept == expected_trials:
                 print(f"Behavior matrix filtered to kept trials ({kept}/{current_trials}).", flush=True)
                 return behavior_matrix[keep_mask]
-            print(f"WARNING: trial_keep masks keep {kept}/{current_trials} trials but expected {expected_trials}.",flush=True)
+            print(f"WARNING: trial_keep masks keep {kept}/{current_trials} trials but expected {expected_trials}.", flush=True)
     if current_trials > expected_trials:
-        print(
-            f"WARNING: Behavior matrix has {current_trials} trials; truncating to {expected_trials} to match data.",
-            flush=True,
-        )
+        print(f"WARNING: Behavior matrix has {current_trials} trials; truncating to {expected_trials} to match data.", flush=True)
         return behavior_matrix[:expected_trials]
-    raise ValueError(
-        f"Behavior matrix has {current_trials} trials but expected {expected_trials}."
-    )
+    raise ValueError(f"Behavior matrix has {current_trials} trials but expected {expected_trials}.")
 
 # Anatomical files live in the data folder.
 anat_root = base_path
@@ -366,14 +357,8 @@ if single_run_mode:
     active_coords = np.column_stack(coords_tuple)
     bold_clean = clean_active_bold_run2
 else:
-    active_flat_idx, active_coords, bold_clean = combine_active_run_data(
-        active_coords_run1,
-        active_coords_run2,
-        clean_active_bold_run1,
-        clean_active_bold_run2,
-        volume_shape,
-        shared_nan_mask_flat,
-    )
+    active_flat_idx, active_coords, bold_clean = combine_active_run_data(active_coords_run1, active_coords_run2, clean_active_bold_run1, clean_active_bold_run2,
+                                                                         volume_shape, shared_nan_mask_flat)
 active_coords = np.asarray(active_coords)
 print(f"Combined active_flat_idx: {active_flat_idx.shape}", flush=True)
 print(f"Combined clean_active_bold: {bold_clean.shape}", flush=True)
@@ -501,11 +486,6 @@ def build_pca_dataset(bold_clean, beta_clean, behavioral_matrix, nan_mask_flat, 
 
 def _compute_global_normalization(behavior_matrix, beta_pca_full, behavior_index):
     behavior_vector = behavior_matrix[:, behavior_index].ravel()
-    # raw_behavior = behavior_matrix[:, behavior_index].ravel()
-    # inv_behavior = np.divide(1.0, raw_behavior, out=np.full_like(raw_behavior, np.nan, dtype=np.float64),
-    #                          where=np.isfinite(raw_behavior) & (raw_behavior != 0))
-    # inv_max = np.nanmax(inv_behavior) if np.any(np.isfinite(inv_behavior)) else 0.0
-    # behavior_vector = inv_behavior - inv_max
     behavior_finite_mask = np.isfinite(behavior_vector)
 
     behavior_centered_full = np.full_like(behavior_vector, np.nan, dtype=np.float64)
@@ -556,15 +536,8 @@ def compute_fold_normalization(projection_data, train_indices, behavior_index):
     beta_mean = np.divide(beta_sum, beta_counts, out=np.zeros_like(beta_sum, dtype=np.float64), where=beta_counts > 0)
     beta_centered_full = beta_pca_full - beta_mean
 
-    return {
-        "behavior_vector_full": behavior_vector_full,
-        "behavior_centered_full": behavior_centered_full,
-        "behavior_normalized_full": behavior_normalized_full,
-        "behavior_mean": behavior_mean,
-        "behavior_norm": behavior_norm,
-        "beta_centered_full": beta_centered_full,
-        "beta_mean_full": beta_mean,
-    }
+    return {"behavior_vector_full": behavior_vector_full, "behavior_centered_full": behavior_centered_full, "behavior_normalized_full": behavior_normalized_full,
+        "behavior_mean": behavior_mean, "behavior_norm": behavior_norm, "beta_centered_full": beta_centered_full, "beta_mean_full": beta_mean}
 
 def build_loss_corr_term(beta_components, normalized_behaviors, ridge=1e-6):
     beta_components = np.nan_to_num(beta_components, nan=0.0, posinf=0.0, neginf=0.0)
@@ -574,14 +547,6 @@ def build_loss_corr_term(beta_components, normalized_behaviors, ridge=1e-6):
     C_d = beta_components @ beta_components.T
     skew_b = C_b - C_b.T
     skew_d = C_d - C_d.T
-    # print(
-    #     f"C_b symmetry deviation: fro_norm={np.linalg.norm(skew_b, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_b)):.6e}",
-    #     flush=True,
-    # )
-    # print(
-    #     f"C_d symmetry deviation: fro_norm={np.linalg.norm(skew_d, ord='fro'):.6e}, max_abs={np.max(np.abs(skew_d)):.6e}",
-    #     flush=True,
-    # )
     C_b = 0.5 * (C_b + C_b.T)
     C_d = 0.5 * (C_d + C_d.T)
     eye = np.eye(beta_components.shape[0])
@@ -660,7 +625,7 @@ def save_brain_map(correlations, active_coords, volume_shape, anat_img, file_pre
 
 def enhance_bold_visualization(input_file, anat_img=None, output_prefix=None,
                                percentiles=(90, 95, 99), min_cluster_sizes=(100, 75, 50),
-                               vmax_percentile=99.9):
+                               vmax_percentile=99.9, map_title=None):
     input_file = os.path.abspath(str(input_file))
     if not os.path.exists(input_file):
         raise FileNotFoundError(f"Input file not found: {input_file}")
@@ -728,31 +693,12 @@ def enhance_bold_visualization(input_file, anat_img=None, output_prefix=None,
     print("\nGenerating visualizations...", flush=True)
     for pct, thr, min_size, data_thr, clusters, _ in filtered_results:
         img_thr = nib.Nifti1Image(data_thr.astype(np.float32), img.affine, img.header)
-        view = plotting.view_img(
-            img_thr,
-            bg_img=anat_img,
-            cmap="hot",
-            symmetric_cmap=False,
-            threshold=thr,
-            vmax=vmax,
-            colorbar=True,
-            title=f"Precise Activation ({pct}th pctl, {clusters} clusters, min_size={min_size})",
-        )
+        view = plotting.view_img(img_thr, bg_img=anat_img, cmap="hot", symmetric_cmap=False, threshold=thr, vmax=vmax, colorbar=True, title=map_title)
         out_html = f"{output_prefix}_thr{pct}.html"
         view.save_as_html(out_html)
         print(f"Saved: {out_html}", flush=True)
 
-        display = plotting.plot_stat_map(
-            img_thr,
-            bg_img=anat_img,
-            cmap="hot",
-            symmetric_cbar=False,
-            threshold=thr,
-            vmax=vmax,
-            colorbar=True,
-            title=f"Precise Activation ({pct}th pctl, {clusters} clusters)",
-            display_mode="ortho",
-        )
+        display = plotting.plot_stat_map(img_thr, bg_img=anat_img,cmap="hot", symmetric_cbar=False, threshold=thr, vmax=vmax, colorbar=True, title=map_title, display_mode="ortho")
         png_path = f"{output_prefix}_thr{pct}.png"
         display.savefig(png_path, dpi=150)
         display.close()
@@ -1816,8 +1762,9 @@ ridge_penalty = 1e-3
 solver_name = "MOSEK"
 # penalty_sweep = [(0.8, 1, 0.5, 1.2, 1.0), (0, 1, 0.5, 1.2, 1.0), (0.8, 0, 0.5, 1.2, 1.0), (0.8, 1, 0, 1.2, 1.0), (0.8, 1, 0.5, 0, 1.0)]
 # penalty_sweep = [(0.8, 0, 0, 0, 1.0), (0, 0.8, 0, 0, 1.0), (0, 0, 0.5, 0, 1.0), (0, 0, 0, 1, 1.0), (0.8, 0.8, 0.5, 1, 1.0)]
-penalty_sweep = [(0.8, 0, 0, 0, 0), (0, 1, 0, 0, 0), (0, 0, 0.5, 0, 0), (0, 0, 0, 1.2, 0)] #for sub09
+# penalty_sweep = [(0.8, 0, 0, 0, 0), (0, 1, 0, 0, 0), (0, 0, 0.5, 0, 0), (0, 0, 0, 1.2, 0)] #for sub09
 # penalty_sweep = [(0.8, 1, 0.5, 1.2, 1.0)] #for sub09
+penalty_sweep = [(0, 1, 0.5, 1.2, 1.0), (0.8, 0, 0.5, 1.2, 1.0), (0.8, 1, 0, 1.2, 1.0), (0.8, 1, 0.5, 0, 1.0), (0.8, 1, 0.5, 1.2, 0)] #for sub09
 # penalty_sweep = [(0.5, 0.8, 0.3, 1.5, 1.0), (1.0, 2.0, 1.0, 3.0, 1.0)] #for sub10
 # penalty_sweep = [(0.7, 0.7, 0.25, 0.1, 1.0)]
 alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha,
@@ -2072,7 +2019,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             voxel_weights_path = f"voxel_weights_mean_{avg_prefix}.nii.gz"
             if os.path.exists(voxel_weights_path):
                 try:
-                    enhance_bold_visualization(voxel_weights_path, anat_img=anat_img)
+                    enhance_bold_visualization(voxel_weights_path, anat_img=anat_img, map_title=weights_title)
                 except Exception as exc:
                     print(f"  Bold viz enhancement failed for {voxel_weights_path}: {exc}", flush=True)
                 if atlas_analysis_enabled:
