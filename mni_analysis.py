@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-"""
-Native-space analysis wrapper:
-1) Resolve native-space inputs.
-2) Stage inputs into an isolated analysis workspace (mni_space).
-3) Run Beta_preprocessing.py writing outputs into mni_space.
-4) Run mian_second_obj_25.py against the same mni_space.
-
-This keeps native inputs separate from derived outputs and avoids reusing
-existing EMPCA/derived files from native directories.
-"""
 import argparse
 import os
 import subprocess
@@ -225,10 +214,12 @@ def _parse_runs(runs_str):
 
 def main():
     """Parse args, stage inputs, run preprocessing, then main analysis in mni_space."""
+    project_dir = Path(__file__).resolve().parent
+    default_data_dir = project_dir / "data" / "sub09_ses01"
     parser = argparse.ArgumentParser()
     parser.add_argument("--sub", default=os.environ.get("SUB", "9"))
     parser.add_argument("--ses", default=os.environ.get("SES", "1"))
-    parser.add_argument("--data-dir", default=os.environ.get("FMRI_OPT_DATA_DIR", "data"))
+    parser.add_argument("--data-dir",default=os.environ.get("FMRI_OPT_DATA_DIR", str(default_data_dir)))
     parser.add_argument("--analysis-dir", default=None, help="Workspace for staged inputs and outputs.")
     parser.add_argument("--mni-dir", default=None, help="Ignored; MNI conversion disabled for analysis.")
     parser.add_argument("--mni-template", default=None, help="Ignored; MNI conversion disabled for analysis.")
@@ -291,18 +282,9 @@ def main():
         if not glmsingle_src.exists():
             raise FileNotFoundError(f"GLMsingle file not found: {glmsingle_src}")
     else:
-        existing_glm = mni_space_dir / "TYPED_FITHRF_GLMDENOISE_RR.npy"
-        if existing_glm.exists():
-            glmsingle_src = existing_glm
-        else:
-            glmsingle_src = (
-                native_dir
-                / "GLMsingle"
-                / f"GLMOutputs-sub{sub_zero}-ses{ses}-std"
-                / "TYPED_FITHRF_GLMDENOISE_RR.npy"
-            )
-            if not glmsingle_src.exists():
-                glmsingle_src = None
+        glmsingle_src = native_dir / "TYPED_FITHRF_GLMDENOISE_RR.npy"
+        if not glmsingle_src.exists():
+            glmsingle_src = None
 
     glmsingle_staged = None
     if glmsingle_src is not None:
@@ -316,14 +298,13 @@ def main():
             "\n".join(
                 [
                     "GLMsingle output not found.",
-                    f"Expected name in: {native_dir / 'GLMsingle' / f'GLMOutputs-sub{sub_zero}-ses{ses}-std'}",
+                    f"Expected name in: {native_dir / 'TYPED_FITHRF_GLMDENOISE_RR.npy'}",
                     "Provide --glmsingle-file or stage TYPED_FITHRF_GLMDENOISE_RR.npy in the input directory.",
                     f"Searched in: {native_dir}",
                 ]
             )
         )
 
-    project_dir = Path(__file__).resolve().parent
     beta_script = project_dir / "Beta_preprocessing.py"
     main_script = project_dir / "mian_second_obj_25.py"
 
