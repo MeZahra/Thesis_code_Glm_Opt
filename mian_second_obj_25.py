@@ -1627,10 +1627,9 @@ solver_name = "MOSEK"
 # penalty_sweep = [(0.8, 0, 0, 0, 1.0), (0, 0.8, 0, 0, 1.0), (0, 0, 0.5, 0, 1.0), (0, 0, 0, 1, 1.0), (0.8, 0.8, 0.5, 1, 1.0)]
 # penalty_sweep = [(0.8, 0, 0, 0, 0), (0, 1, 0, 0, 0), (0, 0, 0.5, 0, 0), (0, 0, 0, 1.2, 0)] #for sub09
 # penalty_sweep = [(0.8, 1, 0.5, 1.2, 1.0)] #for sub09
-penalty_sweep = [(0, 1, 0.5, 1.2, 1.0), (0.8, 0, 0.5, 1.2, 1.0), (0.8, 1, 0, 1.2, 1.0), (0.8, 1, 0.5, 0, 1.0), (0.8, 1, 0.5, 1.2, 0),
-                 (0.8, 0, 0, 0, 0), (0, 1, 0, 0, 0), (0, 0, 0.5, 0, 0), (0, 0, 0, 1.2, 0)] #for sub09
+penalty_sweep = [(0.8, 0, 0.5, 1.2, 1.0), (0.8, 1, 0, 1.2, 1.0), (0.8, 1, 0.5, 0, 1.0), (0.8, 1, 0.5, 1.2, 0)] #for sub09
 # penalty_sweep = [(0.5, 0.8, 0.3, 1.5, 1.0), (1.0, 2.0, 1.0, 3.0, 1.0)] #for sub10
-# penalty_sweep = [(0.7, 0.7, 0.25, 0.1, 1.0)]
+# penalty_sweep = [(0.8, 1, 0.5, 1.2, 1.0)]
 alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha,
     "smooth_penalty": smooth_alpha, "corr_weight": corr_weight}
     for task_alpha, bold_alpha, beta_alpha, smooth_alpha, corr_weight in penalty_sweep]
