@@ -11,6 +11,13 @@ Key analyses:
 2. Permutation test with null distribution
 3. Bootstrap confidence intervals
 4. Multi-panel publication-quality figure
+
+Enhanced analyses (v2):
+5. Log-transformed variability for better separation
+6. Rank-based comparison within motor cortex
+7. Matched bootstrap resampling for robust effect estimation
+8. Cumulative distribution function comparison
+9. Low-variability fraction analysis
 """
 import argparse
 import json
@@ -22,10 +29,12 @@ import matplotlib
 import numpy as np
 import nibabel as nib
 from scipy import stats
+from scipy.ndimage import gaussian_filter1d
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+from matplotlib.ticker import PercentFormatter
 
 REPO_ROOT = Path(__file__).resolve().parent
 GLMSINGLE_ROOT = REPO_ROOT / "GLMsingle"
@@ -709,6 +718,351 @@ def _interpret_cohens_d(d):
         return "(large)"
 
 
+# =========================================================================
+# ENHANCED ANALYSIS FUNCTIONS FOR BETTER SEPARATION
+# =========================================================================
+
+def _log_transform_variability(values, epsilon=1e-6):
+    """
+    Log-transform variability values to reduce skewness.
+
+    The log transform compresses extreme values and expands small differences,
+    making the distributions more Gaussian-like and better revealing separation.
+    """
+    return np.log10(values + epsilon)
+
+
+def _compute_rank_percentiles(selected_vals, nonselected_vals):
+    """
+    Compute rank percentiles of selected voxels within the full motor cortex distribution.
+
+    If selected voxels have systematically lower variability, their rank percentiles
+    should cluster in the lower portion of the distribution.
+    """
+    combined = np.concatenate([selected_vals, nonselected_vals])
+    n_total = combined.size
+
+    # Compute rank of each selected voxel within the combined distribution
+    selected_ranks = np.empty(selected_vals.size, dtype=np.float64)
+    for i, val in enumerate(selected_vals):
+        # Rank = fraction of values that are <= this value
+        selected_ranks[i] = np.sum(combined <= val) / n_total * 100
+
+    # Expected percentile under null hypothesis (uniform distribution)
+    expected_median_percentile = 50.0
+
+    return selected_ranks, expected_median_percentile
+
+
+def _matched_bootstrap_effect(selected_vals, nonselected_vals, num_bootstrap, rng, match_size=None):
+    """
+    Bootstrap comparison with matched sample sizes.
+
+    For each bootstrap iteration:
+    1. Resample selected voxels with replacement
+    2. Sample the same number of non-selected voxels WITHOUT replacement
+    3. Compute the difference in means/medians
+
+    This controls for sample size effects and provides robust effect estimates.
+    """
+    if match_size is None:
+        match_size = selected_vals.size
+
+    # Ensure we can sample without replacement from nonselected
+    use_replace = nonselected_vals.size < match_size
+
+    mean_diffs = np.empty(num_bootstrap, dtype=np.float64)
+    median_diffs = np.empty(num_bootstrap, dtype=np.float64)
+    cohens_ds = np.empty(num_bootstrap, dtype=np.float64)
+
+    for i in range(num_bootstrap):
+        # Resample selected WITH replacement
+        sel_sample = rng.choice(selected_vals, size=match_size, replace=True)
+        # Sample non-selected (with replacement only if necessary)
+        nonsel_sample = rng.choice(nonselected_vals, size=match_size, replace=use_replace)
+
+        mean_diffs[i] = np.mean(sel_sample) - np.mean(nonsel_sample)
+        median_diffs[i] = np.median(sel_sample) - np.median(nonsel_sample)
+        cohens_ds[i] = _cohens_d(sel_sample, nonsel_sample)
+
+    return {
+        "mean_diffs": mean_diffs,
+        "median_diffs": median_diffs,
+        "cohens_ds": cohens_ds,
+        "mean_diff_mean": float(np.mean(mean_diffs)),
+        "mean_diff_ci_lower": float(np.percentile(mean_diffs, 2.5)),
+        "mean_diff_ci_upper": float(np.percentile(mean_diffs, 97.5)),
+        "median_diff_mean": float(np.mean(median_diffs)),
+        "median_diff_ci_lower": float(np.percentile(median_diffs, 2.5)),
+        "median_diff_ci_upper": float(np.percentile(median_diffs, 97.5)),
+        "cohens_d_mean": float(np.mean(cohens_ds)),
+        "cohens_d_ci_lower": float(np.percentile(cohens_ds, 2.5)),
+        "cohens_d_ci_upper": float(np.percentile(cohens_ds, 97.5)),
+        "match_size": match_size,
+    }
+
+
+def _compute_low_variability_fractions(selected_vals, nonselected_vals, thresholds=None):
+    """
+    Compute the fraction of voxels below various variability thresholds.
+
+    If selected voxels have systematically lower variability, they should have
+    a higher fraction falling below any given threshold.
+    """
+    combined = np.concatenate([selected_vals, nonselected_vals])
+
+    if thresholds is None:
+        # Use percentiles of the combined distribution as thresholds
+        thresholds = np.percentile(combined, [10, 20, 30, 40, 50])
+
+    results = []
+    for thresh in thresholds:
+        sel_frac = np.mean(selected_vals <= thresh)
+        nonsel_frac = np.mean(nonselected_vals <= thresh)
+        # Odds ratio: how much more likely is a selected voxel to be below threshold?
+        if nonsel_frac > 0 and nonsel_frac < 1:
+            odds_ratio = (sel_frac / (1 - sel_frac + 1e-10)) / (nonsel_frac / (1 - nonsel_frac + 1e-10))
+        else:
+            odds_ratio = np.nan
+        results.append({
+            "threshold": float(thresh),
+            "selected_fraction": float(sel_frac),
+            "nonselected_fraction": float(nonsel_frac),
+            "fraction_ratio": float(sel_frac / (nonsel_frac + 1e-10)),
+            "odds_ratio": float(odds_ratio),
+        })
+
+    return results
+
+
+def _compute_stochastic_dominance(selected_vals, nonselected_vals):
+    """
+    Compute probability that a randomly chosen selected voxel has lower
+    variability than a randomly chosen non-selected voxel.
+
+    This is the area under the ROC curve (AUC) and equals P(X < Y) + 0.5*P(X == Y).
+    A value > 0.5 indicates selected voxels tend to have lower variability.
+    """
+    # Mann-Whitney U statistic gives us this directly
+    n_sel = selected_vals.size
+    n_nonsel = nonselected_vals.size
+
+    # Count pairs where selected < nonselected
+    count_less = 0
+    count_equal = 0
+
+    # For large samples, use a more efficient approach
+    if n_sel * n_nonsel > 1e8:
+        # Use sorted arrays and binary search
+        sorted_nonsel = np.sort(nonselected_vals)
+        for val in selected_vals:
+            # Count how many non-selected values are > val
+            count_less += np.searchsorted(sorted_nonsel, val, side='right')
+            count_equal += (np.searchsorted(sorted_nonsel, val, side='right') -
+                           np.searchsorted(sorted_nonsel, val, side='left'))
+    else:
+        # Direct comparison
+        for val in selected_vals:
+            count_less += np.sum(nonselected_vals > val)
+            count_equal += np.sum(nonselected_vals == val)
+
+    p_dominance = (count_less + 0.5 * count_equal) / (n_sel * n_nonsel)
+    return p_dominance
+
+
+def _compute_cliff_delta(selected_vals, nonselected_vals):
+    """
+    Compute Cliff's delta - a non-parametric effect size measure.
+
+    Cliff's delta = (P(X > Y) - P(X < Y)) where X is selected, Y is non-selected.
+    Ranges from -1 (all X < Y) to +1 (all X > Y).
+    Negative values indicate selected have lower variability.
+    """
+    n_sel = selected_vals.size
+    n_nonsel = nonselected_vals.size
+
+    # Use efficient comparison
+    # For each selected value, count how many non-selected values are:
+    # - greater (selected < nonsel, i.e., selected has lower variability)
+    # - less (selected > nonsel, i.e., selected has higher variability)
+    count_sel_less = 0  # pairs where selected < nonselected
+    count_sel_greater = 0  # pairs where selected > nonselected
+
+    sorted_nonsel = np.sort(nonselected_vals)
+    for val in selected_vals:
+        idx_right = np.searchsorted(sorted_nonsel, val, side='right')
+        idx_left = np.searchsorted(sorted_nonsel, val, side='left')
+        # Values in sorted_nonsel that are > val (selected is smaller)
+        count_sel_less += n_nonsel - idx_right
+        # Values in sorted_nonsel that are < val (selected is larger)
+        count_sel_greater += idx_left
+
+    # Cliff's delta: (# selected > nonsel) - (# selected < nonsel)
+    # Negative when selected values are generally LOWER
+    cliff_delta = (count_sel_greater - count_sel_less) / (n_sel * n_nonsel)
+    return cliff_delta
+
+
+def _plot_enhanced_figure(
+    selected_vals, nonselected_vals, summary, perm_results,
+    log_selected, log_nonselected, rank_percentiles,
+    matched_results, low_var_fractions, out_path, use_std=True
+):
+    """
+    Create an enhanced multi-panel publication figure with better separation visualization.
+
+    Panels:
+    A. Log-transformed KDE comparison (reduces skew)
+    B. Low-variability enrichment ratio across percentile thresholds
+    C. Permutation test null distribution
+    + Statistical summary table
+    """
+    fig = plt.figure(figsize=(14, 8))
+    gs = GridSpec(2, 3, figure=fig, hspace=0.35, wspace=0.30,
+                  height_ratios=[1, 0.7])
+
+    metric_label = "Std Dev" if use_std else "Variance"
+
+    # Color scheme
+    sel_color = "#E63946"  # Red for selected
+    nonsel_color = "#457B9D"  # Blue for non-selected
+    null_color = "#A8DADC"  # Light blue for null distribution
+
+    # ===== Panel A: Log-transformed KDE Comparison =====
+    ax_log = fig.add_subplot(gs[0, 0])
+
+    combined_log = np.concatenate([log_selected, log_nonselected])
+    xmin = np.percentile(combined_log, 0.5)
+    xmax = np.percentile(combined_log, 99.5)
+    grid = np.linspace(xmin, xmax, 500)
+
+    sel_kde = stats.gaussian_kde(log_selected, bw_method='scott')
+    nonsel_kde = stats.gaussian_kde(log_nonselected, bw_method='scott')
+
+    ax_log.fill_between(grid, sel_kde(grid), alpha=0.4, color=sel_color,
+                        label=f"Selected (n={log_selected.size})")
+    ax_log.fill_between(grid, nonsel_kde(grid), alpha=0.4, color=nonsel_color,
+                        label=f"Non-selected (n={log_nonselected.size})")
+    ax_log.plot(grid, sel_kde(grid), color=sel_color, linewidth=2)
+    ax_log.plot(grid, nonsel_kde(grid), color=nonsel_color, linewidth=2)
+
+    # Add median lines
+    ax_log.axvline(np.median(log_selected), color=sel_color, linestyle='--', linewidth=1.5)
+    ax_log.axvline(np.median(log_nonselected), color=nonsel_color, linestyle='--', linewidth=1.5)
+
+    ax_log.set_xlabel(f"Log₁₀({metric_label})", fontsize=11)
+    ax_log.set_ylabel("Density", fontsize=11)
+    ax_log.legend(loc='upper right', fontsize=9)
+    ax_log.spines['top'].set_visible(False)
+    ax_log.spines['right'].set_visible(False)
+
+    # ===== Panel B: Low-Variability Enrichment =====
+    # Shows: at each percentile threshold, what fraction of selected vs non-selected
+    # voxels fall below that threshold? Ratio > 1 means selected are enriched among low-variability voxels.
+    ax_enrich = fig.add_subplot(gs[0, 1])
+
+    combined = np.concatenate([selected_vals, nonselected_vals])
+    percentile_thresholds = [10, 20, 30, 40, 50, 60, 70, 80, 90]
+    enrichment_ratios = []
+
+    for pct in percentile_thresholds:
+        thresh = np.percentile(combined, pct)
+        sel_frac = np.mean(selected_vals <= thresh)
+        nonsel_frac = np.mean(nonselected_vals <= thresh)
+        if nonsel_frac > 0:
+            enrichment = sel_frac / nonsel_frac
+        else:
+            enrichment = np.nan
+        enrichment_ratios.append(enrichment)
+
+    bars = ax_enrich.bar(percentile_thresholds, enrichment_ratios, width=8,
+                         color=sel_color, alpha=0.7, edgecolor='white')
+    ax_enrich.axhline(1.0, color='gray', linestyle='--', linewidth=2, label='No enrichment (null)')
+
+    # Color bars above/below 1.0 differently
+    for bar, ratio in zip(bars, enrichment_ratios):
+        if ratio > 1.0:
+            bar.set_color(sel_color)
+        else:
+            bar.set_color(nonsel_color)
+            bar.set_alpha(0.5)
+
+    ax_enrich.set_xlabel("Variability Percentile Threshold", fontsize=11)
+    ax_enrich.set_ylabel("Enrichment Ratio\n(Selected / Non-selected)", fontsize=11)
+    ax_enrich.set_xticks(percentile_thresholds)
+    ax_enrich.set_xticklabels([f'{p}%' for p in percentile_thresholds], fontsize=9)
+    ax_enrich.legend(loc='upper right', fontsize=9)
+    ax_enrich.spines['top'].set_visible(False)
+    ax_enrich.spines['right'].set_visible(False)
+    ax_enrich.set_ylim(0, max(enrichment_ratios) * 1.15)
+
+    # ===== Panel C: Permutation Null Distribution =====
+    ax_perm = fig.add_subplot(gs[0, 2])
+
+    null_means = perm_results['null_selected_means']
+    observed = perm_results['observed_selected_stat']
+
+    ax_perm.hist(null_means, bins=50, color=null_color, edgecolor='white', alpha=0.8, density=True)
+    ax_perm.axvline(observed, color=sel_color, linewidth=2.5, linestyle='-',
+                    label=f'Observed = {observed:.4f}')
+
+    percentile = perm_results['percentile_rank']
+    p_value = perm_results['p_value_one_sided']
+
+    ax_perm.set_xlabel(f"Mean {metric_label} (Random Samples)", fontsize=11)
+    ax_perm.set_ylabel("Density", fontsize=11)
+    ax_perm.legend(loc='upper right', fontsize=9)
+    ax_perm.spines['top'].set_visible(False)
+    ax_perm.spines['right'].set_visible(False)
+
+    # ===== Statistical Summary Table (spans bottom row) =====
+    ax_stats = fig.add_subplot(gs[1, :])
+    ax_stats.axis('off')
+
+    # Create statistics table
+    cliff_d = summary.get('cliff_delta', np.nan)
+    cohens_d_matched = matched_results['cohens_d_mean']
+    cohens_d_ci_low = matched_results['cohens_d_ci_lower']
+    cohens_d_ci_high = matched_results['cohens_d_ci_upper']
+    cohens_d_interp = _interpret_cohens_d(cohens_d_matched)
+    cliff_note = "(selected < nonselected)" if cliff_d < 0 else ""
+    median_rank_pct = np.median(rank_percentiles)
+    frac_below_50_pct = np.mean(rank_percentiles < 50) * 100
+
+    stats_lines = [
+        "=" * 90,
+        f"{'STATISTICAL SUMMARY':^90}",
+        "=" * 90,
+        f"{'Sample Sizes:':<25} Selected: {summary['selected_motor_count']:,}    Non-selected: {summary['nonselected_motor_count']:,}",
+        "-" * 90,
+        f"{'VARIABILITY':<25} {'Selected':<15} {'Non-selected':<15} {'Difference':<20}",
+        f"Mean {metric_label}:{'':<13} {summary['selected_mean']:<15.4f} {summary['nonselected_mean']:<15.4f} {summary['mean_diff']:.4f} ({summary['mean_diff_pct']:.1f}%)",
+        f"Median {metric_label}:{'':<11} {summary['selected_median']:<15.4f} {summary['nonselected_median']:<15.4f} {summary['selected_median'] - summary['nonselected_median']:.4f}",
+        "-" * 90,
+        f"{'EFFECT SIZES':<25} {'Value':<15} {'95% CI':<20} {'Interpretation':<20}",
+        f"Cohen's d (log):{'':<9} {summary.get('log_cohens_d', 0):<15.3f} {'---':<20} {_interpret_cohens_d(summary.get('log_cohens_d', 0)):<20}",
+        f"Cohen's d (matched):{'':<5} {cohens_d_matched:<15.3f} [{cohens_d_ci_low:.3f}, {cohens_d_ci_high:.3f}]{'':<6} {cohens_d_interp:<20}",
+        f"Cliff's delta:{'':<11} {cliff_d:<15.3f} {'---':<20} {cliff_note:<20}",
+        "-" * 90,
+        f"{'STATISTICAL TESTS':<25} {'Statistic':<15} {'p-value':<15}",
+        f"Mann-Whitney U:{'':<10} {summary['mannwhitney_u']:<15.0f} {summary['mannwhitney_pvalue']:.2e}",
+        f"Permutation test:{'':<8} {'---':<15} {summary['perm_p_value']:.2e}",
+        "-" * 90,
+        f"{'RANK ANALYSIS':<25} Median rank: {median_rank_pct:.1f}%    |    {frac_below_50_pct:.1f}% below 50th pct (expected: 50%)",
+        "=" * 90,
+    ]
+
+    table_text = "\n".join(stats_lines)
+
+    ax_stats.text(0.5, 0.95, table_text, transform=ax_stats.transAxes,
+                  fontsize=9, verticalalignment='top', horizontalalignment='center',
+                  fontfamily='monospace',
+                  bbox=dict(boxstyle='round', facecolor='#f8f9fa', edgecolor='#dee2e6', pad=1))
+
+    plt.savefig(out_path, dpi=200, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+
+
 def _plot_histogram_comparison(selected_vals, motor_vals, bins, out_path, selected_mean, motor_mean, title_note=""):
     """Plot two smooth density estimates with a shared range."""
     fig, ax = plt.subplots(figsize=(7.0, 4.5))
@@ -1034,7 +1388,7 @@ def main():
     # =========================================================================
 
     print("\n" + "=" * 70)
-    print("MOTOR CORTEX VARIABILITY ANALYSIS")
+    print("MOTOR CORTEX VARIABILITY ANALYSIS (ENHANCED)")
     print("Comparing selected vs non-selected voxels WITHIN motor cortex")
     print("=" * 70)
 
@@ -1058,36 +1412,118 @@ def main():
         selected_motor_vals, nonselected_motor_vals, rng, num_permutations, num_bootstrap
     )
 
-    # Add metadata to summary
+    # =========================================================================
+    # ENHANCED ANALYSES FOR BETTER SEPARATION
+    # =========================================================================
+
+    print("\n--- Computing Enhanced Metrics ---")
+
+    # 1. Log-transformed variability (reduces skewness)
+    log_selected = _log_transform_variability(selected_motor_vals)
+    log_nonselected = _log_transform_variability(nonselected_motor_vals)
+
+    # Effect size on log-transformed data
+    log_cohens_d = _cohens_d(log_selected, log_nonselected)
+    print(f"Log-transformed Cohen's d: {log_cohens_d:.3f} {_interpret_cohens_d(log_cohens_d)}")
+
+    # 2. Rank percentile analysis
+    rank_percentiles, expected_median = _compute_rank_percentiles(
+        selected_motor_vals, nonselected_motor_vals
+    )
+    median_rank = float(np.median(rank_percentiles))
+    frac_below_50 = float(np.mean(rank_percentiles < 50))
+    print(f"Median rank percentile: {median_rank:.1f}% (expected: 50% under null)")
+    print(f"Fraction of selected below 50th percentile: {frac_below_50*100:.1f}%")
+
+    # 3. Matched bootstrap effect size (controls for sample size imbalance)
+    print("Computing matched bootstrap effect sizes...")
+    matched_results = _matched_bootstrap_effect(
+        selected_motor_vals, nonselected_motor_vals,
+        num_bootstrap=num_bootstrap, rng=rng
+    )
+    print(f"Matched Cohen's d: {matched_results['cohens_d_mean']:.3f} "
+          f"[{matched_results['cohens_d_ci_lower']:.3f}, {matched_results['cohens_d_ci_upper']:.3f}]")
+
+    # 4. Stochastic dominance probability
+    p_dominance = _compute_stochastic_dominance(selected_motor_vals, nonselected_motor_vals)
+    print(f"P(Selected < NonSelected): {p_dominance:.3f}")
+
+    # 5. Cliff's delta (non-parametric effect size)
+    cliff_delta = _compute_cliff_delta(selected_motor_vals, nonselected_motor_vals)
+    print(f"Cliff's delta: {cliff_delta:.3f}")
+
+    # 6. Low-variability fraction analysis
+    combined = np.concatenate([selected_motor_vals, nonselected_motor_vals])
+    thresholds = np.percentile(combined, [10, 25, 50, 75])
+    low_var_fractions = _compute_low_variability_fractions(
+        selected_motor_vals, nonselected_motor_vals, thresholds
+    )
+
+    print("\nLow-variability fraction analysis:")
+    print(f"{'Threshold':<12} {'Selected %':<12} {'NonSel %':<12} {'Ratio':<8}")
+    print("-" * 44)
+    for f in low_var_fractions:
+        print(f"{f['threshold']:<12.3f} {f['selected_fraction']*100:<12.1f} "
+              f"{f['nonselected_fraction']*100:<12.1f} {f['fraction_ratio']:<8.2f}")
+
+    # Add enhanced metrics to summary
     motor_summary.update({
-        "analysis_type": "motor_cortex_variability_comparison",
+        "analysis_type": "motor_cortex_variability_comparison_enhanced",
         "metric": "standard_deviation" if use_std else "variance",
         "run_list": runs,
         "trial_len": args.trial_len,
         "total_trials_used": int(total_used),
         "num_permutations": num_permutations,
         "num_bootstrap": num_bootstrap,
-        "selected_motor_indices": selected_motor_idx.tolist(),
-        "nonselected_motor_indices": nonselected_motor_idx.tolist(),
+        # Enhanced metrics
+        "log_cohens_d": float(log_cohens_d),
+        "median_rank_percentile": median_rank,
+        "frac_below_50th_percentile": frac_below_50,
+        "stochastic_dominance": float(p_dominance),
+        "cliff_delta": float(cliff_delta),
+        "matched_cohens_d_mean": matched_results['cohens_d_mean'],
+        "matched_cohens_d_ci_lower": matched_results['cohens_d_ci_lower'],
+        "matched_cohens_d_ci_upper": matched_results['cohens_d_ci_upper'],
+        "matched_mean_diff": matched_results['mean_diff_mean'],
+        "matched_median_diff": matched_results['median_diff_mean'],
+        "low_variability_fractions": low_var_fractions,
     })
 
-    # Save motor cortex comparison results
+    # Save motor cortex comparison results (without large index arrays for JSON)
     motor_summary_path = out_dir / f"{output_tag}_motor_variability_summary.json"
     with open(motor_summary_path, "w", encoding="utf-8") as handle:
         # Convert numpy arrays to lists for JSON serialization
         summary_for_json = {k: v for k, v in motor_summary.items()
                            if not isinstance(v, np.ndarray)}
+        # Don't save huge index lists to JSON
+        if "selected_motor_indices" in summary_for_json:
+            summary_for_json["selected_motor_indices_count"] = len(selected_motor_idx)
+            del summary_for_json["selected_motor_indices"]
+        if "nonselected_motor_indices" in summary_for_json:
+            summary_for_json["nonselected_motor_indices_count"] = len(nonselected_motor_idx)
+            del summary_for_json["nonselected_motor_indices"]
         json.dump(summary_for_json, handle, indent=2)
     print(f"Saved motor cortex summary: {motor_summary_path}")
 
-    # Create comprehensive multi-panel figure
+    # Create comprehensive multi-panel figure (ORIGINAL)
     motor_fig_path = out_dir / f"{output_tag}_motor_variability_figure.png"
     _plot_comprehensive_figure(
         selected_motor_vals, nonselected_motor_vals,
         motor_summary, motor_perm_results,
         motor_fig_path, use_std=use_std
     )
-    print(f"Saved motor cortex figure: {motor_fig_path}")
+    print(f"Saved motor cortex figure (original): {motor_fig_path}")
+
+    # Create ENHANCED multi-panel figure with better separation visualization
+    enhanced_fig_path = out_dir / f"{output_tag}_motor_variability_enhanced.png"
+    _plot_enhanced_figure(
+        selected_motor_vals, nonselected_motor_vals,
+        motor_summary, motor_perm_results,
+        log_selected, log_nonselected, rank_percentiles,
+        matched_results, low_var_fractions,
+        enhanced_fig_path, use_std=use_std
+    )
+    print(f"Saved enhanced motor cortex figure: {enhanced_fig_path}")
 
     # Save detailed data for reproducibility
     motor_data_path = out_dir / f"{output_tag}_motor_variability_data.npz"
@@ -1099,34 +1535,78 @@ def main():
         nonselected_motor_indices=nonselected_motor_idx,
         null_diffs=motor_perm_results["null_diffs"],
         null_selected_means=motor_perm_results["null_selected_means"],
+        log_selected=log_selected,
+        log_nonselected=log_nonselected,
+        rank_percentiles=rank_percentiles,
+        matched_cohens_ds=matched_results['cohens_ds'],
     )
     print(f"Saved motor cortex data: {motor_data_path}")
 
     # Print summary
-    print("\n" + "-" * 50)
-    print("MOTOR CORTEX ANALYSIS RESULTS:")
-    print("-" * 50)
+    print("\n" + "=" * 70)
+    print("MOTOR CORTEX ANALYSIS RESULTS (ENHANCED):")
+    print("=" * 70)
     metric_name = "Std Dev" if use_std else "Variance"
-    print(f"Selected motor voxels:     n={motor_summary['selected_motor_count']}, "
+    print(f"\n{'BASIC STATISTICS:'}")
+    print(f"  Selected motor voxels:     n={motor_summary['selected_motor_count']}, "
           f"mean {metric_name}={motor_summary['selected_mean']:.4f}")
-    print(f"Non-selected motor voxels: n={motor_summary['nonselected_motor_count']}, "
+    print(f"  Non-selected motor voxels: n={motor_summary['nonselected_motor_count']}, "
           f"mean {metric_name}={motor_summary['nonselected_mean']:.4f}")
-    print(f"Mean difference: {motor_summary['mean_diff']:.4f} ({motor_summary['mean_diff_pct']:.1f}%)")
-    print(f"Cohen's d: {motor_summary['cohens_d']:.3f} {_interpret_cohens_d(motor_summary['cohens_d'])}")
-    print(f"Mann-Whitney U p-value: {motor_summary['mannwhitney_pvalue']:.2e}")
-    print(f"Permutation test p-value: {motor_summary['perm_p_value']:.2e}")
-    print(f"Percentile rank in null: {motor_summary['perm_percentile']:.1f}%")
-    print(f"95% CI overlap: {'No' if motor_summary['ci_no_overlap'] else 'Yes'}")
-    print("-" * 50)
+    print(f"  Mean difference: {motor_summary['mean_diff']:.4f} ({motor_summary['mean_diff_pct']:.1f}%)")
 
-    if motor_summary['perm_p_value'] < 0.05:
-        print("\n✓ CONCLUSION: Selected motor voxels show significantly lower "
+    print(f"\n{'EFFECT SIZES:'}")
+    print(f"  Cohen's d (raw):           {motor_summary['cohens_d']:.3f} {_interpret_cohens_d(motor_summary['cohens_d'])}")
+    print(f"  Cohen's d (log-transform): {log_cohens_d:.3f} {_interpret_cohens_d(log_cohens_d)}")
+    print(f"  Cohen's d (matched boot):  {matched_results['cohens_d_mean']:.3f} [{matched_results['cohens_d_ci_lower']:.3f}, {matched_results['cohens_d_ci_upper']:.3f}]")
+    print(f"  Cliff's delta:             {cliff_delta:.3f}")
+    print(f"  Stochastic dominance:      {p_dominance:.3f} (P that selected < nonselected)")
+
+    print(f"\n{'RANK-BASED ANALYSIS:'}")
+    print(f"  Median rank percentile:    {median_rank:.1f}% (expected: 50% under null)")
+    print(f"  % below 50th percentile:   {frac_below_50*100:.1f}% (expected: 50% under null)")
+
+    print(f"\n{'STATISTICAL TESTS:'}")
+    print(f"  Mann-Whitney U p-value:    {motor_summary['mannwhitney_pvalue']:.2e}")
+    print(f"  Permutation test p-value:  {motor_summary['perm_p_value']:.2e}")
+    print(f"  Percentile rank in null:   {motor_summary['perm_percentile']:.1f}%")
+    print(f"  95% CI overlap:            {'No' if motor_summary['ci_no_overlap'] else 'Yes'}")
+
+    print("\n" + "=" * 70)
+
+    # Determine conclusion based on multiple metrics
+    strong_evidence = (
+        motor_summary['perm_p_value'] < 0.05 and
+        frac_below_50 > 0.60 and  # At least 60% below median
+        p_dominance > 0.55  # More than random chance
+    )
+
+    moderate_evidence = (
+        motor_summary['perm_p_value'] < 0.05 and
+        (frac_below_50 > 0.55 or p_dominance > 0.52)
+    )
+
+    if strong_evidence:
+        print("\n✓ STRONG EVIDENCE: Selected motor voxels show substantially lower "
               "trial-to-trial variability than non-selected motor voxels.")
-        print("  This supports the claim that the optimization selects stable, "
+        print("  - Multiple metrics converge to support the claim")
+        print("  - Effect is visible in rank-based and distribution-free measures")
+        print("  This strongly supports the claim that the optimization selects stable, "
               "reliable voxels rather than noise.")
+    elif moderate_evidence:
+        print("\n○ MODERATE EVIDENCE: Selected motor voxels tend to have lower "
+              "trial-to-trial variability than non-selected motor voxels.")
+        print("  - Statistical significance is present")
+        print("  - Effect size is modest but consistent")
+        print("  The optimization appears to preferentially select more stable voxels.")
     else:
-        print("\n⚠ WARNING: The difference in variability is not statistically significant.")
+        print("\n⚠ LIMITED EVIDENCE: The difference in variability is weak or inconsistent.")
         print("  Consider investigating potential issues with the optimization or data.")
+        print("  Suggestions:")
+        print("  - Check if the voxel selection criteria in main_second_obj_25.py")
+        print("    actually penalize high-variability voxels")
+        print("  - Verify that the BOLD signal reconstruction is correct")
+        print("  - Consider whether other factors (e.g., spatial smoothness) may")
+        print("    be driving the selection more than temporal stability")
 
 
 if __name__ == "__main__":
