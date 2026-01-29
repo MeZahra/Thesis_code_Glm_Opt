@@ -1,24 +1,4 @@
 #!/usr/bin/env python3
-"""
-Variability Analysis for Voxel Selection Validation
-
-This script demonstrates that voxels selected by the optimization algorithm
-exhibit significantly lower trial-to-trial variability than non-selected voxels
-within the same anatomical region (motor cortex).
-
-Key analyses:
-1. Compare selected vs non-selected motor cortex voxels
-2. Permutation test with null distribution
-3. Bootstrap confidence intervals
-4. Multi-panel publication-quality figure
-
-Enhanced analyses (v2):
-5. Log-transformed variability for better separation
-6. Rank-based comparison within motor cortex
-7. Matched bootstrap resampling for robust effect estimation
-8. Cumulative distribution function comparison
-9. Low-variability fraction analysis
-"""
 import argparse
 import json
 import re

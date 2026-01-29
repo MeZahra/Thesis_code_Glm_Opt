@@ -1623,18 +1623,15 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
 # # %%
 ridge_penalty = 1e-3
 solver_name = "MOSEK"
-# penalty_sweep = [(0.8, 1, 0.5, 1.2, 1.0), (0, 1, 0.5, 1.2, 1.0), (0.8, 0, 0.5, 1.2, 1.0), (0.8, 1, 0, 1.2, 1.0), (0.8, 1, 0.5, 0, 1.0)]
-# penalty_sweep = [(0.8, 0, 0, 0, 1.0), (0, 0.8, 0, 0, 1.0), (0, 0, 0.5, 0, 1.0), (0, 0, 0, 1, 1.0), (0.8, 0.8, 0.5, 1, 1.0)]
-# penalty_sweep = [(0.8, 0, 0, 0, 0), (0, 1, 0, 0, 0), (0, 0, 0.5, 0, 0), (0, 0, 0, 1.2, 0)] #for sub09
-# penalty_sweep = [(0.8, 1, 0.5, 1.2, 1.0)] #for sub09
-penalty_sweep = [(0.8, 0, 0.5, 1.2, 1.0), (0.8, 1, 0, 1.2, 1.0), (0.8, 1, 0.5, 0, 1.0), (0.8, 1, 0.5, 1.2, 0)] #for sub09
-# penalty_sweep = [(0.5, 0.8, 0.3, 1.5, 1.0), (1.0, 2.0, 1.0, 3.0, 1.0)] #for sub10
-# penalty_sweep = [(0.8, 1, 0.5, 1.2, 1.0)]
+# penalty_sweep = [(0.8, 1, 0.5, 1.2, 1.0)] #for sub09   gamma = 1.5
+# penalty_sweep = [(0.8, 1.5, 0.8, 2, 1.0)] #for sub10  gamma = 1.5
+# penalty_sweep = [(1, 2, 1, 3, 1.0)] #for sub10  gamma = 2
+penalty_sweep = [(0.8, 1.5, 0.8, 2, 1.0), (0, 1.5, 0.8, 2, 1.0), (0.8, 0, 0.8, 2, 1.0), (0.8, 1.5, 0, 2, 1.0), 
+                 (0.8, 1.5, 0.8, 0, 1.0), (0.8, 0, 0, 0, 1.0), (0, 1.5, 0, 0, 1.0), (0, 0, 0.8, 0, 1.0), (0, 0, 0, 2, 1.0)] #for sub10
+
 alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha,
     "smooth_penalty": smooth_alpha, "corr_weight": corr_weight}
     for task_alpha, bold_alpha, beta_alpha, smooth_alpha, corr_weight in penalty_sweep]
-# gamma_sweep = [0, 0.2, 0.8]
-# gamma_sweep = [1, 2]
 gamma_sweep= [1.5]
 # SAVE_PER_FOLD_VOXEL_MAPS = False  # disable individual fold voxel-weight plots; averages saved later
 
