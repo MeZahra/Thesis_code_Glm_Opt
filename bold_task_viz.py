@@ -918,7 +918,7 @@ def _plot_enhanced_figure(
     + Statistical summary table
     """
     fig = plt.figure(figsize=(14, 8))
-    gs = GridSpec(2, 3, figure=fig, hspace=0.35, wspace=0.30,
+    gs = GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.30,
                   height_ratios=[1, 0.7])
 
     metric_label = "Std Dev" if use_std else "Variance"
@@ -987,10 +987,11 @@ def _plot_enhanced_figure(
             bar.set_color(nonsel_color)
             bar.set_alpha(0.5)
 
-    ax_enrich.set_xlabel("Variability Percentile Threshold", fontsize=11)
+    ax_enrich.set_xlabel("Variability Percentile Threshold", fontsize=11, labelpad=8)
     ax_enrich.set_ylabel("Enrichment Ratio\n(Selected / Non-selected)", fontsize=11)
     ax_enrich.set_xticks(percentile_thresholds)
-    ax_enrich.set_xticklabels([f'{p}%' for p in percentile_thresholds], fontsize=9)
+    ax_enrich.set_xticklabels([f"{p}%" for p in percentile_thresholds], fontsize=9, rotation=0, ha="center")
+    ax_enrich.tick_params(axis="x", pad=6)
     ax_enrich.legend(loc='upper right', fontsize=9)
     ax_enrich.spines['top'].set_visible(False)
     ax_enrich.spines['right'].set_visible(False)
