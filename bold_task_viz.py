@@ -23,6 +23,8 @@ if str(GLMSINGLE_ROOT) not in sys.path:
 
 from glmsingle.design.convolve_design import convolve_design
 
+SMALL_N_THRESHOLD = 20
+BALANCED_CI_LEVEL = 0.95
 
 _SUBJECT_ID_RE = re.compile(r"sub(\d)(?!\d)")
 
@@ -330,6 +332,179 @@ def _cohens_d(sample_a, sample_b):
     return (mean_a - mean_b) / np.sqrt(pooled)
 
 
+def _hedges_g(sample_a, sample_b):
+    """Compute Hedges' g (small-sample corrected) effect size."""
+    d = _cohens_d(sample_a, sample_b)
+    if not np.isfinite(d):
+        return float("nan")
+    n_a = int(sample_a.size)
+    n_b = int(sample_b.size)
+    denom = 4 * (n_a + n_b) - 9
+    if denom <= 0:
+        return float("nan")
+    correction = 1.0 - 3.0 / denom
+    return d * correction
+
+
+def _auc_from_samples(sample_a, sample_b):
+    """Compute AUC = P(A > B) + 0.5 * P(A == B) via rank sums."""
+    n_a = int(sample_a.size)
+    n_b = int(sample_b.size)
+    if n_a == 0 or n_b == 0:
+        return float("nan")
+    combined = np.concatenate([sample_a, sample_b])
+    ranks = stats.rankdata(combined, method="average")
+    rank_a = float(np.sum(ranks[:n_a]))
+    u_stat = rank_a - n_a * (n_a + 1) / 2.0
+    return u_stat / (n_a * n_b)
+
+
+def _summarize_distribution(dist, ci_level=BALANCED_CI_LEVEL):
+    """Summarize a distribution with median and percentile CI."""
+    dist = np.asarray(dist, dtype=np.float64)
+    dist = dist[np.isfinite(dist)]
+    if dist.size == 0:
+        return {
+            "median": float("nan"),
+            "ci_lower": float("nan"),
+            "ci_upper": float("nan"),
+            "n": 0,
+        }
+    alpha = 1.0 - ci_level
+    lower = np.percentile(dist, 100 * alpha / 2.0)
+    upper = np.percentile(dist, 100 * (1.0 - alpha / 2.0))
+    return {
+        "median": float(np.median(dist)),
+        "ci_lower": float(lower),
+        "ci_upper": float(upper),
+        "n": int(dist.size),
+    }
+
+
+def _balanced_resample_stats(
+    selected_vals,
+    nonselected_vals,
+    rng,
+    num_resamples,
+    small_n_threshold=SMALL_N_THRESHOLD,
+    ci_level=BALANCED_CI_LEVEL,
+):
+    """Balanced resampling with fixed n to reduce sample-size sensitivity."""
+    n_selected = int(selected_vals.size)
+    n_nonselected = int(nonselected_vals.size)
+    n_balanced = int(min(n_selected, n_nonselected))
+    effect_label = "hedges_g" if n_selected < small_n_threshold else "cohens_d"
+
+    summary = {
+        "balanced_n": n_balanced,
+        "balanced_num_resamples": int(num_resamples),
+        "balanced_effect_size_label": effect_label,
+        "balanced_ci_level": float(ci_level),
+        "balanced_small_n_threshold": int(small_n_threshold),
+    }
+
+    if n_balanced < 2 or num_resamples <= 0:
+        nan_fields = [
+            "balanced_mean_diff_median",
+            "balanced_mean_diff_ci_lower",
+            "balanced_mean_diff_ci_upper",
+            "balanced_median_diff_median",
+            "balanced_median_diff_ci_lower",
+            "balanced_median_diff_ci_upper",
+            "balanced_cohens_d_median",
+            "balanced_cohens_d_ci_lower",
+            "balanced_cohens_d_ci_upper",
+            "balanced_hedges_g_median",
+            "balanced_hedges_g_ci_lower",
+            "balanced_hedges_g_ci_upper",
+            "balanced_effect_size_median",
+            "balanced_effect_size_ci_lower",
+            "balanced_effect_size_ci_upper",
+            "balanced_cliff_delta_median",
+            "balanced_cliff_delta_ci_lower",
+            "balanced_cliff_delta_ci_upper",
+            "balanced_auc_selected_lower_median",
+            "balanced_auc_selected_lower_ci_lower",
+            "balanced_auc_selected_lower_ci_upper",
+        ]
+        for key in nan_fields:
+            summary[key] = float("nan")
+        empty = np.array([], dtype=np.float64)
+        distributions = {
+            "mean_diff": empty,
+            "median_diff": empty,
+            "cohens_d": empty,
+            "hedges_g": empty,
+            "cliff_delta": empty,
+            "auc_selected_lower": empty,
+        }
+        return summary, distributions
+
+    mean_diffs = np.empty(num_resamples, dtype=np.float64)
+    median_diffs = np.empty(num_resamples, dtype=np.float64)
+    cohens_ds = np.empty(num_resamples, dtype=np.float64)
+    hedges_gs = np.empty(num_resamples, dtype=np.float64)
+    cliff_deltas = np.empty(num_resamples, dtype=np.float64)
+    auc_lowers = np.empty(num_resamples, dtype=np.float64)
+
+    for idx in range(num_resamples):
+        sel_sample = rng.choice(selected_vals, size=n_balanced, replace=True)
+        nonsel_sample = rng.choice(nonselected_vals, size=n_balanced, replace=True)
+        mean_diffs[idx] = np.mean(sel_sample) - np.mean(nonsel_sample)
+        median_diffs[idx] = np.median(sel_sample) - np.median(nonsel_sample)
+        cohens_ds[idx] = _cohens_d(sel_sample, nonsel_sample)
+        hedges_gs[idx] = _hedges_g(sel_sample, nonsel_sample)
+        auc_high = _auc_from_samples(sel_sample, nonsel_sample)
+        auc_lowers[idx] = 1.0 - auc_high
+        cliff_deltas[idx] = 2.0 * auc_high - 1.0
+
+    mean_summary = _summarize_distribution(mean_diffs, ci_level=ci_level)
+    median_summary = _summarize_distribution(median_diffs, ci_level=ci_level)
+    cohens_summary = _summarize_distribution(cohens_ds, ci_level=ci_level)
+    hedges_summary = _summarize_distribution(hedges_gs, ci_level=ci_level)
+    cliff_summary = _summarize_distribution(cliff_deltas, ci_level=ci_level)
+    auc_summary = _summarize_distribution(auc_lowers, ci_level=ci_level)
+
+    if effect_label == "hedges_g":
+        effect_summary = hedges_summary
+    else:
+        effect_summary = cohens_summary
+
+    summary.update({
+        "balanced_mean_diff_median": mean_summary["median"],
+        "balanced_mean_diff_ci_lower": mean_summary["ci_lower"],
+        "balanced_mean_diff_ci_upper": mean_summary["ci_upper"],
+        "balanced_median_diff_median": median_summary["median"],
+        "balanced_median_diff_ci_lower": median_summary["ci_lower"],
+        "balanced_median_diff_ci_upper": median_summary["ci_upper"],
+        "balanced_cohens_d_median": cohens_summary["median"],
+        "balanced_cohens_d_ci_lower": cohens_summary["ci_lower"],
+        "balanced_cohens_d_ci_upper": cohens_summary["ci_upper"],
+        "balanced_hedges_g_median": hedges_summary["median"],
+        "balanced_hedges_g_ci_lower": hedges_summary["ci_lower"],
+        "balanced_hedges_g_ci_upper": hedges_summary["ci_upper"],
+        "balanced_effect_size_median": effect_summary["median"],
+        "balanced_effect_size_ci_lower": effect_summary["ci_lower"],
+        "balanced_effect_size_ci_upper": effect_summary["ci_upper"],
+        "balanced_cliff_delta_median": cliff_summary["median"],
+        "balanced_cliff_delta_ci_lower": cliff_summary["ci_lower"],
+        "balanced_cliff_delta_ci_upper": cliff_summary["ci_upper"],
+        "balanced_auc_selected_lower_median": auc_summary["median"],
+        "balanced_auc_selected_lower_ci_lower": auc_summary["ci_lower"],
+        "balanced_auc_selected_lower_ci_upper": auc_summary["ci_upper"],
+    })
+
+    distributions = {
+        "mean_diff": mean_diffs,
+        "median_diff": median_diffs,
+        "cohens_d": cohens_ds,
+        "hedges_g": hedges_gs,
+        "cliff_delta": cliff_deltas,
+        "auc_selected_lower": auc_lowers,
+    }
+
+    return summary, distributions
+
 def _resample_control_means(control_values, target_size, num_resamples, rng):
     """Resample control means for a null distribution."""
     if num_resamples <= 0:
@@ -342,8 +517,51 @@ def _resample_control_means(control_values, target_size, num_resamples, rng):
     return means
 
 
+def _size_matched_resample_summary(
+    selected_vals,
+    nonselected_vals,
+    rng,
+    num_resamples,
+    ci_level=BALANCED_CI_LEVEL,
+):
+    """Size-matched resampling summary using mean variance for non-selected voxels."""
+    n_selected = int(selected_vals.size)
+    n_nonselected = int(nonselected_vals.size)
+    observed_selected_mean = float(np.mean(selected_vals)) if n_selected else float("nan")
+
+    resampled_means = _resample_control_means(nonselected_vals, n_selected, num_resamples, rng)
+    resample_summary = _summarize_distribution(resampled_means, ci_level=ci_level)
+
+    if resampled_means.size:
+        fraction_greater = float(np.mean(resampled_means > observed_selected_mean))
+        percentile = float(stats.percentileofscore(resampled_means, observed_selected_mean, kind="mean"))
+        resampled_mean = float(np.mean(resampled_means))
+    else:
+        fraction_greater = float("nan")
+        percentile = float("nan")
+        resampled_mean = float("nan")
+
+    summary = {
+        "selected_count": n_selected,
+        "nonselected_count": n_nonselected,
+        "resample_size": n_selected,
+        "num_resamples": int(num_resamples),
+        "resample_ci_level": float(ci_level),
+        "observed_selected_mean": observed_selected_mean,
+        "nonselected_resample_mean_mean": resampled_mean,
+        "nonselected_resample_mean_median": resample_summary["median"],
+        "nonselected_resample_mean_ci_lower": resample_summary["ci_lower"],
+        "nonselected_resample_mean_ci_upper": resample_summary["ci_upper"],
+        "fraction_nonselected_mean_greater": fraction_greater,
+        "percentile_selected_in_nonselected": percentile,
+        "resample_with_replacement": bool(n_nonselected < n_selected),
+    }
+
+    return summary, resampled_means
+
+
 def _compare_groups(selected_vals, motor_vals, rng, num_resamples):
-    """Compute statistics and resampling-based sanity checks."""
+    """Compute summary statistics with balanced resampling for uncertainty."""
     summary = {
         "selected_count": int(selected_vals.size),
         "motor_count": int(motor_vals.size),
@@ -355,44 +573,32 @@ def _compare_groups(selected_vals, motor_vals, rng, num_resamples):
         "motor_std": float(np.std(motor_vals, ddof=1)) if motor_vals.size > 1 else float("nan"),
     }
     summary["mean_diff"] = summary["selected_mean"] - summary["motor_mean"]
+    summary["mean_diff_pct"] = (
+        100 * summary["mean_diff"] / summary["motor_mean"] if summary["motor_mean"] != 0 else float("nan")
+    )
 
-    ttest = stats.ttest_ind(selected_vals, motor_vals, equal_var=False, nan_policy="omit")
-    summary["t_stat"] = float(ttest.statistic) if np.isfinite(ttest.statistic) else float("nan")
-    summary["p_two_sided"] = float(ttest.pvalue) if np.isfinite(ttest.pvalue) else float("nan")
-    if np.isfinite(summary["t_stat"]) and np.isfinite(summary["p_two_sided"]):
-        summary["p_one_sided"] = summary["p_two_sided"] / 2.0 if summary["t_stat"] > 0 else 1.0 - summary["p_two_sided"] / 2.0
-    else:
-        summary["p_one_sided"] = float("nan")
+    cohens_d = _cohens_d(selected_vals, motor_vals)
+    hedges_g = _hedges_g(selected_vals, motor_vals)
+    effect_label = "hedges_g" if selected_vals.size < SMALL_N_THRESHOLD else "cohens_d"
+    effect_value = hedges_g if effect_label == "hedges_g" else cohens_d
 
-    summary["cohens_d"] = _cohens_d(selected_vals, motor_vals)
+    auc_high = _auc_from_samples(selected_vals, motor_vals)
+    auc_selected_lower = 1.0 - auc_high
+    cliff_delta = 2.0 * auc_high - 1.0
 
-    ks = stats.ks_2samp(selected_vals, motor_vals, alternative="two-sided", mode="auto")
-    summary["ks_stat"] = float(ks.statistic)
-    summary["ks_pvalue"] = float(ks.pvalue)
+    balanced_summary, balanced_dists = _balanced_resample_stats(
+        selected_vals, motor_vals, rng, num_resamples, small_n_threshold=SMALL_N_THRESHOLD
+    )
 
-    resample_means = _resample_control_means(motor_vals, selected_vals.size, num_resamples, rng)
-    if resample_means.size:
-        resample_mean = float(np.mean(resample_means))
-        resample_std = float(np.std(resample_means, ddof=1)) if resample_means.size > 1 else float("nan")
-        diff = summary["selected_mean"] - summary["motor_mean"]
-        if diff >= 0:
-            p_one = (np.sum(resample_means >= summary["selected_mean"]) + 1) / (resample_means.size + 1)
-        else:
-            p_one = (np.sum(resample_means <= summary["selected_mean"]) + 1) / (resample_means.size + 1)
-        p_two = (np.sum(np.abs(resample_means - summary["motor_mean"]) >= abs(diff)) + 1) / (resample_means.size + 1)
-        percentile = float(stats.percentileofscore(resample_means, summary["selected_mean"], kind="mean"))
-    else:
-        resample_mean = float("nan")
-        resample_std = float("nan")
-        p_one = float("nan")
-        p_two = float("nan")
-        percentile = float("nan")
-
-    summary["resample_mean"] = resample_mean
-    summary["resample_std"] = resample_std
-    summary["resample_p_one_sided"] = float(p_one)
-    summary["resample_p_two_sided"] = float(p_two)
-    summary["resample_selected_percentile"] = percentile
+    summary.update({
+        "cohens_d": float(cohens_d),
+        "hedges_g": float(hedges_g),
+        "effect_size_label": effect_label,
+        "effect_size_value": float(effect_value),
+        "auc_selected_lower": float(auc_selected_lower),
+        "cliff_delta": float(cliff_delta),
+    })
+    summary.update(balanced_summary)
 
     motor_std = summary["motor_std"]
     if np.isfinite(motor_std) and motor_std > 0:
@@ -400,10 +606,10 @@ def _compare_groups(selected_vals, motor_vals, rng, num_resamples):
     else:
         summary["selected_mean_z"] = float("nan")
 
-    return summary, resample_means
+    return summary, balanced_dists
 
 
-def _compute_motor_cortex_comparison(voxel_var_flat, selected_indices, motor_indices, use_std=True):
+def _compute_motor_cortex_comparison(voxel_var_flat, selected_indices, motor_indices):
     """
     Compute variability comparison within motor cortex only.
 
@@ -425,11 +631,6 @@ def _compute_motor_cortex_comparison(voxel_var_flat, selected_indices, motor_ind
     # Filter to finite values
     selected_motor_vals = selected_motor_vals[np.isfinite(selected_motor_vals)]
     nonselected_motor_vals = nonselected_motor_vals[np.isfinite(nonselected_motor_vals)]
-
-    # Convert to standard deviation if requested (more interpretable)
-    if use_std:
-        selected_motor_vals = np.sqrt(np.maximum(selected_motor_vals, 0))
-        nonselected_motor_vals = np.sqrt(np.maximum(nonselected_motor_vals, 0))
 
     return selected_motor_vals, nonselected_motor_vals, selected_motor, nonselected_motor
 
@@ -503,8 +704,8 @@ def _bootstrap_ci(values, num_bootstrap, rng, ci_level=0.95, statistic="mean"):
     return float(lower), float(upper), bootstrap_stats
 
 
-def _compare_motor_groups(selected_vals, nonselected_vals, rng, num_permutations, num_bootstrap):
-    """Comprehensive comparison of selected vs non-selected motor cortex voxels."""
+def _compare_motor_groups(selected_vals, nonselected_vals, rng, num_resamples):
+    """Comprehensive comparison with balanced resampling summaries."""
     summary = {
         "selected_motor_count": int(selected_vals.size),
         "nonselected_motor_count": int(nonselected_vals.size),
@@ -516,71 +717,59 @@ def _compare_motor_groups(selected_vals, nonselected_vals, rng, num_permutations
         "nonselected_std": float(np.std(nonselected_vals, ddof=1)) if nonselected_vals.size > 1 else float("nan"),
     }
 
-    # Difference in means
     summary["mean_diff"] = summary["selected_mean"] - summary["nonselected_mean"]
-    summary["mean_diff_pct"] = 100 * summary["mean_diff"] / summary["nonselected_mean"] if summary["nonselected_mean"] != 0 else float("nan")
+    summary["mean_diff_pct"] = (
+        100 * summary["mean_diff"] / summary["nonselected_mean"]
+        if summary["nonselected_mean"] != 0
+        else float("nan")
+    )
 
-    # Cohen's d effect size
-    summary["cohens_d"] = _cohens_d(selected_vals, nonselected_vals)
+    cohens_d = _cohens_d(selected_vals, nonselected_vals)
+    hedges_g = _hedges_g(selected_vals, nonselected_vals)
+    effect_label = "hedges_g" if selected_vals.size < SMALL_N_THRESHOLD else "cohens_d"
+    effect_value = hedges_g if effect_label == "hedges_g" else cohens_d
 
-    # Welch's t-test (parametric)
-    ttest = stats.ttest_ind(selected_vals, nonselected_vals, equal_var=False, nan_policy="omit")
-    summary["t_stat"] = float(ttest.statistic) if np.isfinite(ttest.statistic) else float("nan")
-    summary["t_pvalue_two_sided"] = float(ttest.pvalue) if np.isfinite(ttest.pvalue) else float("nan")
-    # One-sided p-value (selected < nonselected)
-    if np.isfinite(summary["t_stat"]):
-        summary["t_pvalue_one_sided"] = summary["t_pvalue_two_sided"] / 2.0 if summary["t_stat"] < 0 else 1.0 - summary["t_pvalue_two_sided"] / 2.0
-    else:
-        summary["t_pvalue_one_sided"] = float("nan")
+    auc_high = _auc_from_samples(selected_vals, nonselected_vals)
+    auc_selected_lower = 1.0 - auc_high
+    cliff_delta = 2.0 * auc_high - 1.0
 
-    # Mann-Whitney U test (non-parametric)
-    mwu = stats.mannwhitneyu(selected_vals, nonselected_vals, alternative="less")
-    summary["mannwhitney_u"] = float(mwu.statistic)
-    summary["mannwhitney_pvalue"] = float(mwu.pvalue)
+    balanced_summary, balanced_dists = _balanced_resample_stats(
+        selected_vals, nonselected_vals, rng, num_resamples, small_n_threshold=SMALL_N_THRESHOLD
+    )
 
-    # Kolmogorov-Smirnov test
-    ks = stats.ks_2samp(selected_vals, nonselected_vals, alternative="two-sided")
-    summary["ks_stat"] = float(ks.statistic)
-    summary["ks_pvalue"] = float(ks.pvalue)
+    summary.update({
+        "cohens_d": float(cohens_d),
+        "hedges_g": float(hedges_g),
+        "effect_size_label": effect_label,
+        "effect_size_value": float(effect_value),
+        "auc_selected_lower": float(auc_selected_lower),
+        "cliff_delta": float(cliff_delta),
+    })
+    summary.update(balanced_summary)
 
-    # Permutation test
-    perm_results = _permutation_test(selected_vals, nonselected_vals, num_permutations, rng, statistic="mean")
-    summary["perm_p_value"] = perm_results["p_value_one_sided"]
-    summary["perm_percentile"] = perm_results["percentile_rank"]
-
-    # Bootstrap confidence intervals
-    sel_lower, sel_upper, _ = _bootstrap_ci(selected_vals, num_bootstrap, rng, ci_level=0.95)
-    nonsel_lower, nonsel_upper, _ = _bootstrap_ci(nonselected_vals, num_bootstrap, rng, ci_level=0.95)
-    summary["selected_ci_lower"] = sel_lower
-    summary["selected_ci_upper"] = sel_upper
-    summary["nonselected_ci_lower"] = nonsel_lower
-    summary["nonselected_ci_upper"] = nonsel_upper
-
-    # Check if CIs overlap (no overlap = strong separation)
-    summary["ci_no_overlap"] = sel_upper < nonsel_lower or nonsel_upper < sel_lower
-
-    return summary, perm_results
+    return summary, balanced_dists
 
 
 def _plot_comprehensive_figure(
-    selected_vals, nonselected_vals, summary, perm_results, out_path, use_std=True
+    selected_vals, nonselected_vals, summary, resampled_means, out_path
 ):
     """
     Create a publication-quality multi-panel figure demonstrating voxel selection validity.
 
     Panel A: KDE density comparison
-    Panel B: Permutation null distribution with observed value
+    Panel B: Size-matched resampling distribution (non-selected)
     Panel C: Summary statistics box
     """
     fig = plt.figure(figsize=(12, 8))
     gs = GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.25, height_ratios=[1.2, 1])
 
-    metric_label = "Standard Deviation" if use_std else "Variance"
-
     # Color scheme
     sel_color = "#E63946"  # Red for selected
     nonsel_color = "#457B9D"  # Blue for non-selected
     null_color = "#A8DADC"  # Light blue for null distribution
+
+    selected_mean = summary.get("selected_mean_variance", summary.get("selected_mean", float("nan")))
+    nonselected_mean = summary.get("nonselected_mean_variance", summary.get("nonselected_mean", float("nan")))
 
     # ===== Panel A: KDE Density Comparison =====
     ax_kde = fig.add_subplot(gs[0, 0])
@@ -606,10 +795,10 @@ def _plot_comprehensive_figure(
     ax_kde.plot(grid, nonsel_kde(grid), color=nonsel_color, linewidth=2)
 
     # Add mean lines
-    ax_kde.axvline(summary["selected_mean"], color=sel_color, linestyle="--", linewidth=1.5, alpha=0.8)
-    ax_kde.axvline(summary["nonselected_mean"], color=nonsel_color, linestyle="--", linewidth=1.5, alpha=0.8)
+    ax_kde.axvline(selected_mean, color=sel_color, linestyle="--", linewidth=1.5, alpha=0.8)
+    ax_kde.axvline(nonselected_mean, color=nonsel_color, linestyle="--", linewidth=1.5, alpha=0.8)
 
-    ax_kde.set_xlabel(f"Trial-to-Trial {metric_label}", fontsize=11)
+    ax_kde.set_xlabel("Trial-to-Trial Variance", fontsize=11)
     ax_kde.set_ylabel("Density", fontsize=11)
     ax_kde.set_title("A. Variability Distributions in Motor Cortex", fontsize=12, fontweight="bold")
     ax_kde.legend(loc="upper right", fontsize=9)
@@ -617,28 +806,30 @@ def _plot_comprehensive_figure(
     ax_kde.spines["top"].set_visible(False)
     ax_kde.spines["right"].set_visible(False)
 
-    # ===== Panel B: Permutation Null Distribution =====
+    # ===== Panel B: Size-matched Resampling Distribution =====
     ax_perm = fig.add_subplot(gs[0, 1])
 
-    null_means = perm_results["null_selected_means"]
-    observed = perm_results["observed_selected_stat"]
+    if resampled_means.size:
+        ax_perm.hist(resampled_means, bins=50, color=null_color, edgecolor="white", alpha=0.8, density=True)
+        median = summary["nonselected_resample_mean_median"]
+        ci_low = summary["nonselected_resample_mean_ci_lower"]
+        ci_high = summary["nonselected_resample_mean_ci_upper"]
+        observed = summary["observed_selected_mean"]
+        ax_perm.axvline(observed, color=sel_color, linewidth=2.5, linestyle="--", label=f"Selected mean = {observed:.4f}")
+        ax_perm.axvline(median, color="gray", linewidth=1.5, linestyle="-", label="Resample median")
+        ax_perm.axvline(ci_low, color="gray", linewidth=1.5, linestyle="--")
+        ax_perm.axvline(ci_high, color="gray", linewidth=1.5, linestyle="--", label="95% CI")
+        textstr = f"n={summary['resample_size']}\nB={summary['num_resamples']}"
+        props = dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="gray")
+        ax_perm.text(0.95, 0.95, textstr, transform=ax_perm.transAxes, fontsize=10,
+                     verticalalignment="top", horizontalalignment="right", bbox=props)
+    else:
+        ax_perm.text(0.5, 0.5, "No resamples", transform=ax_perm.transAxes,
+                     fontsize=11, horizontalalignment="center", verticalalignment="center")
 
-    ax_perm.hist(null_means, bins=50, color=null_color, edgecolor="white", alpha=0.8, density=True)
-    ax_perm.axvline(observed, color=sel_color, linewidth=2.5, linestyle="-", label=f"Observed = {observed:.4f}")
-
-    # Add percentile annotation
-    percentile = perm_results["percentile_rank"]
-    p_value = perm_results["p_value_one_sided"]
-
-    ax_perm.set_xlabel(f"Mean {metric_label} of Random Samples", fontsize=11)
+    ax_perm.set_xlabel("Mean Variance (non-selected resamples)", fontsize=11)
     ax_perm.set_ylabel("Density", fontsize=11)
-    ax_perm.set_title("B. Permutation Test: Null Distribution", fontsize=12, fontweight="bold")
-
-    # Add text annotation
-    textstr = f"Percentile: {percentile:.1f}%\np = {p_value:.2e}"
-    props = dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="gray")
-    ax_perm.text(0.95, 0.95, textstr, transform=ax_perm.transAxes, fontsize=10,
-                 verticalalignment="top", horizontalalignment="right", bbox=props)
+    ax_perm.set_title("B. Size-matched Resampling Distribution", fontsize=12, fontweight="bold")
     ax_perm.legend(loc="upper left", fontsize=9)
     ax_perm.spines["top"].set_visible(False)
     ax_perm.spines["right"].set_visible(False)
@@ -648,23 +839,22 @@ def _plot_comprehensive_figure(
     ax_stats.axis("off")
 
     # Create formatted statistics table
+    selected_mean = summary.get("selected_mean_variance", summary.get("selected_mean", float("nan")))
+    nonselected_mean = summary.get("nonselected_mean_variance", summary.get("nonselected_mean", float("nan")))
+    selected_median = summary.get("selected_median_variance", summary.get("selected_median", float("nan")))
+    nonselected_median = summary.get("nonselected_median_variance", summary.get("nonselected_median", float("nan")))
+    sel_count = summary.get("selected_count", 0)
+    nonsel_count = summary.get("nonselected_count", 0)
     stats_text = [
-        ("Metric", "Selected Motor", "Non-Selected Motor"),
-        ("─" * 15, "─" * 15, "─" * 18),
-        ("Count", f"{summary['selected_motor_count']:,}", f"{summary['nonselected_motor_count']:,}"),
-        ("Mean", f"{summary['selected_mean']:.4f}", f"{summary['nonselected_mean']:.4f}"),
-        ("Median", f"{summary['selected_median']:.4f}", f"{summary['nonselected_median']:.4f}"),
-        ("Std Dev", f"{summary['selected_std']:.4f}", f"{summary['nonselected_std']:.4f}"),
-        ("95% CI", f"[{summary['selected_ci_lower']:.4f}, {summary['selected_ci_upper']:.4f}]",
-         f"[{summary['nonselected_ci_lower']:.4f}, {summary['nonselected_ci_upper']:.4f}]"),
-        ("", "", ""),
-        ("Effect Sizes & Tests", "", ""),
-        ("─" * 15, "─" * 15, "─" * 18),
-        ("Mean Difference", f"{summary['mean_diff']:.4f} ({summary['mean_diff_pct']:.1f}%)", ""),
-        ("Cohen's d", f"{summary['cohens_d']:.3f}", _interpret_cohens_d(summary['cohens_d'])),
-        ("Mann-Whitney p", f"{summary['mannwhitney_pvalue']:.2e}", ""),
-        ("Permutation p", f"{summary['perm_p_value']:.2e}", ""),
-        ("CI Overlap", "No" if summary['ci_no_overlap'] else "Yes", ""),
+        ("Metric", "Selected", "Non-selected / Resample"),
+        ("─" * 18, "─" * 18, "─" * 26),
+        ("Counts", f"{sel_count:,}", f"{nonsel_count:,} (n={summary['resample_size']}, B={summary['num_resamples']})"),
+        ("Mean variance", f"{selected_mean:.4f}", f"{nonselected_mean:.4f}"),
+        ("Median variance", f"{selected_median:.4f}", f"{nonselected_median:.4f}"),
+        ("Resample mean", "", f"{summary['nonselected_resample_mean_median']:.4f} "
+         f"[{summary['nonselected_resample_mean_ci_lower']:.4f}, {summary['nonselected_resample_mean_ci_upper']:.4f}]"),
+        ("P(resample > selected)", "", f"{summary['fraction_nonselected_mean_greater']:.3f}"),
+        ("Selected percentile", "", f"{summary['percentile_selected_in_nonselected']:.1f}%"),
     ]
 
     table_text = "\n".join([f"{row[0]:<20} {row[1]:<20} {row[2]}" for row in stats_text])
@@ -677,7 +867,7 @@ def _plot_comprehensive_figure(
 
     # Overall figure title
     fig.suptitle(
-        "Selected Voxels Exhibit Lower Trial-to-Trial Variability\nWithin Motor Cortex",
+        "Selected vs Non-selected Trial-to-Trial Variance\nWithin Motor Cortex",
         fontsize=14, fontweight="bold", y=0.98
     )
 
@@ -884,32 +1074,68 @@ def _compute_cliff_delta(selected_vals, nonselected_vals):
 
 
 def _plot_enhanced_figure(
-    selected_vals, nonselected_vals, summary, perm_results,
-    log_selected, log_nonselected, rank_percentiles,
-    matched_results, low_var_fractions, out_path, use_std=True
+    selected_vals,
+    nonselected_vals,
+    summary,
+    resampled_means,
+    log_selected,
+    log_nonselected,
+    out_path,
 ):
     """
     Create an enhanced multi-panel publication figure with better separation visualization.
 
     Panels:
-    A. Log-transformed KDE comparison (reduces skew)
-    B. Low-variability enrichment ratio across percentile thresholds
-    C. Permutation test null distribution
-    + Statistical summary table
+    A. Variance-scale KDE comparison
+    B. Log-transformed KDE comparison (reduces skew)
+    C. Low-variability prevalence ratio across percentile thresholds
+    D. Size-matched resampling distribution
     """
-    fig = plt.figure(figsize=(14, 8))
-    gs = GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.30,
-                  height_ratios=[1, 0.7])
-
-    metric_label = "Std Dev" if use_std else "Variance"
+    fig = plt.figure(figsize=(12, 8))
+    gs = GridSpec(2, 2, figure=fig, hspace=0.4, wspace=0.3)
 
     # Color scheme
     sel_color = "#E63946"  # Red for selected
     nonsel_color = "#457B9D"  # Blue for non-selected
     null_color = "#A8DADC"  # Light blue for null distribution
 
-    # ===== Panel A: Log-transformed KDE Comparison =====
-    ax_log = fig.add_subplot(gs[0, 0])
+    # ===== Panel A: Variance-scale KDE Comparison =====
+    ax_var = fig.add_subplot(gs[0, 0])
+
+    combined_raw = np.concatenate([selected_vals, nonselected_vals])
+    xmin_raw = np.percentile(combined_raw, 0.5)
+    xmax_raw = np.percentile(combined_raw, 99.5)
+    if not np.isfinite(xmin_raw) or not np.isfinite(xmax_raw):
+        xmin_raw = np.min(combined_raw)
+        xmax_raw = np.max(combined_raw)
+    if xmin_raw == xmax_raw:
+        pad = 1.0 if xmin_raw == 0.0 else abs(xmin_raw) * 0.05
+        xmin_raw -= pad
+        xmax_raw += pad
+    xmin_raw = max(0.0, xmin_raw)
+    grid_raw = np.linspace(xmin_raw, xmax_raw, 500)
+
+    sel_kde_raw = stats.gaussian_kde(selected_vals, bw_method="scott")
+    nonsel_kde_raw = stats.gaussian_kde(nonselected_vals, bw_method="scott")
+
+    ax_var.fill_between(grid_raw, sel_kde_raw(grid_raw), alpha=0.4, color=sel_color,
+                        label=f"Selected (n={selected_vals.size})")
+    ax_var.fill_between(grid_raw, nonsel_kde_raw(grid_raw), alpha=0.4, color=nonsel_color,
+                        label=f"Non-selected (n={nonselected_vals.size})")
+    ax_var.plot(grid_raw, sel_kde_raw(grid_raw), color=sel_color, linewidth=2)
+    ax_var.plot(grid_raw, nonsel_kde_raw(grid_raw), color=nonsel_color, linewidth=2)
+
+    ax_var.axvline(np.median(selected_vals), color=sel_color, linestyle="--", linewidth=1.5)
+    ax_var.axvline(np.median(nonselected_vals), color=nonsel_color, linestyle="--", linewidth=1.5)
+
+    ax_var.set_xlabel("Variance", fontsize=11)
+    ax_var.set_ylabel("Density", fontsize=11)
+    ax_var.legend(loc="upper right", fontsize=9)
+    ax_var.spines["top"].set_visible(False)
+    ax_var.spines["right"].set_visible(False)
+
+    # ===== Panel B: Log-transformed KDE Comparison =====
+    ax_log = fig.add_subplot(gs[0, 1])
 
     combined_log = np.concatenate([log_selected, log_nonselected])
     xmin = np.percentile(combined_log, 0.5)
@@ -930,16 +1156,16 @@ def _plot_enhanced_figure(
     ax_log.axvline(np.median(log_selected), color=sel_color, linestyle='--', linewidth=1.5)
     ax_log.axvline(np.median(log_nonselected), color=nonsel_color, linestyle='--', linewidth=1.5)
 
-    ax_log.set_xlabel(f"Log₁₀({metric_label})", fontsize=11)
+    ax_log.set_xlabel("Log₁₀(Variance)", fontsize=11)
     ax_log.set_ylabel("Density", fontsize=11)
     ax_log.legend(loc='upper right', fontsize=9)
     ax_log.spines['top'].set_visible(False)
     ax_log.spines['right'].set_visible(False)
 
-    # ===== Panel B: Low-Variability Enrichment =====
+    # ===== Panel C: Low-Variability Prevalence =====
     # Shows: at each percentile threshold, what fraction of selected vs non-selected
     # voxels fall below that threshold? Ratio > 1 means selected are enriched among low-variability voxels.
-    ax_enrich = fig.add_subplot(gs[0, 1])
+    ax_enrich = fig.add_subplot(gs[1, 0])
 
     combined = np.concatenate([selected_vals, nonselected_vals])
     percentile_thresholds = [10, 20, 30, 40, 50, 60, 70, 80, 90]
@@ -957,7 +1183,7 @@ def _plot_enhanced_figure(
 
     bars = ax_enrich.bar(percentile_thresholds, enrichment_ratios, width=8,
                          color=sel_color, alpha=0.7, edgecolor='white')
-    ax_enrich.axhline(1.0, color='gray', linestyle='--', linewidth=2, label='No enrichment (null)')
+    ax_enrich.axhline(1.0, color='gray', linestyle='--', linewidth=2, label='Parity (selected = non-selected)')
 
     # Color bars above/below 1.0 differently
     for bar, ratio in zip(bars, enrichment_ratios):
@@ -968,7 +1194,7 @@ def _plot_enhanced_figure(
             bar.set_alpha(0.5)
 
     ax_enrich.set_xlabel("Variability Percentile Threshold", fontsize=11, labelpad=8)
-    ax_enrich.set_ylabel("Enrichment Ratio\n(Selected / Non-selected)", fontsize=11)
+    ax_enrich.set_ylabel("Relative Prevalence\n(Selected / Non-selected)", fontsize=11)
     ax_enrich.set_xticks(percentile_thresholds)
     ax_enrich.set_xticklabels([f"{p}%" for p in percentile_thresholds], fontsize=9, rotation=0, ha="center")
     ax_enrich.tick_params(axis="x", pad=6)
@@ -977,70 +1203,76 @@ def _plot_enhanced_figure(
     ax_enrich.spines['right'].set_visible(False)
     ax_enrich.set_ylim(0, max(enrichment_ratios) * 1.15)
 
-    # ===== Panel C: Permutation Null Distribution =====
-    ax_perm = fig.add_subplot(gs[0, 2])
+    # ===== Panel D: Size-matched Resampling Distribution =====
+    ax_perm = fig.add_subplot(gs[1, 1])
 
-    null_means = perm_results['null_selected_means']
-    observed = perm_results['observed_selected_stat']
+    if resampled_means.size:
+        ax_perm.hist(resampled_means, bins=50, color=null_color, edgecolor='white', alpha=0.8, density=True)
+        median = summary["nonselected_resample_mean_median"]
+        ci_low = summary["nonselected_resample_mean_ci_lower"]
+        ci_high = summary["nonselected_resample_mean_ci_upper"]
+        observed = summary["observed_selected_mean"]
+        ax_perm.axvline(observed, color=sel_color, linewidth=2.5, linestyle="--",
+                        label=f"Selected mean = {observed:.4f}")
+        ax_perm.axvline(median, color="gray", linewidth=1.5, linestyle="-", label="Resample median")
+        ax_perm.axvline(ci_low, color="gray", linewidth=1.5, linestyle="--")
+        ax_perm.axvline(ci_high, color="gray", linewidth=1.5, linestyle="--", label="95% CI")
+        textstr = f"n={summary['resample_size']}\nB={summary['num_resamples']}"
+        props = dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="gray")
+        ax_perm.text(0.95, 0.95, textstr, transform=ax_perm.transAxes, fontsize=10,
+                     verticalalignment="top", horizontalalignment="right", bbox=props)
+    else:
+        ax_perm.text(0.5, 0.5, "No resamples", transform=ax_perm.transAxes,
+                     fontsize=11, horizontalalignment="center", verticalalignment="center")
 
-    ax_perm.hist(null_means, bins=50, color=null_color, edgecolor='white', alpha=0.8, density=True)
-    ax_perm.axvline(observed, color=sel_color, linewidth=2.5, linestyle='-',
-                    label=f'Observed = {observed:.4f}')
-
-    percentile = perm_results['percentile_rank']
-    p_value = perm_results['p_value_one_sided']
-
-    ax_perm.set_xlabel(f"Mean {metric_label} (Random Samples)", fontsize=11)
+    ax_perm.set_xlabel("Mean Variance (non-selected voxels)", fontsize=11)
     ax_perm.set_ylabel("Density", fontsize=11)
-    ax_perm.legend(loc='upper right', fontsize=9)
     ax_perm.spines['top'].set_visible(False)
     ax_perm.spines['right'].set_visible(False)
 
-    # ===== Statistical Summary Table (spans bottom row) =====
-    ax_stats = fig.add_subplot(gs[1, :])
-    ax_stats.axis('off')
+    plt.savefig(out_path, dpi=200, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
 
-    # Create statistics table
-    cliff_d = summary.get('cliff_delta', np.nan)
-    cohens_d_matched = matched_results['cohens_d_mean']
-    cohens_d_ci_low = matched_results['cohens_d_ci_lower']
-    cohens_d_ci_high = matched_results['cohens_d_ci_upper']
-    cohens_d_interp = _interpret_cohens_d(cohens_d_matched)
-    cliff_note = "(selected < nonselected)" if cliff_d < 0 else ""
-    median_rank_pct = np.median(rank_percentiles)
-    frac_below_50_pct = np.mean(rank_percentiles < 50) * 100
+
+def _plot_statistical_summary_figure(summary, out_path):
+    """Plot the statistical summary table as a standalone figure."""
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.axis("off")
+
+    selected_mean = summary.get("selected_mean_variance", summary.get("selected_mean", float("nan")))
+    nonselected_mean = summary.get("nonselected_mean_variance", summary.get("nonselected_mean", float("nan")))
+    selected_median = summary.get("selected_median_variance", summary.get("selected_median", float("nan")))
+    nonselected_median = summary.get("nonselected_median_variance", summary.get("nonselected_median", float("nan")))
+    sel_count = summary.get("selected_count", 0)
+    nonsel_count = summary.get("nonselected_count", 0)
 
     stats_lines = [
         "=" * 90,
         f"{'STATISTICAL SUMMARY':^90}",
         "=" * 90,
-        f"{'Sample Sizes:':<25} Selected: {summary['selected_motor_count']:,}    Non-selected: {summary['nonselected_motor_count']:,}",
+        f"{'Sample Sizes:':<25} Selected: {sel_count:,}    Non-selected: {nonsel_count:,}",
+        f"{'Resampling:':<25} n={summary['resample_size']}    B={summary['num_resamples']}",
         "-" * 90,
-        f"{'VARIABILITY':<25} {'Selected':<15} {'Non-selected':<15} {'Difference':<20}",
-        f"Mean {metric_label}:{'':<13} {summary['selected_mean']:<15.4f} {summary['nonselected_mean']:<15.4f} {summary['mean_diff']:.4f} ({summary['mean_diff_pct']:.1f}%)",
-        f"Median {metric_label}:{'':<11} {summary['selected_median']:<15.4f} {summary['nonselected_median']:<15.4f} {summary['selected_median'] - summary['nonselected_median']:.4f}",
+        f"{'VARIABILITY':<25} {'Selected':<15} {'Non-selected':<15}",
+        f"Mean variance:{'':<12} {selected_mean:<15.4f} {nonselected_mean:<15.4f}",
+        f"Median variance:{'':<10} {selected_median:<15.4f} {nonselected_median:<15.4f}",
         "-" * 90,
-        f"{'EFFECT SIZES':<25} {'Value':<15} {'95% CI':<20} {'Interpretation':<20}",
-        f"Cohen's d (log):{'':<9} {summary.get('log_cohens_d', 0):<15.3f} {'---':<20} {_interpret_cohens_d(summary.get('log_cohens_d', 0)):<20}",
-        f"Cohen's d (matched):{'':<5} {cohens_d_matched:<15.3f} [{cohens_d_ci_low:.3f}, {cohens_d_ci_high:.3f}]{'':<6} {cohens_d_interp:<20}",
-        f"Cliff's delta:{'':<11} {cliff_d:<15.3f} {'---':<20} {cliff_note:<20}",
-        "-" * 90,
-        f"{'STATISTICAL TESTS':<25} {'Statistic':<15} {'p-value':<15}",
-        f"Mann-Whitney U:{'':<10} {summary['mannwhitney_u']:<15.0f} {summary['mannwhitney_pvalue']:.2e}",
-        f"Permutation test:{'':<8} {'---':<15} {summary['perm_p_value']:.2e}",
-        "-" * 90,
-        f"{'RANK ANALYSIS':<25} Median rank: {median_rank_pct:.1f}%    |    {frac_below_50_pct:.1f}% below 50th pct (expected: 50%)",
+        f"{'RESAMPLING SUMMARY':<25} {'Median [95% CI]':<40}",
+        f"Resample mean:{'':<13} {summary['nonselected_resample_mean_median']:.4f} "
+        f"[{summary['nonselected_resample_mean_ci_lower']:.4f}, {summary['nonselected_resample_mean_ci_upper']:.4f}]",
+        f"P(resample > selected):{'':<5} {summary['fraction_nonselected_mean_greater']:.3f}",
+        f"Selected percentile:{'':<6} {summary['percentile_selected_in_nonselected']:.1f}%",
         "=" * 90,
     ]
 
     table_text = "\n".join(stats_lines)
 
-    ax_stats.text(0.5, 0.95, table_text, transform=ax_stats.transAxes,
-                  fontsize=9, verticalalignment='top', horizontalalignment='center',
-                  fontfamily='monospace',
-                  bbox=dict(boxstyle='round', facecolor='#f8f9fa', edgecolor='#dee2e6', pad=1))
+    ax.text(0.5, 0.95, table_text, transform=ax.transAxes,
+            fontsize=10, verticalalignment="top", horizontalalignment="center",
+            fontfamily="monospace",
+            bbox=dict(boxstyle="round", facecolor="#f8f9fa", edgecolor="#dee2e6", pad=1))
 
-    plt.savefig(out_path, dpi=200, bbox_inches='tight', facecolor='white')
+    plt.savefig(out_path, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
 
@@ -1092,6 +1324,56 @@ def _plot_histogram_comparison(selected_vals, motor_vals, bins, out_path, select
     plt.close(fig)
 
 
+def _plot_resampled_mean_distribution(
+    resampled_means,
+    observed_selected_mean,
+    out_path,
+    n_selected,
+    num_resamples,
+    fraction_greater,
+    metric_label="Variance",
+    title="Size-matched resampling of non-selected voxels",
+):
+    """Plot resampled non-selected mean variance distribution with observed selected mean."""
+    fig, ax = plt.subplots(figsize=(7.5, 4.8))
+
+    if resampled_means.size:
+        ax.hist(resampled_means, bins=45, color="#A8DADC", edgecolor="white", alpha=0.85, density=True)
+        if resampled_means.size > 1:
+            xmin = float(np.min(resampled_means))
+            xmax = float(np.max(resampled_means))
+            if xmin != xmax:
+                grid = np.linspace(xmin, xmax, 400)
+                kde = stats.gaussian_kde(resampled_means)
+                ax.plot(grid, kde(grid), color="#457B9D", linewidth=2)
+    else:
+        ax.text(0.5, 0.5, "No resamples", transform=ax.transAxes,
+                fontsize=11, horizontalalignment="center", verticalalignment="center")
+
+    ax.axvline(observed_selected_mean, color="#E63946", linestyle="--", linewidth=2.0,
+               label=f"Selected mean = {observed_selected_mean:.4f}")
+
+    ax.set_xlabel(f"Mean {metric_label} (non-selected resamples, n={n_selected})")
+    ax.set_ylabel("Density")
+    ax.set_title(title)
+
+    if resampled_means.size:
+        textstr = (
+            f"Resamples: {num_resamples}\n"
+            f"P(resample > selected) = {fraction_greater:.3f}"
+        )
+        props = dict(boxstyle="round", facecolor="white", alpha=0.85, edgecolor="gray")
+        ax.text(0.98, 0.95, textstr, transform=ax.transAxes, fontsize=10,
+                verticalalignment="top", horizontalalignment="right", bbox=props)
+
+    ax.legend(loc="upper left", fontsize=9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, facecolor="white")
+    plt.close(fig)
+
+
 def main():
     """Run the end-to-end workflow: predict BOLD, compute variance, and compare groups."""
     parser = argparse.ArgumentParser(description=("Compute predicted BOLD from GLMsingle outputs, estimate per-voxel trial variance, "
@@ -1104,7 +1386,7 @@ def main():
     parser.add_argument("--trial-len", type=int, default=9, help="Number of TRs per trial segment.")
     parser.add_argument("--chunk-size", type=int, default=2048, help="Voxel chunk size for matrix multiplies.")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for resampling.")
-    parser.add_argument("--num-resamples", type=int, default=5000, help="Number of control resamples for sanity checks.")
+    parser.add_argument("--num-resamples", type=int, default=1000, help="Number of size-matched resamples for variability analysis.")
     parser.add_argument("--hist-bins", type=int, default=30, help="Histogram bin count.")
     parser.add_argument("--hist-subsample", dest="hist_subsample", action="store_true", default=True, help="Subsample motor-only voxels for histogram to match selected count.")
     parser.add_argument("--no-hist-subsample", dest="hist_subsample", action="store_false", help="Do not subsample motor-only voxels for histogram.")
@@ -1301,11 +1583,17 @@ def main():
         hist_note = "Motor-only distribution subsampled to match selected count."
 
     bins = np.histogram_bin_edges(np.concatenate([selected_vals, motor_vals]), bins=args.hist_bins)
-    stats_summary, resample_means = _compare_groups(
+    stats_summary, resampled_means = _size_matched_resample_summary(
         selected_vals, motor_vals, rng, args.num_resamples
     )
 
     stats_summary.update({
+        "analysis_type": "selected_vs_motor_resample",
+        "metric": "variance",
+        "selected_mean": float(np.mean(selected_vals)),
+        "motor_mean": float(np.mean(motor_vals)),
+        "selected_median": float(np.median(selected_vals)),
+        "motor_median": float(np.median(motor_vals)),
         "run_list": runs,
         "trial_len": args.trial_len,
         "total_trials_used": int(total_used),
@@ -1340,7 +1628,12 @@ def main():
         selected_values=selected_vals,
         motor_values=motor_vals,
         motor_hist_values=hist_motor_vals,
-        resample_means=resample_means,
+        resampled_nonselected_mean_variances=resampled_means,
+        observed_selected_mean_variance=stats_summary["observed_selected_mean"],
+        fraction_nonselected_mean_greater=stats_summary["fraction_nonselected_mean_greater"],
+        percentile_selected_in_nonselected=stats_summary["percentile_selected_in_nonselected"],
+        resample_size=stats_summary["resample_size"],
+        num_resamples=stats_summary["num_resamples"],
         selected_indices=selected_indices,
         motor_indices=motor_indices,
         motor_only_indices=motor_only,
@@ -1354,10 +1647,9 @@ def main():
         "Variance comparison complete: "
         f"selected={stats_summary['selected_count']}, "
         f"motor_only={stats_summary['motor_only_count']}, "
-        f"mean_diff={stats_summary['mean_diff']:.6f}, "
-        f"t={stats_summary['t_stat']:.3f}, "
-        f"p_one={stats_summary['p_one_sided']:.3g}, "
-        f"d={stats_summary['cohens_d']:.3f}",
+        f"P(resampled motor mean > selected mean)={stats_summary['fraction_nonselected_mean_greater']:.3f} "
+        f"({stats_summary['fraction_nonselected_mean_greater']*100:.1f}%), "
+        f"selected_mean_percentile={stats_summary['percentile_selected_in_nonselected']:.1f}",
         flush=True,
     )
 
@@ -1369,14 +1661,13 @@ def main():
     # =========================================================================
 
     print("\n" + "=" * 70)
-    print("MOTOR CORTEX VARIABILITY ANALYSIS (ENHANCED)")
+    print("MOTOR CORTEX VARIABILITY ANALYSIS (SIZE-MATCHED RESAMPLING)")
     print("Comparing selected vs non-selected voxels WITHIN motor cortex")
     print("=" * 70)
 
-    # Compute motor cortex comparison using standard deviation (more interpretable)
-    use_std = True
+    # Compute motor cortex comparison using variance (no std)
     selected_motor_vals, nonselected_motor_vals, selected_motor_idx, nonselected_motor_idx = \
-        _compute_motor_cortex_comparison(voxel_var_flat, selected_indices, motor_indices, use_std=use_std)
+        _compute_motor_cortex_comparison(voxel_var_flat, selected_indices, motor_indices)
 
     if selected_motor_vals.size < 10:
         print(f"WARNING: Only {selected_motor_vals.size} selected voxels in motor cortex. "
@@ -1385,90 +1676,40 @@ def main():
     print(f"Selected voxels in motor cortex: {selected_motor_vals.size}")
     print(f"Non-selected voxels in motor cortex: {nonselected_motor_vals.size}")
 
-    # Run comprehensive comparison
-    num_permutations = args.num_resamples
-    num_bootstrap = min(2000, args.num_resamples)
-
-    motor_summary, motor_perm_results = _compare_motor_groups(
-        selected_motor_vals, nonselected_motor_vals, rng, num_permutations, num_bootstrap
+    num_resamples = int(args.num_resamples)
+    motor_summary, resampled_means = _size_matched_resample_summary(
+        selected_motor_vals, nonselected_motor_vals, rng, num_resamples
     )
 
-    # =========================================================================
-    # ENHANCED ANALYSES FOR BETTER SEPARATION
-    # =========================================================================
-
-    print("\n--- Computing Enhanced Metrics ---")
-
-    # 1. Log-transformed variability (reduces skewness)
-    log_selected = _log_transform_variability(selected_motor_vals)
-    log_nonselected = _log_transform_variability(nonselected_motor_vals)
-
-    # Effect size on log-transformed data
-    log_cohens_d = _cohens_d(log_selected, log_nonselected)
-    print(f"Log-transformed Cohen's d: {log_cohens_d:.3f} {_interpret_cohens_d(log_cohens_d)}")
-
-    # 2. Rank percentile analysis
-    rank_percentiles, expected_median = _compute_rank_percentiles(
-        selected_motor_vals, nonselected_motor_vals
-    )
-    median_rank = float(np.median(rank_percentiles))
-    frac_below_50 = float(np.mean(rank_percentiles < 50))
-    print(f"Median rank percentile: {median_rank:.1f}% (expected: 50% under null)")
-    print(f"Fraction of selected below 50th percentile: {frac_below_50*100:.1f}%")
-
-    # 3. Matched bootstrap effect size (controls for sample size imbalance)
-    print("Computing matched bootstrap effect sizes...")
-    matched_results = _matched_bootstrap_effect(
-        selected_motor_vals, nonselected_motor_vals,
-        num_bootstrap=num_bootstrap, rng=rng
-    )
-    print(f"Matched Cohen's d: {matched_results['cohens_d_mean']:.3f} "
-          f"[{matched_results['cohens_d_ci_lower']:.3f}, {matched_results['cohens_d_ci_upper']:.3f}]")
-
-    # 4. Stochastic dominance probability
-    p_dominance = _compute_stochastic_dominance(selected_motor_vals, nonselected_motor_vals)
-    print(f"P(Selected < NonSelected): {p_dominance:.3f}")
-
-    # 5. Cliff's delta (non-parametric effect size)
-    cliff_delta = _compute_cliff_delta(selected_motor_vals, nonselected_motor_vals)
-    print(f"Cliff's delta: {cliff_delta:.3f}")
-
-    # 6. Low-variability fraction analysis
-    combined = np.concatenate([selected_motor_vals, nonselected_motor_vals])
-    thresholds = np.percentile(combined, [10, 25, 50, 75])
-    low_var_fractions = _compute_low_variability_fractions(
-        selected_motor_vals, nonselected_motor_vals, thresholds
-    )
-
-    print("\nLow-variability fraction analysis:")
-    print(f"{'Threshold':<12} {'Selected %':<12} {'NonSel %':<12} {'Ratio':<8}")
-    print("-" * 44)
-    for f in low_var_fractions:
-        print(f"{f['threshold']:<12.3f} {f['selected_fraction']*100:<12.1f} "
-              f"{f['nonselected_fraction']*100:<12.1f} {f['fraction_ratio']:<8.2f}")
-
-    # Add enhanced metrics to summary
     motor_summary.update({
-        "analysis_type": "motor_cortex_variability_comparison_enhanced",
-        "metric": "standard_deviation" if use_std else "variance",
+        "analysis_type": "motor_cortex_variability_resample",
+        "metric": "variance",
         "run_list": runs,
         "trial_len": args.trial_len,
         "total_trials_used": int(total_used),
-        "num_permutations": num_permutations,
-        "num_bootstrap": num_bootstrap,
-        # Enhanced metrics
-        "log_cohens_d": float(log_cohens_d),
-        "median_rank_percentile": median_rank,
-        "frac_below_50th_percentile": frac_below_50,
-        "stochastic_dominance": float(p_dominance),
-        "cliff_delta": float(cliff_delta),
-        "matched_cohens_d_mean": matched_results['cohens_d_mean'],
-        "matched_cohens_d_ci_lower": matched_results['cohens_d_ci_lower'],
-        "matched_cohens_d_ci_upper": matched_results['cohens_d_ci_upper'],
-        "matched_mean_diff": matched_results['mean_diff_mean'],
-        "matched_median_diff": matched_results['median_diff_mean'],
-        "low_variability_fractions": low_var_fractions,
+        "total_trials_skipped": int(total_skipped),
+        "total_timepoints": int(total_timepoints),
+        "selected_mean_variance": float(np.mean(selected_motor_vals)),
+        "nonselected_mean_variance": float(np.mean(nonselected_motor_vals)),
+        "selected_median_variance": float(np.median(selected_motor_vals)),
+        "nonselected_median_variance": float(np.median(nonselected_motor_vals)),
     })
+
+    observed_selected_mean = motor_summary["observed_selected_mean"]
+    resample_median = motor_summary["nonselected_resample_mean_median"]
+    resample_ci_lower = motor_summary["nonselected_resample_mean_ci_lower"]
+    resample_ci_upper = motor_summary["nonselected_resample_mean_ci_upper"]
+    fraction_greater = motor_summary["fraction_nonselected_mean_greater"]
+    percentile = motor_summary["percentile_selected_in_nonselected"]
+
+    print("\n--- Size-matched resampling ---")
+    print(f"Observed selected mean variance: {observed_selected_mean:.4f}")
+    if np.isfinite(resample_median):
+        print(f"Non-selected resample mean variance median [95% CI]: {resample_median:.4f} "
+              f"[{resample_ci_lower:.4f}, {resample_ci_upper:.4f}]")
+    print(f"P(resampled non-selected mean > observed selected mean): "
+          f"{fraction_greater:.3f} ({fraction_greater*100:.1f}%)")
+    print(f"Observed selected mean percentile: {percentile:.1f}% (lower = more stable)")
 
     # Save motor cortex comparison results (without large index arrays for JSON)
     motor_summary_path = out_dir / f"{output_tag}_motor_variability_summary.json"
@@ -1486,25 +1727,30 @@ def main():
         json.dump(summary_for_json, handle, indent=2)
     print(f"Saved motor cortex summary: {motor_summary_path}")
 
-    # Create comprehensive multi-panel figure (ORIGINAL)
+    # Create motor cortex figures (restore multi-panel layout + resampling panel)
     motor_fig_path = out_dir / f"{output_tag}_motor_variability_figure.png"
     _plot_comprehensive_figure(
         selected_motor_vals, nonselected_motor_vals,
-        motor_summary, motor_perm_results,
-        motor_fig_path, use_std=use_std
+        motor_summary, resampled_means,
+        motor_fig_path,
     )
-    print(f"Saved motor cortex figure (original): {motor_fig_path}")
+    print(f"Saved motor cortex figure: {motor_fig_path}")
 
-    # Create ENHANCED multi-panel figure with better separation visualization
+    log_selected = _log_transform_variability(selected_motor_vals)
+    log_nonselected = _log_transform_variability(nonselected_motor_vals)
+
     enhanced_fig_path = out_dir / f"{output_tag}_motor_variability_enhanced.png"
     _plot_enhanced_figure(
         selected_motor_vals, nonselected_motor_vals,
-        motor_summary, motor_perm_results,
-        log_selected, log_nonselected, rank_percentiles,
-        matched_results, low_var_fractions,
-        enhanced_fig_path, use_std=use_std
+        motor_summary, resampled_means,
+        log_selected, log_nonselected,
+        enhanced_fig_path,
     )
     print(f"Saved enhanced motor cortex figure: {enhanced_fig_path}")
+
+    summary_fig_path = out_dir / f"{output_tag}_motor_variability_statistical_summary.png"
+    _plot_statistical_summary_figure(motor_summary, summary_fig_path)
+    print(f"Saved statistical summary figure: {summary_fig_path}")
 
     # Save detailed data for reproducibility
     motor_data_path = out_dir / f"{output_tag}_motor_variability_data.npz"
@@ -1514,80 +1760,44 @@ def main():
         nonselected_motor_values=nonselected_motor_vals,
         selected_motor_indices=selected_motor_idx,
         nonselected_motor_indices=nonselected_motor_idx,
-        null_diffs=motor_perm_results["null_diffs"],
-        null_selected_means=motor_perm_results["null_selected_means"],
-        log_selected=log_selected,
-        log_nonselected=log_nonselected,
-        rank_percentiles=rank_percentiles,
-        matched_cohens_ds=matched_results['cohens_ds'],
+        resampled_nonselected_mean_variances=resampled_means,
+        observed_selected_mean_variance=observed_selected_mean,
+        fraction_nonselected_mean_greater=fraction_greater,
+        percentile_selected_in_nonselected=percentile,
+        resample_size=selected_motor_vals.size,
+        num_resamples=num_resamples,
     )
     print(f"Saved motor cortex data: {motor_data_path}")
 
     # Print summary
     print("\n" + "=" * 70)
-    print("MOTOR CORTEX ANALYSIS RESULTS (ENHANCED):")
+    print("MOTOR CORTEX ANALYSIS RESULTS (SIZE-MATCHED RESAMPLING):")
     print("=" * 70)
-    metric_name = "Std Dev" if use_std else "Variance"
     print(f"\n{'BASIC STATISTICS:'}")
-    print(f"  Selected motor voxels:     n={motor_summary['selected_motor_count']}, "
-          f"mean {metric_name}={motor_summary['selected_mean']:.4f}")
-    print(f"  Non-selected motor voxels: n={motor_summary['nonselected_motor_count']}, "
-          f"mean {metric_name}={motor_summary['nonselected_mean']:.4f}")
-    print(f"  Mean difference: {motor_summary['mean_diff']:.4f} ({motor_summary['mean_diff_pct']:.1f}%)")
-
-    print(f"\n{'EFFECT SIZES:'}")
-    print(f"  Cohen's d (raw):           {motor_summary['cohens_d']:.3f} {_interpret_cohens_d(motor_summary['cohens_d'])}")
-    print(f"  Cohen's d (log-transform): {log_cohens_d:.3f} {_interpret_cohens_d(log_cohens_d)}")
-    print(f"  Cohen's d (matched boot):  {matched_results['cohens_d_mean']:.3f} [{matched_results['cohens_d_ci_lower']:.3f}, {matched_results['cohens_d_ci_upper']:.3f}]")
-    print(f"  Cliff's delta:             {cliff_delta:.3f}")
-    print(f"  Stochastic dominance:      {p_dominance:.3f} (P that selected < nonselected)")
-
-    print(f"\n{'RANK-BASED ANALYSIS:'}")
-    print(f"  Median rank percentile:    {median_rank:.1f}% (expected: 50% under null)")
-    print(f"  % below 50th percentile:   {frac_below_50*100:.1f}% (expected: 50% under null)")
-
-    print(f"\n{'STATISTICAL TESTS:'}")
-    print(f"  Mann-Whitney U p-value:    {motor_summary['mannwhitney_pvalue']:.2e}")
-    print(f"  Permutation test p-value:  {motor_summary['perm_p_value']:.2e}")
-    print(f"  Percentile rank in null:   {motor_summary['perm_percentile']:.1f}%")
-    print(f"  95% CI overlap:            {'No' if motor_summary['ci_no_overlap'] else 'Yes'}")
+    print(f"  Selected motor voxels:     n={motor_summary['selected_count']}, "
+          f"mean variance={motor_summary['selected_mean_variance']:.4f}")
+    print(f"  Non-selected motor voxels: n={motor_summary['nonselected_count']}, "
+          f"mean variance={motor_summary['nonselected_mean_variance']:.4f}")
+    print(f"  P(resampled non-selected mean > selected mean): "
+          f"{fraction_greater:.3f} ({fraction_greater*100:.1f}%)")
+    print(f"  Selected mean percentile:  {percentile:.1f}% (lower = more stable)")
 
     print("\n" + "=" * 70)
 
-    # Determine conclusion based on multiple metrics
-    strong_evidence = (
-        motor_summary['perm_p_value'] < 0.05 and
-        frac_below_50 > 0.60 and  # At least 60% below median
-        p_dominance > 0.55  # More than random chance
-    )
-
-    moderate_evidence = (
-        motor_summary['perm_p_value'] < 0.05 and
-        (frac_below_50 > 0.55 or p_dominance > 0.52)
-    )
-
-    if strong_evidence:
-        print("\n✓ STRONG EVIDENCE: Selected motor voxels show substantially lower "
-              "trial-to-trial variability than non-selected motor voxels.")
-        print("  - Multiple metrics converge to support the claim")
-        print("  - Effect is visible in rank-based and distribution-free measures")
-        print("  This strongly supports the claim that the optimization selects stable, "
-              "reliable voxels rather than noise.")
-    elif moderate_evidence:
-        print("\n○ MODERATE EVIDENCE: Selected motor voxels tend to have lower "
-              "trial-to-trial variability than non-selected motor voxels.")
-        print("  - Statistical significance is present")
-        print("  - Effect size is modest but consistent")
-        print("  The optimization appears to preferentially select more stable voxels.")
-    else:
-        print("\n⚠ LIMITED EVIDENCE: The difference in variability is weak or inconsistent.")
-        print("  Consider investigating potential issues with the optimization or data.")
-        print("  Suggestions:")
-        print("  - Check if the voxel selection criteria in main_second_obj_25.py")
-        print("    actually penalize high-variability voxels")
-        print("  - Verify that the BOLD signal reconstruction is correct")
-        print("  - Consider whether other factors (e.g., spatial smoothness) may")
-        print("    be driving the selection more than temporal stability")
+    if np.isfinite(fraction_greater):
+        if fraction_greater >= 0.95:
+            print("\n✓ STRONG EVIDENCE: Selected motor voxels show substantially lower "
+                  "trial-to-trial variance than non-selected motor voxels.")
+            print("  - Observed selected mean variance is lower than most size-matched resamples")
+            print("  This supports the claim that the optimization selects stable voxels.")
+        elif fraction_greater >= 0.80:
+            print("\n○ MODERATE EVIDENCE: Selected motor voxels tend to have lower "
+                  "trial-to-trial variance than non-selected motor voxels.")
+            print("  - Observed selected mean variance is lower than many size-matched resamples")
+            print("  The optimization appears to favor more stable voxels.")
+        else:
+            print("\n⚠ LIMITED EVIDENCE: The selected mean variance is not consistently lower.")
+            print("  Consider investigating potential issues with the optimization or data.")
 
 
 if __name__ == "__main__":
