@@ -14,6 +14,7 @@ from scipy.ndimage import gaussian_filter1d
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+from matplotlib.lines import Line2D
 from matplotlib.ticker import PercentFormatter
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -509,7 +510,8 @@ def _resample_control_means(control_values, target_size, num_resamples, rng):
     """Resample control means for a null distribution."""
     if num_resamples <= 0:
         return np.array([], dtype=np.float64)
-    replace = control_values.size < target_size
+    # Always sample with replacement to keep the null distribution consistent.
+    replace = True
     means = np.empty(num_resamples, dtype=np.float64)
     for idx in range(num_resamples):
         sample = rng.choice(control_values, size=target_size, replace=replace)
@@ -1103,16 +1105,11 @@ def _plot_enhanced_figure(
     ax_var = fig.add_subplot(gs[0, 0])
 
     combined_raw = np.concatenate([selected_vals, nonselected_vals])
-    xmin_raw = np.percentile(combined_raw, 0.5)
-    xmax_raw = np.percentile(combined_raw, 99.5)
-    if not np.isfinite(xmin_raw) or not np.isfinite(xmax_raw):
-        xmin_raw = np.min(combined_raw)
-        xmax_raw = np.max(combined_raw)
-    if xmin_raw == xmax_raw:
-        pad = 1.0 if xmin_raw == 0.0 else abs(xmin_raw) * 0.05
-        xmin_raw -= pad
-        xmax_raw += pad
-    xmin_raw = max(0.0, xmin_raw)
+    xmin_raw = np.percentile(combined_raw, 1)
+    xmax_raw = np.percentile(combined_raw, 99)
+    pad_raw = (xmax_raw - xmin_raw) * 0.1
+    xmin_raw = max(0, xmin_raw - pad_raw)
+    xmax_raw = xmax_raw + pad_raw
     grid_raw = np.linspace(xmin_raw, xmax_raw, 500)
 
     sel_kde_raw = stats.gaussian_kde(selected_vals, bw_method="scott")
@@ -1125,12 +1122,15 @@ def _plot_enhanced_figure(
     ax_var.plot(grid_raw, sel_kde_raw(grid_raw), color=sel_color, linewidth=2)
     ax_var.plot(grid_raw, nonsel_kde_raw(grid_raw), color=nonsel_color, linewidth=2)
 
-    ax_var.axvline(np.median(selected_vals), color=sel_color, linestyle="--", linewidth=1.5)
-    ax_var.axvline(np.median(nonselected_vals), color=nonsel_color, linestyle="--", linewidth=1.5)
+    selected_mean_raw = summary.get("selected_mean_variance", float(np.mean(selected_vals)))
+    nonselected_mean_raw = summary.get("nonselected_mean_variance", float(np.mean(nonselected_vals)))
+    ax_var.axvline(selected_mean_raw, color=sel_color, linestyle="--", linewidth=1.5, alpha=0.8)
+    ax_var.axvline(nonselected_mean_raw, color=nonsel_color, linestyle="--", linewidth=1.5, alpha=0.8)
 
-    ax_var.set_xlabel("Variance", fontsize=11)
+    ax_var.set_xlabel("Trial-to-Trial Variance", fontsize=11)
     ax_var.set_ylabel("Density", fontsize=11)
     ax_var.legend(loc="upper right", fontsize=9)
+    ax_var.set_xlim(xmin_raw, xmax_raw)
     ax_var.spines["top"].set_visible(False)
     ax_var.spines["right"].set_visible(False)
 
@@ -1138,8 +1138,11 @@ def _plot_enhanced_figure(
     ax_log = fig.add_subplot(gs[0, 1])
 
     combined_log = np.concatenate([log_selected, log_nonselected])
-    xmin = np.percentile(combined_log, 0.5)
-    xmax = np.percentile(combined_log, 99.5)
+    xmin = np.percentile(combined_log, 1)
+    xmax = np.percentile(combined_log, 99)
+    pad = (xmax - xmin) * 0.1
+    xmin = xmin - pad
+    xmax = xmax + pad
     grid = np.linspace(xmin, xmax, 500)
 
     sel_kde = stats.gaussian_kde(log_selected, bw_method='scott')
@@ -1152,13 +1155,14 @@ def _plot_enhanced_figure(
     ax_log.plot(grid, sel_kde(grid), color=sel_color, linewidth=2)
     ax_log.plot(grid, nonsel_kde(grid), color=nonsel_color, linewidth=2)
 
-    # Add median lines
-    ax_log.axvline(np.median(log_selected), color=sel_color, linestyle='--', linewidth=1.5)
-    ax_log.axvline(np.median(log_nonselected), color=nonsel_color, linestyle='--', linewidth=1.5)
+    # Add mean lines
+    ax_log.axvline(np.mean(log_selected), color=sel_color, linestyle='--', linewidth=1.5, alpha=0.8)
+    ax_log.axvline(np.mean(log_nonselected), color=nonsel_color, linestyle='--', linewidth=1.5, alpha=0.8)
 
-    ax_log.set_xlabel("Log₁₀(Variance)", fontsize=11)
+    ax_log.set_xlabel("Log₁₀(Trial-to-Trial Variance)", fontsize=11)
     ax_log.set_ylabel("Density", fontsize=11)
     ax_log.legend(loc='upper right', fontsize=9)
+    ax_log.set_xlim(xmin, xmax)
     ax_log.spines['top'].set_visible(False)
     ax_log.spines['right'].set_visible(False)
 
@@ -1183,7 +1187,7 @@ def _plot_enhanced_figure(
 
     bars = ax_enrich.bar(percentile_thresholds, enrichment_ratios, width=8,
                          color=sel_color, alpha=0.7, edgecolor='white')
-    ax_enrich.axhline(1.0, color='gray', linestyle='--', linewidth=2, label='Parity (selected = non-selected)')
+    ax_enrich.axhline(1.0, color='gray', linestyle='--', linewidth=2, label='Selected = non-selected')
 
     # Color bars above/below 1.0 differently
     for bar, ratio in zip(bars, enrichment_ratios):
@@ -1212,15 +1216,30 @@ def _plot_enhanced_figure(
         ci_low = summary["nonselected_resample_mean_ci_lower"]
         ci_high = summary["nonselected_resample_mean_ci_upper"]
         observed = summary["observed_selected_mean"]
-        ax_perm.axvline(observed, color=sel_color, linewidth=2.5, linestyle="--",
-                        label=f"Selected mean = {observed:.4f}")
-        ax_perm.axvline(median, color="gray", linewidth=1.5, linestyle="-", label="Resample median")
+        ax_perm.axvline(observed, color=sel_color, linewidth=2.5, linestyle="--")
+        ax_perm.axvline(median, color="gray", linewidth=1.5, linestyle="-")
         ax_perm.axvline(ci_low, color="gray", linewidth=1.5, linestyle="--")
-        ax_perm.axvline(ci_high, color="gray", linewidth=1.5, linestyle="--", label="95% CI")
-        textstr = f"n={summary['resample_size']}\nB={summary['num_resamples']}"
-        props = dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="gray")
-        ax_perm.text(0.95, 0.95, textstr, transform=ax_perm.transAxes, fontsize=10,
-                     verticalalignment="top", horizontalalignment="right", bbox=props)
+        ax_perm.axvline(ci_high, color="gray", linewidth=1.5, linestyle="--")
+        line_handles = [
+            Line2D([0], [0], color=sel_color, linewidth=2.5, linestyle="--"),
+            Line2D([0], [0], color="gray", linewidth=1.5, linestyle="-"),
+            Line2D([0], [0], color="gray", linewidth=1.5, linestyle="--"),
+        ]
+        line_labels = [
+            f"Selected mean = {observed:.4f}",
+            f"Resample median = {median:.4f}",
+            f"95% CI = [{ci_low:.4f}, {ci_high:.4f}]",
+        ]
+        ax_perm.legend(
+            line_handles,
+            line_labels,
+            loc="upper right",
+            fontsize=8,
+            frameon=True,
+            borderpad=0.4,
+            handlelength=2.2,
+            labelspacing=0.4,
+        )
     else:
         ax_perm.text(0.5, 0.5, "No resamples", transform=ax_perm.transAxes,
                      fontsize=11, horizontalalignment="center", verticalalignment="center")
