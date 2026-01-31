@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 
 
 PARAM_KEYS = ("task", "bold", "beta", "smooth", "gamma")
+_SUBJECT_RE = re.compile(r"^sub[-_]?(\d+)$", re.IGNORECASE)
+_SESSION_RE = re.compile(r"^ses[-_]?(\d+)$", re.IGNORECASE)
 
 
 def _parse_params(name: str) -> Tuple[dict, Optional[float]]:
@@ -68,6 +70,42 @@ def _sort_key(path: Path) -> tuple:
         except ValueError:
             key.append(float("inf"))
     return tuple(key)
+
+
+def _normalize_subject_folder(subject: str, session: Optional[str]) -> str:
+    subject = subject.strip()
+    if not subject:
+        return subject
+    lowered = subject.lower()
+    if "ses" in lowered:
+        return subject
+    match = _SUBJECT_RE.match(subject)
+    subj_id = match.group(1) if match else subject
+    if subj_id.isdigit():
+        subj_id = subj_id.zfill(2)
+        subject_label = f"sub{subj_id}"
+    else:
+        subject_label = subject if subject.startswith("sub") else f"sub{subj_id}"
+    if session is None:
+        session = "1"
+    if session == "":
+        return subject_label
+    ses_match = _SESSION_RE.match(session)
+    ses_id = ses_match.group(1) if ses_match else session
+    return f"{subject_label}-ses{ses_id}"
+
+
+def _resolve_input_dir(input_dir: Path, subject: Optional[str], session: Optional[str]) -> Path:
+    if not subject:
+        return input_dir
+    subject = subject.strip()
+    if not subject:
+        return input_dir
+    subject_path = Path(subject)
+    if subject_path.is_absolute() or len(subject_path.parts) > 1:
+        return subject_path
+    subject_folder = _normalize_subject_folder(subject, session)
+    return input_dir / subject_folder
 
 
 def _load_mask(
@@ -206,7 +244,17 @@ def main():
     parser.add_argument(
         "--input-dir",
         default="Results",
-        help="Directory containing NIfTI maps (default: Results).",
+        help="Results root directory containing NIfTI maps (default: Results).",
+    )
+    parser.add_argument(
+        "--subject",
+        default=None,
+        help="Subject identifier or Results subfolder (e.g., 9, sub09, sub09-ses1).",
+    )
+    parser.add_argument(
+        "--session",
+        default=None,
+        help="Session identifier when building the subject folder (default: 1).",
     )
     parser.add_argument(
         "--pattern",
@@ -253,18 +301,18 @@ def main():
     )
     parser.add_argument(
         "--output",
-        default="Results/dice_voe_heatmap.png",
-        help="Path for combined heatmap image (Dice + VOE).",
+        default=None,
+        help="Path for combined heatmap image (Dice + VOE). Defaults to <input-dir>/dice_voe_heatmap.png.",
     )
     parser.add_argument(
         "--matrix-csv",
-        default="Results/dice_matrix.csv",
-        help="Path for CSV output of the DSC matrix.",
+        default=None,
+        help="Path for CSV output of the DSC matrix. Defaults to <input-dir>/dice_matrix.csv.",
     )
     parser.add_argument(
         "--voe-matrix-csv",
-        default="Results/voe_matrix.csv",
-        help="Path for CSV output of the VOE matrix.",
+        default=None,
+        help="Path for CSV output of the VOE matrix. Defaults to <input-dir>/voe_matrix.csv.",
     )
     parser.add_argument(
         "--dpi",
@@ -274,7 +322,10 @@ def main():
     )
     args = parser.parse_args()
 
-    input_dir = Path(args.input_dir)
+    input_dir = _resolve_input_dir(Path(args.input_dir), args.subject, args.session)
+    output_path = Path(args.output) if args.output else input_dir / "dice_voe_heatmap.png"
+    matrix_csv = Path(args.matrix_csv) if args.matrix_csv else input_dir / "dice_matrix.csv"
+    voe_matrix_csv = Path(args.voe_matrix_csv) if args.voe_matrix_csv else input_dir / "voe_matrix.csv"
     paths = _select_paths(input_dir, args.pattern, args.include, args.exclude, args.recursive)
     if not paths:
         raise SystemExit(f"No files matched in {input_dir} with pattern {args.pattern}.")
@@ -308,13 +359,13 @@ def main():
             voe_matrix[i, j] = voe_val
             voe_matrix[j, i] = voe_val
 
-    _write_csv(matrix, labels, Path(args.matrix_csv))
-    _write_csv(voe_matrix, labels, Path(args.voe_matrix_csv))
-    _plot_combined_heatmaps(matrix, voe_matrix, labels, Path(args.output), args.dpi)
+    _write_csv(matrix, labels, matrix_csv)
+    _write_csv(voe_matrix, labels, voe_matrix_csv)
+    _plot_combined_heatmaps(matrix, voe_matrix, labels, output_path, args.dpi)
 
-    print(f"Wrote DSC matrix: {args.matrix_csv}")
-    print(f"Wrote VOE matrix: {args.voe_matrix_csv}")
-    print(f"Wrote heatmaps: {args.output}")
+    print(f"Wrote DSC matrix: {matrix_csv}")
+    print(f"Wrote VOE matrix: {voe_matrix_csv}")
+    print(f"Wrote heatmaps: {output_path}")
 
 
 if __name__ == "__main__":
