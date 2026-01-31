@@ -382,6 +382,40 @@ def _summarize_distribution(dist, ci_level=BALANCED_CI_LEVEL):
     }
 
 
+def _q_factor_single(sample):
+    """Compute Q-factor for a single distribution (mean / std)."""
+    if sample.size < 2:
+        return float("nan")
+    mean = float(np.mean(sample))
+    std = float(np.std(sample, ddof=1))
+    if not np.isfinite(std) or std <= 0:
+        return float("nan")
+    return mean / std
+
+
+def _add_text_under_legend(ax, fig, text, fontsize=9):
+    """Place a text box just below the legend, if it exists."""
+    legend = ax.get_legend()
+    if legend is None:
+        return
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    bbox = legend.get_window_extent(renderer=renderer)
+    bbox_axes = bbox.transformed(ax.transAxes.inverted())
+    x = min(max(bbox_axes.x1, 0.02), 0.98)
+    y = max(bbox_axes.y0 - 0.02, 0.02)
+    ax.text(
+        x,
+        y,
+        text,
+        transform=ax.transAxes,
+        fontsize=fontsize,
+        ha="right",
+        va="top",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8, edgecolor="gray"),
+    )
+
+
 def _balanced_resample_stats(
     selected_vals,
     nonselected_vals,
@@ -804,6 +838,14 @@ def _plot_comprehensive_figure(
     ax_kde.set_ylabel("Density", fontsize=11)
     ax_kde.set_title("A. Variability Distributions in Motor Cortex", fontsize=12, fontweight="bold")
     ax_kde.legend(loc="upper right", fontsize=9)
+    q_sel = _q_factor_single(selected_vals)
+    q_non = _q_factor_single(nonselected_vals)
+    q_text = (
+        f"Q_sel = {q_sel:.3f}\nQ_non = {q_non:.3f}"
+        if np.isfinite(q_sel) and np.isfinite(q_non)
+        else "Q_sel = n/a\nQ_non = n/a"
+    )
+    _add_text_under_legend(ax_kde, fig, q_text, fontsize=9)
     ax_kde.set_xlim(xmin, xmax)
     ax_kde.spines["top"].set_visible(False)
     ax_kde.spines["right"].set_visible(False)
@@ -1130,6 +1172,14 @@ def _plot_enhanced_figure(
     ax_var.set_xlabel("Trial-to-Trial Variance", fontsize=11)
     ax_var.set_ylabel("Density", fontsize=11)
     ax_var.legend(loc="upper right", fontsize=9)
+    q_sel_raw = _q_factor_single(selected_vals)
+    q_non_raw = _q_factor_single(nonselected_vals)
+    q_text_raw = (
+        f"Q_sel = {q_sel_raw:.3f}\nQ_non = {q_non_raw:.3f}"
+        if np.isfinite(q_sel_raw) and np.isfinite(q_non_raw)
+        else "Q_sel = n/a\nQ_non = n/a"
+    )
+    _add_text_under_legend(ax_var, fig, q_text_raw, fontsize=9)
     ax_var.set_xlim(xmin_raw, xmax_raw)
     ax_var.spines["top"].set_visible(False)
     ax_var.spines["right"].set_visible(False)
@@ -1162,6 +1212,14 @@ def _plot_enhanced_figure(
     ax_log.set_xlabel("Log₁₀(Trial-to-Trial Variance)", fontsize=11)
     ax_log.set_ylabel("Density", fontsize=11)
     ax_log.legend(loc='upper right', fontsize=9)
+    q_sel_log = _q_factor_single(log_selected)
+    q_non_log = _q_factor_single(log_nonselected)
+    q_text_log = (
+        f"Q_sel = {q_sel_log:.3f}\nQ_non = {q_non_log:.3f}"
+        if np.isfinite(q_sel_log) and np.isfinite(q_non_log)
+        else "Q_sel = n/a\nQ_non = n/a"
+    )
+    _add_text_under_legend(ax_log, fig, q_text_log, fontsize=9)
     ax_log.set_xlim(xmin, xmax)
     ax_log.spines['top'].set_visible(False)
     ax_log.spines['right'].set_visible(False)
