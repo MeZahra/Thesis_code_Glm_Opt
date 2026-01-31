@@ -99,6 +99,12 @@ def _dice(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     return (2.0 * overlap / denom) if denom else np.nan
 
 
+def _voe(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    overlap = np.count_nonzero(mask_a & mask_b)
+    union = np.count_nonzero(mask_a | mask_b)
+    return (1.0 - (overlap / union)) if union else np.nan
+
+
 def _select_paths(
     root: Path, pattern: str, include: Optional[str], exclude: Optional[str], recursive: bool
 ) -> list:
@@ -147,9 +153,55 @@ def _plot_heatmap(matrix: np.ndarray, labels: list, out_path: Path, dpi: int) ->
     plt.close(fig)
 
 
+def _format_heatmap_axis(ax, labels: list) -> None:
+    n = len(labels)
+    ax.set_xticks(np.arange(n))
+    ax.set_yticks(np.arange(n))
+    ax.set_xticklabels(labels, rotation=90, fontsize=7)
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.set_xlabel("Network (parameter set)")
+    ax.set_ylabel("Network (parameter set)")
+    ax.set_xticks(np.arange(-0.5, n, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, n, 1), minor=True)
+    ax.grid(which="minor", color="white", linestyle="-", linewidth=0.3)
+    ax.tick_params(which="minor", bottom=False, left=False)
+
+
+def _plot_combined_heatmaps(
+    dice_matrix: np.ndarray,
+    voe_matrix: np.ndarray,
+    labels: list,
+    out_path: Path,
+    dpi: int,
+) -> None:
+    n = len(labels)
+    base = max(6, min(16, 0.4 * n))
+    fig, axes = plt.subplots(1, 2, figsize=(2 * base, base))
+
+    im_dice = axes[0].imshow(dice_matrix, vmin=0, vmax=1, cmap="magma")
+    axes[0].set_title("Dice overlap", fontsize=10)
+    _format_heatmap_axis(axes[0], labels)
+    cbar_dice = fig.colorbar(im_dice, ax=axes[0], fraction=0.046, pad=0.04)
+    cbar_dice.set_label("Dice overlap")
+
+    im_voe = axes[1].imshow(voe_matrix, vmin=0, vmax=1, cmap="magma_r")
+    axes[1].set_title("Volumetric overlap error", fontsize=10)
+    _format_heatmap_axis(axes[1], labels)
+    cbar_voe = fig.colorbar(im_voe, ax=axes[1], fraction=0.046, pad=0.04)
+    cbar_voe.set_label("VOE (1 - Jaccard)")
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Compute pairwise Dice Similarity Coefficient (DSC) for NIfTI networks and plot a heatmap."
+        description=(
+            "Compute pairwise Dice Similarity Coefficient (DSC) and volumetric overlap error (VOE) "
+            "for NIfTI networks and plot heatmaps."
+        )
     )
     parser.add_argument(
         "--input-dir",
@@ -201,13 +253,18 @@ def main():
     )
     parser.add_argument(
         "--output",
-        default="Results/dice_heatmap.png",
-        help="Path for heatmap image.",
+        default="Results/dice_voe_heatmap.png",
+        help="Path for combined heatmap image (Dice + VOE).",
     )
     parser.add_argument(
         "--matrix-csv",
         default="Results/dice_matrix.csv",
         help="Path for CSV output of the DSC matrix.",
+    )
+    parser.add_argument(
+        "--voe-matrix-csv",
+        default="Results/voe_matrix.csv",
+        help="Path for CSV output of the VOE matrix.",
     )
     parser.add_argument(
         "--dpi",
@@ -239,18 +296,25 @@ def main():
 
     n = len(paths)
     matrix = np.zeros((n, n), dtype=np.float32)
+    voe_matrix = np.zeros((n, n), dtype=np.float32)
     for i in range(n):
         matrix[i, i] = 1.0
+        voe_matrix[i, i] = 0.0
         for j in range(i + 1, n):
-            val = _dice(masks[i], masks[j])
-            matrix[i, j] = val
-            matrix[j, i] = val
+            dice_val = _dice(masks[i], masks[j])
+            voe_val = _voe(masks[i], masks[j])
+            matrix[i, j] = dice_val
+            matrix[j, i] = dice_val
+            voe_matrix[i, j] = voe_val
+            voe_matrix[j, i] = voe_val
 
     _write_csv(matrix, labels, Path(args.matrix_csv))
-    _plot_heatmap(matrix, labels, Path(args.output), args.dpi)
+    _write_csv(voe_matrix, labels, Path(args.voe_matrix_csv))
+    _plot_combined_heatmaps(matrix, voe_matrix, labels, Path(args.output), args.dpi)
 
     print(f"Wrote DSC matrix: {args.matrix_csv}")
-    print(f"Wrote heatmap: {args.output}")
+    print(f"Wrote VOE matrix: {args.voe_matrix_csv}")
+    print(f"Wrote heatmaps: {args.output}")
 
 
 if __name__ == "__main__":
