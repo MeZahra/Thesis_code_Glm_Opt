@@ -10,6 +10,7 @@ gray_matter_data/
 *.txt
 *.log
 *.jsonl
+*.pdf
 
 data/
 results/

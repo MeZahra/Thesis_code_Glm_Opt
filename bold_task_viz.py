@@ -67,6 +67,110 @@ def _load_model(model_path):
     return model["betasmd"], model["HRFindexrun"]
 
 
+def _load_trial_keep_mask(run, base_dirs):
+    """Load trial_keep_run*.npy mask from the first directory that contains it."""
+    if base_dirs is None:
+        return None, None
+    if not isinstance(base_dirs, (list, tuple)):
+        base_dirs = [base_dirs]
+    for base_dir in base_dirs:
+        if base_dir is None:
+            continue
+        path = Path(base_dir) / f"trial_keep_run{run}.npy"
+        if not path.exists():
+            continue
+        keep = np.load(path, allow_pickle=True)
+        keep = np.asarray(keep)
+        if keep.dtype != bool:
+            raise ValueError(f"trial_keep_run{run}.npy must be boolean, got dtype={keep.dtype}.")
+        if keep.ndim != 1:
+            raise ValueError(f"trial_keep_run{run}.npy must be 1D, got shape={keep.shape}.")
+        return keep, path
+    return None, None
+
+
+def _active_trial_indices(design_single, eps=1e-6):
+    """Return indices of trials with any nonzero design entry."""
+    design = np.asarray(design_single)
+    if design.ndim != 2:
+        raise ValueError(f"Design matrix must be 2D, got shape {design.shape}.")
+    active = np.flatnonzero(np.sum(np.abs(design), axis=0) > eps)
+    if active.size == 0:
+        return np.arange(design.shape[1], dtype=np.int64)
+    return active.astype(np.int64, copy=False)
+
+
+def _resolve_trial_indices_by_run(design_single_list, trial_keep_masks, numtrials):
+    """Resolve per-run trial indices using trial_keep masks when possible."""
+    numruns = len(design_single_list)
+    active_by_run = [_active_trial_indices(design) for design in design_single_list]
+    if not trial_keep_masks:
+        return active_by_run
+
+    shared_design = all(design.shape[1] == numtrials for design in design_single_list)
+    have_all = all(mask is not None for mask in trial_keep_masks)
+    keep_counts = [int(np.count_nonzero(mask)) if mask is not None else None for mask in trial_keep_masks]
+
+    if shared_design and have_all:
+        total_keep = int(np.sum(keep_counts))
+        if total_keep == numtrials:
+            indices_by_run = []
+            start = 0
+            for run_idx, (count, active) in enumerate(zip(keep_counts, active_by_run), start=1):
+                idx = np.arange(start, start + count, dtype=np.int64)
+                if active.size and active.size != count:
+                    print(
+                        f"Warning: Run {run_idx} active trials ({active.size}) "
+                        f"do not match trial_keep count ({count}); using active columns.",
+                        flush=True,
+                    )
+                    idx = active
+                elif active.size and not np.array_equal(active, idx):
+                    print(
+                        f"Warning: Run {run_idx} active columns do not match trial_keep ordering; "
+                        "using active columns.",
+                        flush=True,
+                    )
+                    idx = active
+                indices_by_run.append(idx)
+                start += count
+            return indices_by_run
+        print(
+            f"Warning: trial_keep counts sum to {total_keep}, expected {numtrials}; "
+            "falling back to design-based trial indices.",
+            flush=True,
+        )
+
+    indices_by_run = []
+    for run_idx, (design, active, mask) in enumerate(zip(design_single_list, active_by_run, trial_keep_masks), start=1):
+        if mask is None:
+            indices_by_run.append(active)
+            continue
+        mask = np.asarray(mask, dtype=bool)
+        if mask.ndim != 1:
+            raise ValueError(f"trial_keep_run{run_idx}.npy must be 1D, got shape={mask.shape}.")
+        if mask.size == design.shape[1]:
+            keep_cols = np.flatnonzero(mask)
+            if active.size and active.size != design.shape[1]:
+                keep_cols = keep_cols[np.isin(keep_cols, active)]
+            indices_by_run.append(keep_cols.astype(np.int64, copy=False))
+            continue
+        if mask.size == active.size:
+            indices_by_run.append(active[mask])
+            continue
+        if int(np.count_nonzero(mask)) == active.size:
+            indices_by_run.append(active)
+            continue
+        print(
+            f"Warning: trial_keep_run{run_idx}.npy length {mask.size} "
+            f"does not align with design columns ({design.shape[1]}) or active trials ({active.size}); "
+            "using active columns.",
+            flush=True,
+        )
+        indices_by_run.append(active)
+    return indices_by_run
+
+
 def _flatten_betas(betasmd):
     """Reshape beta volume to (voxels, trials) and return volume shape."""
     if betasmd.ndim < 2:
@@ -1460,6 +1564,8 @@ def main():
     parser.add_argument("--design-path", default="data/sub09_ses01/DESIGNINFO.npy")
     parser.add_argument("--out-dir", default="data/sub09_ses01")
     parser.add_argument("--output-prefix", default="data/sub09_ses01/voxel_weights_mean_foldavg_sub09_ses1_task0.8_bold1_beta0.5_smooth1.2_gamma1.5", help="Prefix used to locate indices files and name outputs.")
+    parser.add_argument("--trial-keep-dir", default=None, help="Directory containing trial_keep_run*.npy (default: out-dir).")
+    parser.add_argument("--trial-keep-run", type=int, default=None, help="Restrict analysis outputs to trials from this run (1-based) using trial_keep_run*.npy.")
     parser.add_argument("--trial-len", type=int, default=9, help="Number of TRs per trial segment.")
     parser.add_argument("--chunk-size", type=int, default=2048, help="Voxel chunk size for matrix multiplies.")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for resampling.")
@@ -1519,6 +1625,44 @@ def main():
                     f"from masks in {mask_dir}.",
                     flush=True,
                 )
+
+    if args.trial_keep_run is not None:
+        if args.trial_keep_run < 1 or args.trial_keep_run > numruns:
+            raise ValueError(f"trial-keep-run must be between 1 and {numruns}, got {args.trial_keep_run}.")
+        if args.trial_keep_run not in runs:
+            raise ValueError(f"trial-keep-run {args.trial_keep_run} must be included in --runs ({runs}).")
+        runs = [args.trial_keep_run]
+
+    if args.trial_keep_run is not None:
+        output_tag = f"{output_tag}_run{args.trial_keep_run}"
+
+    trial_keep_dirs = []
+    if args.trial_keep_dir:
+        trial_keep_dirs.append(_resolve_path(args.trial_keep_dir))
+    trial_keep_dirs.append(out_dir)
+    if model_path.parent not in trial_keep_dirs:
+        trial_keep_dirs.append(model_path.parent)
+
+    trial_keep_masks = []
+    trial_keep_paths = {}
+    for run in range(1, numruns + 1):
+        mask, path = _load_trial_keep_mask(run, trial_keep_dirs)
+        trial_keep_masks.append(mask)
+        if path is not None:
+            trial_keep_paths[run] = path
+
+    if args.trial_keep_run is not None and trial_keep_masks[args.trial_keep_run - 1] is None:
+        raise FileNotFoundError(
+            f"trial_keep_run{args.trial_keep_run}.npy not found in {trial_keep_dirs}."
+        )
+
+    trial_indices_by_run = _resolve_trial_indices_by_run(design_single_list, trial_keep_masks, numtrials)
+    trial_keep_counts = None
+    if any(mask is not None for mask in trial_keep_masks):
+        trial_keep_counts = [
+            int(np.count_nonzero(mask)) if mask is not None else None
+            for mask in trial_keep_masks
+        ]
 
     run_indices = [run - 1 for run in runs]
     if min(run_indices) < 0 or max(run_indices) >= numruns:
@@ -1580,9 +1724,13 @@ def main():
         xbeta[:, time_offset : time_offset + run_timepoints] = pred
 
         onsets = _trial_onsets_from_design(design_single)
+        trial_indices = trial_indices_by_run[run_idx]
+        if trial_indices is None:
+            trial_indices = np.arange(onsets.size, dtype=np.int64)
         used = 0
         skipped = 0
-        for onset in onsets:
+        for trial_idx in trial_indices:
+            onset = onsets[trial_idx]
             if onset < 0:
                 skipped += 1
                 continue
@@ -1598,7 +1746,8 @@ def main():
         total_used += used
         total_skipped += skipped
         print(
-            f"Run {run}: predicted {pred.shape}, trials used={used}, skipped={skipped}.",
+            f"Run {run}: predicted {pred.shape}, "
+            f"trials selected={trial_indices.size}, used={used}, skipped={skipped}.",
             flush=True,
         )
 
@@ -1686,6 +1835,12 @@ def main():
         "hist_subsample": bool(args.hist_subsample),
         "hist_motor_count": int(hist_motor_vals.size),
     })
+    if args.trial_keep_run is not None:
+        stats_summary["trial_keep_run"] = int(args.trial_keep_run)
+    if trial_keep_counts is not None:
+        stats_summary["trial_keep_counts"] = trial_keep_counts
+    if trial_keep_paths:
+        stats_summary["trial_keep_paths"] = {str(run): str(path) for run, path in trial_keep_paths.items()}
 
     hist_path = out_dir / f"{output_tag}_voxel_var_hist.png"
     _plot_histogram_comparison(
@@ -1771,6 +1926,12 @@ def main():
         "selected_median_variance": float(np.median(selected_motor_vals)),
         "nonselected_median_variance": float(np.median(nonselected_motor_vals)),
     })
+    if args.trial_keep_run is not None:
+        motor_summary["trial_keep_run"] = int(args.trial_keep_run)
+    if trial_keep_counts is not None:
+        motor_summary["trial_keep_counts"] = trial_keep_counts
+    if trial_keep_paths:
+        motor_summary["trial_keep_paths"] = {str(run): str(path) for run, path in trial_keep_paths.items()}
 
     observed_selected_mean = motor_summary["observed_selected_mean"]
     resample_median = motor_summary["nonselected_resample_mean_median"]
