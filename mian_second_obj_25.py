@@ -162,7 +162,7 @@ def compute_distance_weighted_adjacency(coords, affine, radius_mm=3.0, sigma_mm=
     return adjacency, degree_matrix
 # %%
 # Subject/session (edit these only; SUB/SES env vars override when set)
-sub = os.environ.get("SUB", "10")
+sub = os.environ.get("SUB", "9")
 ses = int(os.environ.get("SES", "1"))
 sub_dir = str(sub).zfill(2)
 ses_dir = str(ses).zfill(2)
@@ -1623,11 +1623,11 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
 # # %%
 ridge_penalty = 1e-3
 solver_name = "MOSEK"
-# penalty_sweep = [(0.8, 1, 0.5, 1.2, 1.0)] #for sub09   gamma = 1.5
+penalty_sweep = [(0.8, 1, 0.5, 1.2, 1.0)] #for sub09   gamma = 1.5
 # penalty_sweep = [(0.8, 1.5, 0.8, 2, 1.0)] #for sub10  gamma = 1.5
 # penalty_sweep = [(1, 2, 1, 3, 1.0)] #for sub10  gamma = 2
-penalty_sweep = [(0.8, 1.5, 0.8, 2, 1.0), (0, 1.5, 0.8, 2, 1.0), (0.8, 0, 0.8, 2, 1.0), (0.8, 1.5, 0, 2, 1.0), 
-                 (0.8, 1.5, 0.8, 0, 1.0), (0.8, 0, 0, 0, 1.0), (0, 1.5, 0, 0, 1.0), (0, 0, 0.8, 0, 1.0), (0, 0, 0, 2, 1.0)] #for sub10
+# penalty_sweep = [(0.8, 1.5, 0.8, 2, 1.0), (0, 1.5, 0.8, 2, 1.0), (0.8, 0, 0.8, 2, 1.0), (0.8, 1.5, 0, 2, 1.0), 
+#                  (0.8, 1.5, 0.8, 0, 1.0), (0.8, 0, 0, 0, 1.0), (0, 1.5, 0, 0, 1.0), (0, 0, 0.8, 0, 1.0), (0, 0, 0, 2, 1.0)] #for sub10
 
 alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha,
     "smooth_penalty": smooth_alpha, "corr_weight": corr_weight}
