@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import nibabel as nib
-from nilearn import image
+from nilearn import image, masking
 
 import matplotlib
 
@@ -42,6 +42,31 @@ def _auto_background(results_dir: Path) -> Path | None:
 def _load_canonical(path: Path) -> nib.Nifti1Image:
     img = nib.load(str(path))
     return nib.as_closest_canonical(img)
+
+
+def _load_brain_mask(mask_path: Path, ref_img: nib.Nifti1Image | None) -> np.ndarray:
+    mask_img = _load_canonical(mask_path)
+    if ref_img is not None and (
+        mask_img.shape != ref_img.shape or not np.allclose(mask_img.affine, ref_img.affine)
+    ):
+        mask_img = image.resample_to_img(mask_img, ref_img, interpolation="nearest")
+    mask_data = mask_img.get_fdata(dtype=np.float32)
+    return mask_data > 0.5
+
+
+def _compute_brain_mask(bg_img: nib.Nifti1Image, fallback_percentile: float) -> np.ndarray | None:
+    try:
+        mask_img = masking.compute_brain_mask(bg_img)
+        return mask_img.get_fdata(dtype=np.float32) > 0
+    except Exception as exc:  # pragma: no cover - best-effort fallback for unusual images
+        print(f"Warning: auto brain-mask failed ({exc}); using percentile fallback.", flush=True)
+
+    bg_data = np.nan_to_num(bg_img.get_fdata(dtype=np.float32))
+    positive = bg_data[bg_data > 0]
+    if positive.size == 0:
+        return None
+    threshold = np.percentile(positive, fallback_percentile)
+    return bg_data > threshold
 
 
 def _resample_overlay(overlay_img: nib.Nifti1Image, bg_img: nib.Nifti1Image) -> nib.Nifti1Image:
@@ -164,6 +189,18 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Create axial-slice mosaics for each NIfTI in Results.")
     parser.add_argument("--results-dir", type=Path, default=default_results, help="Directory with NIfTI results.")
     parser.add_argument("--bg", type=Path, default=None, help="Background anatomical NIfTI.")
+    parser.add_argument("--brain-mask", type=Path, default=None, help="Brain mask NIfTI to clean background.")
+    parser.add_argument(
+        "--no-brain-mask",
+        action="store_true",
+        help="Disable brain-masking of the background/overlay.",
+    )
+    parser.add_argument(
+        "--mask-percentile",
+        type=float,
+        default=5.0,
+        help="Fallback percentile for auto mask if brain-mask inference fails.",
+    )
     parser.add_argument("--out-dir", type=Path, default=None, help="Output directory for mosaics.")
     parser.add_argument("--n-slices", type=int, default=48, help="Number of slices to show per mosaic.")
     parser.add_argument("--n-cols", type=int, default=8, help="Number of columns in the mosaic grid.")
@@ -194,6 +231,17 @@ def main() -> None:
 
     bg_path = args.bg or _auto_background(results_dir)
     bg_img = _load_canonical(bg_path) if bg_path else None
+    brain_mask = None
+    if bg_img is not None and not args.no_brain_mask:
+        if args.brain_mask:
+            brain_mask = _load_brain_mask(args.brain_mask, bg_img)
+            print(f"Using brain mask: {args.brain_mask}", flush=True)
+        else:
+            brain_mask = _compute_brain_mask(bg_img, args.mask_percentile)
+            if brain_mask is not None:
+                print("Computed brain mask from background.", flush=True)
+            else:
+                print("Warning: could not derive a brain mask from background.", flush=True)
     if bg_path:
         print(f"Using background: {bg_path}", flush=True)
     else:
@@ -223,10 +271,16 @@ def main() -> None:
         if bg_img is not None:
             overlay_img = _resample_overlay(overlay_img, bg_img)
             bg_data = np.nan_to_num(bg_img.get_fdata(dtype=np.float32))
+            if brain_mask is not None:
+                bg_data = bg_data.copy()
+                bg_data[~brain_mask] = 0
         else:
             bg_data = np.zeros(overlay_img.shape, dtype=np.float32)
 
         overlay_data = np.nan_to_num(overlay_img.get_fdata(dtype=np.float32))
+        if brain_mask is not None and overlay_data.shape == brain_mask.shape:
+            overlay_data = overlay_data.copy()
+            overlay_data[~brain_mask] = 0
         if args.use_abs:
             overlay_data = np.abs(overlay_data)
 

@@ -162,7 +162,7 @@ def compute_distance_weighted_adjacency(coords, affine, radius_mm=3.0, sigma_mm=
     return adjacency, degree_matrix
 # %%
 # Subject/session (edit these only; SUB/SES env vars override when set)
-sub = os.environ.get("SUB", "9")
+sub = os.environ.get("SUB", "10")
 ses = int(os.environ.get("SES", "1"))
 sub_dir = str(sub).zfill(2)
 ses_dir = str(ses).zfill(2)
