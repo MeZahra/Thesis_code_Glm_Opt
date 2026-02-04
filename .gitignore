@@ -9,6 +9,8 @@
 gray_matter_data/
 *.txt
 *.log
+*.jsonl
+*.pdf
 
 data/
 results/
@@ -21,6 +23,8 @@ analysis_motor_cortex/
 empca/
 codex_m1_search/
 tmp_param_sweep/
+.cache/
+nilearn_data/
 
 # python cruft
 __pycache__/
@@ -46,3 +50,4 @@ slurm-*.err
 
 GLMsingle/glmsingle/
 tmp/
+*.md

@@ -303,9 +303,7 @@ def empca(data, weights=None, niter=25, nvec=5, smooth=0, randseed=1, silent=Fal
         print("       iter        R2             rchi2")
     
     for k in range(niter):
-        print(1)
         model.solve_coeffs()
-        print(2)
         model.solve_eigenvectors(smooth=smooth)
         if not silent:
             print('EMPCA %2d/%2d  %15.8f %15.8f' % \

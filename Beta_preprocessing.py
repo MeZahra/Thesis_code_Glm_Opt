@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import gc
 from pathlib import Path
 import nibabel as nib
 import numpy as np
@@ -14,9 +15,11 @@ from statsmodels.stats.multitest import multipletests
 import scipy.ndimage as ndimage
 from nilearn import datasets, image, plotting
 
-DATA_DIRNAME = 'sub09_ses1'
-sub = '09'
-ses = 1
+# Subject/session (edit these only; SUB/SES env vars override when set)
+sub = os.environ.get("SUB", "9")
+ses = os.environ.get("SES", "1")
+DATA_DIRNAME = f"sub{sub}_ses{ses}"
+DATA_BASEDIR = Path(os.environ.get("FMRI_OPT_DATA_DIR", "/scratch/st-mmckeown-1/zkavian/fmri_opt/Thesis_code_Glm_Opt/data")).expanduser()
 RUNS = (1, 2)
 RUN_TAG = "_".join(str(r) for r in RUNS)
 TRIAL_LEN = 9
@@ -675,7 +678,9 @@ def main():
     args = _parse_args()
     selected_runs = _parse_runs_arg(args.runs, RUNS)
     run_tag = "_".join(str(r) for r in selected_runs)
-    data_root = (Path.cwd() / DATA_DIRNAME).resolve()
+    data_root = (DATA_BASEDIR / DATA_DIRNAME).resolve()
+    if not data_root.exists():
+        data_root = DATA_BASEDIR.resolve()
     
     print("Define Parameters ....")
     fdr_alpha = 0.2   # FDR alpha for voxelwise t-tests. Relaxed to 0.2 for motor discovery
@@ -708,16 +713,45 @@ def main():
     bold_paths = [data_root / f'{sub_label}_ses-{ses}_run-{r}_task-mv_bold_corrected_smoothed_reg.nii.gz' for r in selected_runs]
     data_paths = {'bold': bold_paths[0], 'anat': data_root / f'{sub_label}_ses-{ses}_T1w_brain.nii.gz',
         'brain': data_root / f'{sub_label}_ses-{ses}_T1w_brain_mask.nii.gz', 'csf': data_root / f'{sub_label}_ses-{ses}_T1w_brain_pve_0.nii.gz', 'gray': data_root / f'{sub_label}_ses-{ses}_T1w_brain_pve_1.nii.gz'}
+    missing = {k: str(p) for k, p in data_paths.items() if not Path(p).exists()}
+    if missing:
+        msg = ["Missing required input files:"]
+        msg.extend([f"  - {k}: {p}" for k, p in sorted(missing.items())])
+        msg.append(f"Resolved data_root: {data_root}")
+        msg.append("Hint: set FMRI_OPT_DATA_DIR to the folder containing these files.")
+        raise FileNotFoundError("\n".join(msg))
     anat_img = nib.load(str(data_paths['anat']))
     bold_imgs = [nib.load(str(path)) for path in bold_paths]
     bold_img = bold_imgs[0]
-    bold_data = np.concatenate([img.get_fdata() for img in bold_imgs], axis=3)
+    # Important for memory: nibabel defaults to float64; keep BOLD as float32.
+    bold_data = np.concatenate([img.get_fdata(dtype=np.float32) for img in bold_imgs], axis=3).astype(np.float32, copy=False)
     volume_shape = anat_img.shape[:3]
     glmsingle_file = Path(args.glmsingle_file) if args.glmsingle_file else (data_root / 'TYPED_FITHRF_GLMDENOISE_RR.npy')
+    if not glmsingle_file.is_absolute():
+        glmsingle_file = (Path.cwd() / glmsingle_file).resolve()
     if not glmsingle_file.exists():
-        raise FileNotFoundError(f"GLMsingle output not found: {glmsingle_file}")
+        fallbacks = [
+            DATA_BASEDIR / 'TYPED_FITHRF_GLMDENOISE_RR.npy',
+            DATA_BASEDIR / 'GLMsingle' / f'GLMOutputs-sub{sub}-ses{ses}-std' / 'TYPED_FITHRF_GLMDENOISE_RR.npy',
+        ]
+        for candidate in fallbacks:
+            if candidate.exists():
+                glmsingle_file = candidate.resolve()
+                break
+    if not glmsingle_file.exists():
+        tried = [str(Path(args.glmsingle_file).expanduser())] if args.glmsingle_file else [str((data_root / 'TYPED_FITHRF_GLMDENOISE_RR.npy').resolve())]
+        tried.extend([str(p) for p in [
+            (DATA_BASEDIR / 'TYPED_FITHRF_GLMDENOISE_RR.npy').resolve(),
+            (DATA_BASEDIR / 'GLMsingle' / f'GLMOutputs-sub{sub}-ses{ses}-std' / 'TYPED_FITHRF_GLMDENOISE_RR.npy').resolve(),
+        ]])
+        raise FileNotFoundError(
+            "GLMsingle output not found. Tried:\n  - " + "\n  - ".join(tried) +
+            f"\nHint: set FMRI_OPT_DATA_DIR to the folder containing the GLMsingle output."
+        )
     glm_dict = np.load(str(glmsingle_file), allow_pickle=True).item()
-    beta_glm = glm_dict['betasmd']
+    # Important for memory: downstream arrays can be huge; keep betas as float32.
+    beta_glm = np.asarray(glm_dict['betasmd'], dtype=np.float32)
+    del glm_dict
     back_mask = nib.load(str(data_paths['brain'])).get_fdata(dtype=np.float32)
     csf_mask = nib.load(str(data_paths['csf'])).get_fdata(dtype=np.float32)
     gray_mask = nib.load(str(data_paths['gray'])).get_fdata(dtype=np.float32)
@@ -740,40 +774,40 @@ def main():
     print("Apply Masking on Bold data...")
     csf_mask_data = csf_mask > 0
     back_mask_data = back_mask > 0
+    beta_subset_mask = None
+    beta_indices = None
+    beta_mask_count = None
     if args.mask_indices:
         nonzero_mask = _load_mask_indices(args.mask_indices)
         keep_voxels = np.ones(nonzero_mask[0].shape[0], dtype=bool)
         print(f"Using mask indices from {args.mask_indices}.", flush=True)
         if args.gray_threshold is not None:
             print("Note: --gray-threshold is ignored when --mask-indices is set.", flush=True)
-
-        # Create mapping from beta_glm voxels to mask_indices voxels
-        # beta_glm was created with a gray threshold of 0.5, but mask_indices may be a subset
-        # We need to find which voxels in beta_glm correspond to mask_indices
-        gray_mask_data = gray_mask > 0.5  # The threshold used when creating beta_glm
+        # Precompute the GLM mask count for a fallback remapping.
+        gray_mask_data = gray_mask > 0.5  # The threshold used when creating beta_glm (if not mask_indices).
         beta_mask = np.logical_and(back_mask_data, np.logical_and(gray_mask_data, ~csf_mask_data))
         beta_indices = np.where(beta_mask)
-
-        # Create a 3D boolean mask from mask_indices
-        mask_3d = np.zeros(volume_shape, dtype=bool)
-        mask_3d[tuple(nonzero_mask)] = True
-
-        # Extract this mask at beta_indices locations to get which beta voxels to keep
-        beta_subset_mask = mask_3d[beta_indices]
+        beta_mask_count = beta_indices[0].size
     else:
         mask = np.logical_and(back_mask_data, ~csf_mask_data)
         nonzero_mask = np.where(mask)
         gray_mask_data = gray_mask > args.gray_threshold
         keep_voxels = gray_mask_data[nonzero_mask]
         beta_subset_mask = None
-    bold_flat = bold_data[nonzero_mask]
-    masked_bold = bold_flat[keep_voxels].astype(np.float32)
+    # bold_flat = bold_data[nonzero_mask]
+    # masked_bold = bold_flat[keep_voxels].astype(np.float32)
     masked_coords = tuple(ax[keep_voxels] for ax in nonzero_mask)
+    # Free large intermediates early.
+    del bold_data, bold_flat, bold_imgs
+    gc.collect()
 
     print("Reshape Bold and Beta datasets...")
     start_idx = 0
     end_idx = beta_glm.shape[-1]
-    beta = beta_glm[:, 0, 0, start_idx:end_idx]
+    beta = np.asarray(beta_glm[:, 0, 0, start_idx:end_idx], dtype=np.float32)
+    # beta_glm can be very large; once sliced, we no longer need the full array.
+    del beta_glm
+    gc.collect()
     if args.runs:
         run_to_pos = {run: idx for idx, run in enumerate(RUNS)}
         run_slices = []
@@ -789,10 +823,22 @@ def main():
     total_trials = beta.shape[1]
 
     # Apply masking to beta to match masked_coords
-    if beta_subset_mask is not None:
-        # Using mask_indices: beta has all voxels from the GLM mask (gray>0.5),
-        # but we only want the subset in mask_indices
-        beta = beta[beta_subset_mask]
+    if args.mask_indices:
+        mask_indices_count = nonzero_mask[0].shape[0]
+        if beta.shape[0] == mask_indices_count:
+            pass
+        elif beta_mask_count is not None and beta.shape[0] == beta_mask_count:
+            # Using mask_indices: beta has all voxels from the GLM mask (gray>0.5),
+            # but we only want the subset in mask_indices.
+            mask_3d = np.zeros(volume_shape, dtype=bool)
+            mask_3d[tuple(nonzero_mask)] = True
+            beta_subset_mask = mask_3d[beta_indices]
+            beta = beta[beta_subset_mask]
+        else:
+            raise ValueError(
+                f"Beta voxels ({beta.shape[0]}) do not match mask_indices ({mask_indices_count})"
+                + (f" or GLM mask ({beta_mask_count})." if beta_mask_count is not None else ".")
+            )
     else:
         # In the non-mask_indices case, we need to apply the keep_voxels mask
         keep_voxels_count = int(np.count_nonzero(keep_voxels))
@@ -805,17 +851,17 @@ def main():
     #     raise ValueError(
     #         f"Beta voxels ({beta.shape[0]}) do not match masked BOLD ({masked_bold.shape[0]})."
     #     )
-    bold_data_reshape = _extract_trial_segments(masked_bold, trial_len=TRIAL_LEN, num_trials=total_trials, rest_every=30, rest_len=20)
+    # bold_data_reshape = _extract_trial_segments(masked_bold, trial_len=TRIAL_LEN, num_trials=total_trials, rest_every=30, rest_len=20)
     print("Remove NaN voxels...")
     nan_voxels = np.isnan(beta).all(axis=1)
     if np.any(nan_voxels):
         beta = beta[~nan_voxels]
+        bold_data_reshape = bold_data_reshape[~nan_voxels]
         masked_coords = tuple(coord[~nan_voxels] for coord in masked_coords)
     print(f"Beta Shape: {beta.shape}, Bold shape: {bold_data_reshape.shape}")
     beta_overlay = _mean_abs_beta_volume(beta, masked_coords, volume_shape)
     _save_overlay_html(beta_overlay, anat_img=anat_img, out_html=str(beta_overlay_html_path), title='', 
                        threshold_pct=overlay_threshold_pct, vmax_pct=overlay_vmax_pct, cut_coords=cut_coords)
-
     print("Remove Outlier Beta Values...")
     # My code
     # med = np.nanmedian(beta, keepdims=True)
@@ -833,12 +879,12 @@ def main():
 
     # GPT code
     # per-voxel robust z
-    med = np.nanmedian(beta, axis=1, keepdims=True)
-    mad = np.nanmedian(np.abs(beta - med), axis=1, keepdims=True)
-    scale = 1.4826 * np.maximum(mad, 1e-9)
-    beta_norm = (beta - med) / scale
+    med = np.nanmedian(beta, axis=1, keepdims=True).astype(np.float32, copy=False)
+    mad = np.nanmedian(np.abs(beta - med), axis=1, keepdims=True).astype(np.float32, copy=False)
+    scale = (1.4826 * np.maximum(mad, 1e-9)).astype(np.float32, copy=False)
+    beta_norm = ((beta - med) / scale).astype(np.float32, copy=False)
     # per-voxel threshold or fixed z
-    thr = np.nanpercentile(np.abs(beta_norm), outlier_percentile, axis=1, keepdims=True)
+    thr = np.nanpercentile(np.abs(beta_norm), outlier_percentile, axis=1, keepdims=True).astype(np.float32, copy=False)
     outlier_mask = np.abs(beta_norm) > thr
     clean_beta = beta.copy()
     clean_beta[outlier_mask] = np.nan
@@ -847,6 +893,9 @@ def main():
     clean_beta[~valid_voxels] = np.nan
     keeped_mask = valid_voxels
     # GPT code finish
+    # Free large intermediates.
+    del beta_norm, med, mad, scale, thr
+    gc.collect()
 
 
     clean_beta = clean_beta[keeped_mask]
@@ -861,8 +910,8 @@ def main():
     clean_beta_coords = tuple(coord[keeped_mask] for coord in masked_coords)
     clean_beta_overlay = _mean_abs_beta_volume(clean_beta, clean_beta_coords, volume_shape)
     _save_overlay_html(clean_beta_overlay, anat_img=anat_img, out_html=str(clean_beta_overlay_html_path), title='',
-                       threshold_pct=overlay_threshold_pct, vmax_pct=overlay_vmax_pct, cut_coords=cut_coords)
-    
+                        threshold_pct=overlay_threshold_pct, vmax_pct=overlay_vmax_pct, cut_coords=cut_coords)
+
     print(f"Apply ttest?: {args.skip_ttest}")
     if args.skip_ttest:
         clean_active_beta = clean_beta
@@ -885,11 +934,21 @@ def main():
         print(f"After ttest: Beta Shape: {clean_active_beta.shape}, Bold shape: {clean_active_bold.shape}")
         ttest_coords = tuple(coord[clean_active_idx] for coord in masked_coords)
         ttest_beta_overlay = _mean_abs_beta_volume(clean_active_beta, ttest_coords, volume_shape)
-        _save_overlay_html(ttest_beta_overlay, anat_img=anat_img, out_html=str(ttest_beta_overlay_html_path), title='', 
-                           threshold_pct=overlay_threshold_pct, vmax_pct=overlay_vmax_pct, cut_coords=cut_coords)
+        _save_overlay_html(
+            ttest_beta_overlay,
+            anat_img=anat_img,
+            out_html=str(ttest_beta_overlay_html_path),
+            title="",
+            threshold_pct=overlay_threshold_pct,
+            vmax_pct=overlay_vmax_pct,
+            cut_coords=cut_coords,
+        )
+        del tvals, pvals, qvals, reject
+        gc.collect()
 
     num_trials = clean_active_beta.shape[1]
-    clean_active_volume = np.full(volume_shape + (num_trials,), np.nan)
+    # Important for memory: default dtype would be float64.
+    clean_active_volume = np.full(volume_shape + (num_trials,), np.nan, dtype=np.float32)
     active_coords = tuple(coord[clean_active_idx] for coord in masked_coords)
     clean_active_volume[active_coords[0], active_coords[1], active_coords[2], :] = clean_active_beta
 
@@ -897,47 +956,105 @@ def main():
     if args.skip_hampel:
         beta_volume_filter = clean_active_volume
     else:
-        beta_volume_filter, hampel_stats = hampel_filter_image(clean_active_volume.astype(np.float32), window_size=hampel_window, threshold_factor=hampel_threshold, return_stats=True)
+        beta_volume_filter, hampel_stats = hampel_filter_image(
+            clean_active_volume,
+            window_size=hampel_window,
+            threshold_factor=hampel_threshold,
+            return_stats=True,
+        )
         print('Total voxels with <3 neighbours:', hampel_stats['insufficient_total'], flush=True)
         print('Total corrected voxels:', hampel_stats['corrected_total'], flush=True)
+        del hampel_stats
+        gc.collect()
 
     print("Saving Beta preprocessing files ....")
-    nan_voxels = np.all(np.isnan(beta_volume_filter), axis=-1)
-    mask_2d = nan_voxels.reshape(-1)
+    run_slices = [(r, slice(None)) for r in selected_runs]
+    if len(selected_runs) > 1:
+        run_slices = [
+            (r, slice(idx * TRIALS_PER_RUN, (idx + 1) * TRIALS_PER_RUN))
+            for idx, r in enumerate(selected_runs)
+        ]
 
-    np.save(output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy', beta_volume_filter)
-    np.save(output_dir / f'mask_all_nan_sub{sub}_ses{ses}_run{run}.npy', mask_2d)
+    for run, trial_slice in run_slices:
+        beta_volume_filter_run = beta_volume_filter[..., trial_slice]
+        clean_active_bold_run = clean_active_bold[:, trial_slice, :]
+        clean_active_beta_run = clean_active_beta[:, trial_slice]
 
-    beta_volume_filter = np.load(output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy')
-    nan_voxels = np.all(np.isnan(beta_volume_filter), axis=-1)
-    mask_2d = np.load(output_dir / f'mask_all_nan_sub{sub}_ses{ses}_run{run}.npy')
-    np.save(output_dir / f"nan_mask_flat_sub{sub}_ses{ses}_run{run}.npy", mask_2d)
-    beta_volume_clean_2d = beta_volume_filter[~nan_voxels]
-    np.save(output_dir / f"beta_volume_filter_sub{sub}_ses{ses}_run{run}.npy", beta_volume_clean_2d)
+        nan_voxels = np.all(np.isnan(beta_volume_filter_run), axis=-1)
+        mask_2d = nan_voxels.reshape(-1)
 
-    active_flat_idx = np.ravel_multi_index(active_coords, nan_voxels.shape)
-    np.save(output_dir / f"active_flat_indices__sub{sub}_ses{ses}_run{run}.npy", active_flat_idx)
-    keep_mask = ~mask_2d[active_flat_idx]
-    clean_active_bold = clean_active_bold[keep_mask, ...]
-    np.save(output_dir / f"active_bold_sub{sub}_ses{ses}_run{run}.npy", clean_active_bold)
-    clean_active_beta = clean_active_beta[keep_mask, ...]
-    print(f"After filtering: Beta Shape: {beta_volume_clean_2d.shape}, Bold shape: {clean_active_bold.shape}")
+        cleaned_beta_path = _with_tag(
+            output_dir / f'cleaned_beta_volume_sub{sub}_ses{ses}_run{run}.npy',
+            output_tag,
+        )
+        mask_all_nan_path = _with_tag(output_dir / f'mask_all_nan_sub{sub}_ses{ses}_run{run}.npy', output_tag)
 
-    clean_active_idx = clean_active_idx[keep_mask]
-    active_coords = tuple(coord[keep_mask] for coord in active_coords)
-    np.save(output_dir / f"active_coords_sub{sub}_ses{ses}_run{run}.npy", active_coords)
+        np.save(cleaned_beta_path, beta_volume_filter_run.astype(np.float32, copy=False))
+        np.save(mask_all_nan_path, mask_2d)
 
-    mean_clean_active = np.nanmean(np.abs(beta_volume_filter), axis=-1)
-    mean_clean_active_path = _with_tag(output_dir / f'mean_clean_active_sub{sub}_ses{ses}_run{run_tag}.nii.gz', output_tag)
-    mean_clean_active_img = nib.Nifti1Image(mean_clean_active.astype(np.float32), anat_img.affine, anat_img.header)
-    mean_clean_active_img.to_filename(str(mean_clean_active_path))
-    print(f'Saved mean_clean_active: {mean_clean_active_path}', flush=True)
-    _save_beta_overlay(mean_clean_active, anat_img=anat_img, out_html=str(overlay_html_path), threshold_pct=overlay_threshold_pct, 
-                       vmax_pct=overlay_vmax_pct, cut_coords=cut_coords, snapshot_path=str(overlay_snapshot_path))
-    if not skip_roi_ranking:
-        roi_rank_path = _with_tag(output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run_tag}.csv', output_tag)
-        _rank_rois_by_beta(mean_clean_active, anat_img=anat_img, anat_path=data_paths['anat'], ref_img=anat_img, out_path=roi_rank_path,
-                           atlas_threshold=roi_atlas_threshold, label_patterns=roi_label_patterns, assume_mni=False, summary_stat=args.roi_stat)
+        beta_volume_filter_run = np.load(cleaned_beta_path)
+        nan_voxels = np.all(np.isnan(beta_volume_filter_run), axis=-1)
+        mask_2d = np.load(mask_all_nan_path)
+        np.save(_with_tag(output_dir / f"nan_mask_flat_sub{sub}_ses{ses}_run{run}.npy", output_tag), mask_2d)
+        beta_volume_clean_2d = beta_volume_filter_run[~nan_voxels]
+        np.save(_with_tag(output_dir / f"beta_volume_filter_sub{sub}_ses{ses}_run{run}.npy", output_tag), beta_volume_clean_2d)
+
+        active_flat_idx = np.ravel_multi_index(active_coords, nan_voxels.shape)
+        np.save(_with_tag(output_dir / f"active_flat_indices__sub{sub}_ses{ses}_run{run}.npy", output_tag), active_flat_idx)
+        keep_mask = ~mask_2d[active_flat_idx]
+        clean_active_bold_keep = clean_active_bold_run[keep_mask, ...]
+        np.save(_with_tag(output_dir / f"active_bold_sub{sub}_ses{ses}_run{run}.npy", output_tag), clean_active_bold_keep)
+        clean_active_beta_keep = clean_active_beta_run[keep_mask, ...]
+        print(
+            f"After filtering (run={run}): Beta Shape: {beta_volume_clean_2d.shape}, Bold shape: {clean_active_bold_keep.shape}"
+        )
+
+        clean_active_idx_keep = clean_active_idx[keep_mask]
+        active_coords_keep = tuple(coord[keep_mask] for coord in active_coords)
+        np.save(_with_tag(output_dir / f"active_coords_sub{sub}_ses{ses}_run{run}.npy", output_tag), active_coords_keep)
+
+        mean_clean_active = np.nanmean(np.abs(beta_volume_filter_run), axis=-1)
+        mean_clean_active_path = _with_tag(output_dir / f'mean_clean_active_sub{sub}_ses{ses}_run{run}.nii.gz', output_tag)
+        mean_clean_active_img = nib.Nifti1Image(mean_clean_active.astype(np.float32), anat_img.affine, anat_img.header)
+        mean_clean_active_img.to_filename(str(mean_clean_active_path))
+        print(f'Saved mean_clean_active: {mean_clean_active_path}', flush=True)
+
+        overlay_html_path_run = _with_tag(
+            output_dir / f'clean_active_beta_overlay_sub{sub}_ses{ses}_run{run}.html',
+            output_tag,
+        )
+        overlay_snapshot_path_run = overlay_html_path_run.with_suffix(".png")
+        _save_beta_overlay(
+            mean_clean_active,
+            anat_img=anat_img,
+            out_html=str(overlay_html_path_run),
+            threshold_pct=overlay_threshold_pct,
+            vmax_pct=overlay_vmax_pct,
+            cut_coords=cut_coords,
+            snapshot_path=str(overlay_snapshot_path_run),
+        )
+        if not skip_roi_ranking:
+            roi_rank_path = _with_tag(output_dir / f'roi_{roi_tag}_sub{sub}_ses{ses}_run{run}.csv', output_tag)
+            _rank_rois_by_beta(
+                mean_clean_active,
+                anat_img=anat_img,
+                anat_path=data_paths['anat'],
+                ref_img=anat_img,
+                out_path=roi_rank_path,
+                atlas_threshold=roi_atlas_threshold,
+                label_patterns=roi_label_patterns,
+                assume_mni=False,
+                summary_stat=args.roi_stat,
+            )
+
+        del nan_voxels, mask_2d, beta_volume_filter_run, beta_volume_clean_2d
+        del clean_active_bold_run, clean_active_beta_run, clean_active_bold_keep, clean_active_beta_keep
+        del clean_active_idx_keep, active_coords_keep, mean_clean_active, mean_clean_active_img
+        gc.collect()
+
+    # Free 4D volume before returning.
+    del clean_active_volume
+    gc.collect()
 
 
 if __name__ == '__main__':
