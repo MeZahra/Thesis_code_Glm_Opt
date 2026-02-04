@@ -51,4 +51,9 @@ slurm-*.err
 GLMsingle/glmsingle/
 tmp/
 *.md
-GLMsingle
+
+GLMsingle/GLMOutputs-sub09-ses1-std
+GLMsingle/GLMOutputs-sub09-ses2-std
+GLMsingle/GLMOutputs-sub10-ses1-std
+GLMsingle/GLMOutputs-sub10-ses2-std
+GLMsingle/GLMOutputs-sub11-ses1-std
