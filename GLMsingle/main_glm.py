@@ -22,7 +22,6 @@ brain_mask_template = 'sub-pd0{sub}_ses-{ses}_T1w_brain_mask.nii.gz'
 csf_mask_template = 'sub-pd0{sub}_ses-{ses}_T1w_brain_pve_0.nii.gz'
 gray_mask_template = 'sub-pd0{sub}_ses-{ses}_T1w_brain_pve_1.nii.gz'
 anat_template = 'sub-pd0{sub}_ses-{ses}_T1w_brain.nii.gz'
-go_times_root = Path(__file__).resolve().parent.parent / 'sub09_ses1'
 go_times_template = 'PSPD0{sub}-ses-{ses}-go-times.txt'
 
 mask_threshold_brain = 0.0
@@ -171,13 +170,15 @@ runs = list(runs)
 
 print("loading files...")
 files_cfg = {'bold_template': bold, 'brain_mask': brain_mask_template, 'csf_mask': csf_mask_template, 'gray_mask': gray_mask_template, 'anat': anat_template}
-data_root = Path(__file__).resolve().parent
-data_root = data_root.expanduser().resolve()
-outputdir_glmsingle = data_root / f'GLMOutputs-sub{sub}-ses{ses}-{trial_metric}'
+script_root = Path(__file__).resolve().parent
+script_root = script_root.expanduser().resolve()
+outputdir_glmsingle = script_root / f'GLMOutputs-sub{sub}-ses{ses}-{trial_metric}'
 outputdir_glmsingle.mkdir(parents=True, exist_ok=True)
 if load_results_dir is None:
     load_results_dir = outputdir_glmsingle
-data_dir = data_root.parent / 'sub09_ses1'
+data_root = script_root.parent
+data_dir = data_root / f'sub{sub}_ses{ses}'
+go_times_root = data_dir
 go_times_path = go_times_root / go_times_template.format(sub=sub, ses=ses)
 brain_mask = nib.load(join(data_dir, files_cfg['brain_mask'].format(sub=sub, ses=ses)))
 csf_mask = nib.load(join(data_dir, files_cfg['csf_mask'].format(sub=sub, ses=ses)))
@@ -214,6 +215,7 @@ for run in runs:
 
 del anat_data
 
+# np.save(f'csf_reg_sub{sub}_ses{ses}.npy', extraregressors)
 # %%
 print("Select trials...")
 go_flag = np.loadtxt(go_times_path, dtype=int)
