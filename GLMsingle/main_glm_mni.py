@@ -191,6 +191,15 @@ def _load_existing_results(load_dir, cache_name):
         return {'typed': np.load(typed_path, allow_pickle=True).item()}
     return None
 
+def _has_existing_results(output_dir: Path, cache_name: str) -> bool:
+    if output_dir is None:
+        return False
+    cache_path = output_dir / cache_name
+    if cache_path.is_file():
+        return True
+    typed_candidates = sorted(output_dir.glob('TYPED_FITHRF_GLMDENOISE_RR*.npy'))
+    return bool(typed_candidates)
+
 
 def _load_templates(masks_root: Path):
     brain_mask_path = _require_file(masks_root / brain_mask_template, 'brain_mask_template')
@@ -319,7 +328,7 @@ def run_glmsingle_mni_for_subject_session(*, sub: str, ses: str, run_paths: list
         design_matrix.append(design)
 
     opt = {'wantlibrary': glmsingle_wantlibrary, 'wantglmdenoise': int(glmsingle_wantglmdenoise), 'wantfracridge': int(glmsingle_wantfracridge),
-        'wantfileoutputs': glmsingle_wantfileoutputs, 'wantmemoryoutputs': glmsingle_wantmemoryoutputs, 'chunklen': 100000}
+        'wantfileoutputs': glmsingle_wantfileoutputs, 'wantmemoryoutputs': glmsingle_wantmemoryoutputs, 'chunklen': 5000}
     if len(extraregressors) == len(run_paths):
         opt['extra_regressors'] = extraregressors
 
@@ -345,6 +354,7 @@ def main():
 
     parser = argparse.ArgumentParser(description='Run GLMsingle in MNI space for all subjects/sessions/runs in /Data/zahra/bold_data.')
     parser.add_argument('--dry-run', action='store_true', help='Only validate inputs and print planned outputs; do not write results.')
+    parser.add_argument('--force', action='store_true', help='Run even if results already exist in the results directory.')
     parser.add_argument('--subjects', nargs='*', default=None, help='Optional list of subject IDs (e.g., 004 009). Defaults to all discovered.')
     parser.add_argument('--sessions', nargs='*', default=None, help='Optional list of session IDs (e.g., 1 2). Defaults to all discovered.')
     args = parser.parse_args()
@@ -372,6 +382,11 @@ def main():
     print(f'Found {len(selected)} subject-session entries.')
 
     for sub, ses, run_paths in selected:
+        outputdir_glmsingle = results_root / f'sub-pd{sub}' / f'ses-{ses}' / f'GLMOutputs-mni-{trial_metric}'
+        if not args.force and _has_existing_results(outputdir_glmsingle, results_cache_name):
+            print(f'[skip] sub-pd{sub} ses-{ses}: existing results found at {outputdir_glmsingle}')
+            continue
+
         t0 = time.time()
         run_glmsingle_mni_for_subject_session(sub=sub, ses=ses, run_paths=run_paths, results_root=results_root, 
                                               masks_root=masks_root, go_times_root=go_times_root, dry_run=args.dry_run)
