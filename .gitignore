@@ -51,3 +51,4 @@ slurm-*.err
 GLMsingle/glmsingle/
 tmp/
 *.md
+GLMsingle
