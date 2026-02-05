@@ -328,7 +328,7 @@ def run_glmsingle_mni_for_subject_session(*, sub: str, ses: str, run_paths: list
         design_matrix.append(design)
 
     opt = {'wantlibrary': glmsingle_wantlibrary, 'wantglmdenoise': int(glmsingle_wantglmdenoise), 'wantfracridge': int(glmsingle_wantfracridge),
-        'wantfileoutputs': glmsingle_wantfileoutputs, 'wantmemoryoutputs': glmsingle_wantmemoryoutputs, 'chunklen': 5000}
+        'wantfileoutputs': glmsingle_wantfileoutputs, 'wantmemoryoutputs': glmsingle_wantmemoryoutputs, 'chunklen': 8000}
     if len(extraregressors) == len(run_paths):
         opt['extra_regressors'] = extraregressors
 

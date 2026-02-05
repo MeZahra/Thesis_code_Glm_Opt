@@ -15,7 +15,7 @@ from matplotlib import pyplot as plt
 from matplotlib.colors import ListedColormap
 from nilearn import datasets, plotting
 
-from Beta_preprocessing import TRIALS_PER_RUN, _align_atlas_to_reference, _rank_rois_by_beta
+from Beta_preprocessing_old import TRIALS_PER_RUN, _align_atlas_to_reference, _rank_rois_by_beta
 
 
 def _load_roi_rows(csv_path: Path):

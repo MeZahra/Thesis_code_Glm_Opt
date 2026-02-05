@@ -9,7 +9,7 @@ import numpy as np
 from matplotlib.colors import ListedColormap
 from nilearn import plotting
 
-import Beta_preprocessing as bp
+import Beta_preprocessing_old as bp
 
 
 def _label_cmap(colors, alpha=0.6):
