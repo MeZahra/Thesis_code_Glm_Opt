@@ -11,6 +11,7 @@ import numpy as np
 
 
 DATA_ROOT_DEFAULT = Path('/Data/zahra')
+RESULTS_GLM_ROOT_DEFAULT = Path('/Data/zahra/results_glm')
 
 BOLD_FILENAME_RE = re.compile(r'^sub-pd(?P<sub>\d+)_ses-(?P<ses>\d+)_run-(?P<run>\d+)_task-mv_bold_corrected_smoothed_mnireg-2mm\.nii\.gz$')
 
@@ -59,7 +60,8 @@ def _resolve_zahra_paths():
     masks_root = Path(os.getenv('ZAHRA_MASK_DIR', str(root / 'anatomy_masks'))).expanduser().resolve()
     go_times_root = Path(os.getenv('ZAHRA_GO_DIR', str(root / 'go_times'))).expanduser().resolve()
     results_root = Path(os.getenv('ZAHRA_RESULTS_DIR', str(root / 'results'))).expanduser().resolve()
-    return root, bold_root, masks_root, go_times_root, results_root
+    results_glm_root = Path(os.getenv('ZAHRA_RESULTS_GLM_DIR', str(root / 'results_glm'))).expanduser().resolve()
+    return root, bold_root, masks_root, go_times_root, results_root, results_glm_root
 
 def _require_file(path: Path, label: str) -> Path:
     if not path.is_file():
@@ -199,6 +201,12 @@ def _has_existing_results(output_dir: Path, cache_name: str) -> bool:
         return True
     typed_candidates = sorted(output_dir.glob('TYPED_FITHRF_GLMDENOISE_RR*.npy'))
     return bool(typed_candidates)
+
+def _has_existing_results_glm(results_glm_root: Path, sub: str, ses: str, trial_metric: str) -> bool:
+    if results_glm_root is None:
+        return False
+    outputdir_glm = results_glm_root / f'sub-pd{sub}' / f'ses-{ses}' / f'GLMOutputs-mni-{trial_metric}'
+    return _has_existing_results(outputdir_glm, results_cache_name)
 
 
 def _load_templates(masks_root: Path):
@@ -359,7 +367,7 @@ def main():
     parser.add_argument('--sessions', nargs='*', default=None, help='Optional list of session IDs (e.g., 1 2). Defaults to all discovered.')
     args = parser.parse_args()
 
-    _, bold_root, masks_root, go_times_root, results_root = _resolve_zahra_paths()
+    _, bold_root, masks_root, go_times_root, results_root, results_glm_root = _resolve_zahra_paths()
     by_sub_ses = _discover_bold_runs(bold_root)
 
     selected = []
@@ -379,9 +387,14 @@ def main():
     print(f'  anatomy_masks: {masks_root}')
     print(f'  go_times: {go_times_root}')
     print(f'  results: {results_root}')
+    print(f'  results_glm: {results_glm_root}')
     print(f'Found {len(selected)} subject-session entries.')
 
     for sub, ses, run_paths in selected:
+        if _has_existing_results_glm(results_glm_root, sub, ses, trial_metric):
+            print(f'[skip] sub-pd{sub} ses-{ses}: existing results found in {results_glm_root}')
+            continue
+
         outputdir_glmsingle = results_root / f'sub-pd{sub}' / f'ses-{ses}' / f'GLMOutputs-mni-{trial_metric}'
         if not args.force and _has_existing_results(outputdir_glmsingle, results_cache_name):
             print(f'[skip] sub-pd{sub} ses-{ses}: existing results found at {outputdir_glmsingle}')
