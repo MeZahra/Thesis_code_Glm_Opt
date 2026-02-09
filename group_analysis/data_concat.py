@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""
+Concatenate preprocessed beta/BOLD data across all subjects/sessions/runs.
+
+This script builds a group voxel mask based on cleaned_beta_volume files
+(voxels that are finite in at least one input file). It then concatenates
+trials across all inputs (all sessions/runs) and writes group-level outputs
+that can be consumed by group_analysis/obj_param.py (via SUB/SES and
+FMRI_OPT_DATA_DIR).
+
+Note: To avoid a massive 4D volume, cleaned_beta_volume is stored as a 2D
+array (n_union_voxels x total_trials). Use common_mask_* to rebuild volumes
+if needed.
+"""
+
+import argparse
+import csv
+import os
+import re
+from glob import glob
+
+import numpy as np
+from numpy.lib.format import open_memmap
+
+
+FILE_RE = re.compile(r"cleaned_beta_volume_(sub-[^_]+)_ses-(\d+)_run-(\d+)\.npy$")
+
+
+def _safe_symlink(src, dest):
+    if os.path.islink(dest):
+        if os.readlink(dest) == src:
+            return
+        os.unlink(dest)
+    elif os.path.exists(dest):
+        raise RuntimeError(f"{dest} exists and is not a symlink; remove it to continue.")
+    os.symlink(src, dest)
+
+
+def _discover_inputs(in_root):
+    pattern = os.path.join(in_root, "sub-*", "cleaned_beta_volume_sub-*_ses-*_run-*.npy")
+    files = sorted(glob(pattern))
+    entries = []
+    for path in files:
+        name = os.path.basename(path)
+        match = FILE_RE.match(name)
+        if not match:
+            continue
+        sub_tag = match.group(1)
+        ses = int(match.group(2))
+        run = int(match.group(3))
+        tag = f"{sub_tag}_ses-{ses}_run-{run}"
+        base_dir = os.path.dirname(path)
+        entries.append(
+            {
+                "sub_tag": sub_tag,
+                "ses": ses,
+                "run": run,
+                "tag": tag,
+                "cleaned_beta": path,
+                "active_bold": os.path.join(base_dir, f"active_bold_{tag}.npy.npy"),
+                "active_coords": os.path.join(base_dir, f"active_coords_{tag}.npy"),
+                "active_flat": os.path.join(base_dir, f"active_flat_indices__{tag}.npy"),
+                "beta_filter": os.path.join(base_dir, f"beta_volume_filter_{tag}.npy.npy"),
+                "mask_all_nan": os.path.join(base_dir, f"mask_all_nan_{tag}.npy"),
+                "nan_mask_flat": os.path.join(base_dir, f"nan_mask_flat_{tag}.npy"),
+            }
+        )
+    return entries
+
+
+def _validate_inputs(entries):
+    required_keys = [
+        "cleaned_beta",
+        "active_bold",
+        "active_coords",
+        "active_flat",
+        "beta_filter",
+        "mask_all_nan",
+        "nan_mask_flat",
+    ]
+    missing = []
+    for entry in entries:
+        for key in required_keys:
+            path = entry[key]
+            if not os.path.exists(path):
+                missing.append(path)
+    if missing:
+        msg = ["Missing required inputs:"]
+        msg.extend([f"  - {path}" for path in missing])
+        raise FileNotFoundError("\n".join(msg))
+
+
+def _build_union_mask(entries):
+    union_mask = None
+    volume_shape = None
+    trial_len = None
+    for entry in entries:
+        vol = np.load(entry["cleaned_beta"], mmap_mode="r")
+        if volume_shape is None:
+            volume_shape = vol.shape[:3]
+        elif vol.shape[:3] != volume_shape:
+            raise ValueError(
+                f"Volume shape mismatch: {entry['cleaned_beta']} has {vol.shape[:3]} "
+                f"but expected {volume_shape}."
+            )
+        entry["n_trials"] = int(vol.shape[3])
+
+        active_bold = np.load(entry["active_bold"], mmap_mode="r")
+        if active_bold.shape[1] != entry["n_trials"]:
+            raise ValueError(
+                f"Trial mismatch between cleaned_beta and active_bold in {entry['tag']}: "
+                f"{entry['n_trials']} vs {active_bold.shape[1]}"
+            )
+        if trial_len is None:
+            trial_len = int(active_bold.shape[2])
+        elif trial_len != int(active_bold.shape[2]):
+            raise ValueError(
+                f"Trial length mismatch: {entry['active_bold']} has {active_bold.shape[2]} "
+                f"but expected {trial_len}."
+            )
+
+        valid = np.any(np.isfinite(vol), axis=-1)
+        union_mask = valid if union_mask is None else (union_mask | valid)
+    if union_mask is None:
+        raise RuntimeError("No cleaned_beta_volume files found to build a union mask.")
+    if not np.any(union_mask):
+        raise RuntimeError("Union mask is empty after aggregation.")
+    return union_mask, volume_shape, trial_len
+
+
+def _resolve_trial_keep_root(path):
+    if path is None:
+        return None
+    root = os.path.expanduser(path)
+    if os.path.isdir(root):
+        return root
+    print(f"Warning: trial-keep root not found: {root}. Trial keep masking disabled.", flush=True)
+    return None
+
+
+def _load_trial_keep_mask(trial_keep_root, entry, n_trials):
+    if trial_keep_root is None:
+        return None, None
+    path = os.path.join(
+        trial_keep_root,
+        entry["sub_tag"],
+        f"ses-{entry['ses']}",
+        "GLMOutputs-mni-std",
+        f"trial_keep_run{entry['run']}.npy",
+    )
+    if not os.path.exists(path):
+        return None, path
+    keep = np.load(path)
+    keep = np.asarray(keep, dtype=bool)
+    if keep.ndim != 1:
+        raise ValueError(f"trial_keep must be 1D, got shape {keep.shape} for {path}")
+    if keep.size != n_trials:
+        raise ValueError(
+            f"trial_keep length mismatch for {entry['tag']}: {keep.size} vs {n_trials}"
+        )
+    return keep, path
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--in-root", default="/Data/zahra/results_beta_preprocessed")
+    parser.add_argument("--out-dir", default=None)
+    parser.add_argument("--group-sub", default="99")
+    parser.add_argument("--obj-ses", default="1")
+    parser.add_argument("--obj-run", default="2")
+    parser.add_argument("--tag-ses", default="all")
+    parser.add_argument("--tag-run", default="all")
+    parser.add_argument("--group-label", default="group")
+    parser.add_argument("--dtype", default="float32")
+    parser.add_argument("--trial-keep-root", default="/Data/zahra/results_glm")
+    args = parser.parse_args()
+
+    in_root = os.path.expanduser(args.in_root)
+    if not os.path.isdir(in_root):
+        alt_root = "/Data/zahra/data/results_beta_preprocessed"
+        if os.path.isdir(alt_root):
+            in_root = alt_root
+        else:
+            raise FileNotFoundError(f"Input root not found: {args.in_root}")
+
+    out_dir = args.out_dir or os.path.join(in_root, "group_concat")
+    out_dir = os.path.expanduser(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    entries = _discover_inputs(in_root)
+    if not entries:
+        raise FileNotFoundError(f"No cleaned_beta_volume files found under {in_root}")
+    _validate_inputs(entries)
+
+    entries.sort(key=lambda e: (e["sub_tag"], e["ses"], e["run"]))
+    union_mask, volume_shape, trial_len = _build_union_mask(entries)
+    union_flat = np.flatnonzero(union_mask)
+    n_union = int(union_flat.size)
+    total_trials = int(sum(entry["n_trials"] for entry in entries))
+    trial_keep_root = _resolve_trial_keep_root(args.trial_keep_root)
+
+    print(f"Found {len(entries)} runs across subjects.", flush=True)
+    print(f"Union voxel count: {n_union}", flush=True)
+    print(f"Total trials (all runs): {total_trials}", flush=True)
+
+    group_label = str(args.group_label)
+    tag_ses = str(args.tag_ses)
+    tag_run = str(args.tag_run)
+    obj_ses = str(args.obj_ses)
+    obj_run = str(args.obj_run)
+    group_sub = str(args.group_sub)
+
+    tag_hyphen = group_label
+    tag_obj = f"sub0{group_sub}_ses{obj_ses}_run{obj_run}"
+
+    common_mask_path = os.path.join(out_dir, f"common_mask_{tag_hyphen}.npy")
+    common_mask_flat_path = os.path.join(out_dir, f"common_mask_flat_{tag_hyphen}.npy")
+    np.save(common_mask_path, union_mask)
+    np.save(common_mask_flat_path, union_mask.ravel())
+
+    active_coords = np.unravel_index(union_flat, volume_shape)
+    active_flat_indices = union_flat
+    mask_all_nan = ~union_mask.ravel()
+
+    active_coords_path = os.path.join(out_dir, f"active_coords_{tag_hyphen}.npy")
+    active_flat_path = os.path.join(out_dir, f"active_flat_indices__{tag_hyphen}.npy")
+    mask_all_nan_path = os.path.join(out_dir, f"mask_all_nan_{tag_hyphen}.npy")
+    nan_mask_flat_path = os.path.join(out_dir, f"nan_mask_flat_{tag_hyphen}.npy")
+    np.save(active_coords_path, active_coords)
+    np.save(active_flat_path, active_flat_indices)
+    np.save(mask_all_nan_path, mask_all_nan)
+    np.save(nan_mask_flat_path, mask_all_nan)
+
+    beta_dtype = np.dtype(args.dtype)
+    if not np.issubdtype(beta_dtype, np.floating):
+        raise ValueError(f"beta dtype must be floating to support NaN masking, got {beta_dtype}")
+    beta_path = os.path.join(out_dir, f"beta_volume_filter_{tag_hyphen}.npy")
+    beta_mm = open_memmap(beta_path, mode="w+", dtype=beta_dtype, shape=(n_union, total_trials))
+
+    cleaned_path = os.path.join(out_dir, f"cleaned_beta_volume_{tag_hyphen}.npy")
+    _safe_symlink(beta_path, cleaned_path)
+    cleaned_mm = beta_mm
+
+    active_dtype = np.load(entries[0]["active_bold"], mmap_mode="r").dtype
+    if not np.issubdtype(active_dtype, np.floating):
+        raise ValueError(
+            f"active_bold dtype must be floating to support NaN masking, got {active_dtype}"
+        )
+    active_bold_path = os.path.join(out_dir, f"active_bold_{tag_hyphen}.npy")
+    active_mm = open_memmap(
+        active_bold_path,
+        mode="w+",
+        dtype=active_dtype,
+        shape=(n_union, total_trials, trial_len),
+    )
+
+    manifest_path = os.path.join(out_dir, f"concat_manifest_{tag_hyphen}.tsv")
+    with open(manifest_path, "w", newline="") as manifest_file:
+        writer = csv.writer(manifest_file, delimiter="\t")
+        writer.writerow(
+            [
+                "offset_start",
+                "offset_end",
+                "sub_tag",
+                "ses",
+                "run",
+                "n_trials",
+                "cleaned_beta",
+                "trial_keep_path",
+                "trial_keep_kept",
+            ]
+        )
+
+        offset = 0
+        for entry in entries:
+            vol = np.load(entry["cleaned_beta"], mmap_mode="r")
+            n_trials = entry["n_trials"]
+            flat_view = vol.reshape(-1, n_trials)
+            beta_chunk = flat_view[union_flat]
+            trial_keep, trial_keep_path = _load_trial_keep_mask(trial_keep_root, entry, n_trials)
+            if trial_keep is None and trial_keep_path is not None and trial_keep_root is not None:
+                print(
+                    f"Warning: missing trial_keep for {entry['tag']} at {trial_keep_path}.",
+                    flush=True,
+                )
+            if trial_keep is not None:
+                beta_chunk[:, ~trial_keep] = np.nan
+            beta_mm[:, offset : offset + n_trials] = beta_chunk
+            if cleaned_mm is not None and cleaned_mm is not beta_mm:
+                cleaned_mm[:, offset : offset + n_trials] = beta_chunk
+
+            coords = np.load(entry["active_coords"], allow_pickle=True)
+            flat_active = np.ravel_multi_index(coords, volume_shape)
+            sorter = np.argsort(flat_active)
+            sorted_flat = flat_active[sorter]
+            positions = np.searchsorted(sorted_flat, union_flat)
+            present = (positions < sorted_flat.size) & (sorted_flat[positions] == union_flat)
+            idx = np.full(union_flat.size, -1, dtype=int)
+            if np.any(present):
+                idx[present] = sorter[positions[present]]
+
+            active_bold = np.load(entry["active_bold"], mmap_mode="r")
+            active_slice = active_mm[:, offset : offset + n_trials, :]
+            active_slice[:] = np.nan
+            if np.any(present):
+                active_slice[present, :, :] = active_bold[idx[present]]
+            if trial_keep is not None:
+                active_slice[:, ~trial_keep, :] = np.nan
+
+            writer.writerow(
+                [
+                    offset,
+                    offset + n_trials,
+                    entry["sub_tag"],
+                    entry["ses"],
+                    entry["run"],
+                    n_trials,
+                    entry["cleaned_beta"],
+                    trial_keep_path or "",
+                    int(trial_keep.sum()) if trial_keep is not None else "",
+                ]
+            )
+            offset += n_trials
+
+    beta_mm.flush()
+    active_mm.flush()
+
+    print(f"Wrote outputs to: {out_dir}", flush=True)
+    print(f"Group tag (output): {tag_hyphen}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
