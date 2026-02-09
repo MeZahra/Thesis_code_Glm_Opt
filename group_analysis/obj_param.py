@@ -30,7 +30,6 @@ import pandas as pd
 from nilearn import plotting, image, datasets
 from scipy import sparse
 from scipy import ndimage
-from scipy.io import loadmat
 from scipy.linalg import eigh
 from scipy.optimize import minimize
 from scipy.spatial import cKDTree
@@ -80,69 +79,6 @@ def _append_run_log(entry, path=LOG_FILE):
     with open(path, "a") as log_file:
         log_file.write(json.dumps(payload) + "\n")
 
-def synchronize_beta_voxels(beta_run1, beta_run2, mask_run1, mask_run2):
-    valid_run1, valid_run2 = ~mask_run1, ~mask_run2
-    shared_valid = valid_run1 & valid_run2
-    shared_mask_run1 = shared_valid[np.flatnonzero(valid_run1)] #indices of nonzero elements in mask_run1
-    shared_mask_run2 = shared_valid[np.flatnonzero(valid_run2)]
-
-    synced_run1, synced_run2 = beta_run1[shared_mask_run1], beta_run2[shared_mask_run2]
-    removed_run1 = beta_run1.shape[0] - synced_run1.shape[0]
-    removed_run2 = beta_run2.shape[0] - synced_run2.shape[0]
-    print(f"Removed {removed_run1} run1 voxels and {removed_run2} run2 voxels to enforce a shared voxel set.", flush=True)
-
-    shared_flat_indices = np.flatnonzero(shared_valid)
-    combined_nan_mask = mask_run1 | mask_run2
-    return synced_run1, synced_run2, combined_nan_mask, shared_flat_indices
-
-def combine_filtered_betas(beta_run1, beta_run2, nan_mask_flat, flat_indices):
-    n1 = beta_run1.shape[1]
-    n2 = beta_run2.shape[1]
-    min_trials = min(n1, n2)
-
-    # Only union NaNs over the shared prefix of trials.
-    if min_trials > 0:
-        union_nan_mask = np.isnan(beta_run1[:, :min_trials]) | np.isnan(beta_run2[:, :min_trials])
-        if np.any(union_nan_mask):
-            beta_run1[:, :min_trials][union_nan_mask] = np.nan
-            beta_run2[:, :min_trials][union_nan_mask] = np.nan
-
-    # Concatenate trials across runs; runs are independent so differing trial counts are ok here.
-    beta_combined = np.concatenate((beta_run1, beta_run2), axis=1)
-    valid_voxel_mask = ~np.all(np.isnan(beta_combined), axis=1)
-    removed_voxels = int(valid_voxel_mask.size - np.count_nonzero(valid_voxel_mask))
-    if removed_voxels > 0:
-        beta_combined = beta_combined[valid_voxel_mask]
-        dropped_flat = flat_indices[~valid_voxel_mask]
-        nan_mask_flat[dropped_flat] = True
-    print(f"Combined filtered beta shape: {beta_combined.shape}", flush=True)
-    print(f"Removed voxels with all-NaN trials: {removed_voxels}", flush=True)
-    return beta_combined, nan_mask_flat
-
-def combine_active_run_data(coords_run1, coords_run2, bold_run1, bold_run2, volume_shape, shared_nan_mask_flat):
-    coords_run1 = tuple(axis for axis in coords_run1)
-    coords_run2 = tuple(axis for axis in coords_run2)
-    # Collapse (x, y, z) coordinates into single flat indices for practical set operations.
-    flat_run1 = np.ravel_multi_index(coords_run1, volume_shape)
-    flat_run2 = np.ravel_multi_index(coords_run2, volume_shape)
-
-    # Only keep voxels that exist in both runs and are not masked out by NaNs.
-    shared_flat = np.intersect1d(flat_run1, flat_run2, assume_unique=False)
-    shared_flat = shared_flat[~shared_nan_mask_flat[shared_flat]]
-    shared_coords = np.unravel_index(shared_flat, volume_shape)
-    shared_coords = tuple(axis for axis in shared_coords)
-
-    # Sorting once lets np.searchsorted perform vectorized index lookup back into each run.
-    sorter1 = np.argsort(flat_run1)
-    sorter2 = np.argsort(flat_run2)
-    sorted_flat_run1 = flat_run1[sorter1]
-    sorted_flat_run2 = flat_run2[sorter2]
-    idx_run1 = sorter1[np.searchsorted(sorted_flat_run1, shared_flat)]
-    idx_run2 = sorter2[np.searchsorted(sorted_flat_run2, shared_flat)]
-    # Concatenate matching voxel time courses from the two runs to build the joint dataset.
-    combined_bold = np.concatenate((bold_run1[idx_run1], bold_run2[idx_run2]), axis=1)
-    return shared_flat, shared_coords, combined_bold
-
 def mask_anatomical_image(anat_img, mask_flat, volume_shape):
     anat_data = anat_img.get_fdata()
     mask_flat = mask_flat.ravel()
@@ -169,7 +105,7 @@ def compute_distance_weighted_adjacency(coords, affine, radius_mm=3.0, sigma_mm=
     degree_matrix = sparse.diags(degrees).tocsr()  # CSR keeps diagonal structure but allows slicing.
     return adjacency, degree_matrix
 # %%
-# Subject/session (edit these only; SUB/SES env vars override when set)
+# Output labels (SUB/SES env vars are only used for naming outputs)
 sub = os.environ.get("SUB", "9")
 ses = int(os.environ.get("SES", "1"))
 sub_dir = str(sub).zfill(2)
@@ -177,7 +113,6 @@ ses_dir = str(ses).zfill(2)
 num_trials = 180  # default; updated after loading data
 trial_len = 9
 behave_indice = 1 #1/RT
-trials_per_run = num_trials // 2
 
 # Save a quick visualization of the mean beta activation (averaged over trials) as an interactive HTML.
 
@@ -197,12 +132,6 @@ def _resolve_existing_path(*candidates, glob_candidates=()):
 
 def _resolve_numpy_path(*candidates, glob_candidates=()):
     return _resolve_existing_path(*candidates, glob_candidates=glob_candidates)
-
-def _parse_bool_env(name, default=None):
-    value = os.environ.get(name)
-    if value is None or str(value).strip() == "":
-        return default
-    return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 def _group_concat_required_files(group_label):
     return [f"nan_mask_flat_{group_label}.npy", f"active_coords_{group_label}.npy", f"active_flat_indices__{group_label}.npy",
@@ -231,58 +160,11 @@ def _resolve_group_concat_dir(data_root, group_label):
             return expanded
     return None
 
-def _optional_numpy_load(path, **kwargs):
-    if path is None or (isinstance(path, str) and not os.path.exists(path)):
-        return None
-    try:
-        return np.load(path, **kwargs)
-    except FileNotFoundError:
-        return None
-
-def _load_trial_keep_mask(run, base_path):
-    path = _resolve_numpy_path(join(base_path, f"trial_keep_run{run}.npy"), f"data/trial_keep_run{run}.npy")
-    keep = _optional_numpy_load(path)
-    if keep is None:
-        return None
-    keep = np.asarray(keep)
-    return keep
-
-# def _pad_trials_with_nan(array, keep_mask, target_trials):
-#     if keep_mask is None:
-#         return array
-#     keep_mask = np.asarray(keep_mask, dtype=bool)
-#     if keep_mask.size != target_trials:
-#         raise ValueError(f"trial_keep mask length ({keep_mask.size}) does not match target_trials ({target_trials})")
-#     if array.shape[1] == target_trials:
-#         array = array.copy()
-#         array[:, ~keep_mask, ...] = np.nan
-#         return array
-#     kept = int(np.sum(keep_mask))
-#     if array.shape[1] != kept:
-#         raise ValueError(f"Array has {array.shape[1]} trials, expected {kept} (kept) or {target_trials} (full).")
-#     padded_shape = (array.shape[0], target_trials) + array.shape[2:]
-#     padded = np.full(padded_shape, np.nan, dtype=array.dtype)
-#     padded[:, keep_mask, ...] = array
-#     return padded
-
-def _align_behavior_matrix(behavior_matrix, expected_trials, trial_keep_run1=None, trial_keep_run2=None):
+def _align_behavior_matrix(behavior_matrix, expected_trials):
     behavior_matrix = np.asarray(behavior_matrix)
     current_trials = behavior_matrix.shape[0]
     if current_trials == expected_trials:
         return behavior_matrix
-    masks = []
-    if trial_keep_run1 is not None:
-        masks.append(np.asarray(trial_keep_run1, dtype=bool))
-    if trial_keep_run2 is not None:
-        masks.append(np.asarray(trial_keep_run2, dtype=bool))
-    if masks:
-        keep_mask = np.concatenate(masks) if len(masks) > 1 else masks[0]
-        if keep_mask.size == current_trials:
-            kept = int(np.count_nonzero(keep_mask))
-            if kept == expected_trials:
-                print(f"Behavior matrix filtered to kept trials ({kept}/{current_trials}).", flush=True)
-                return behavior_matrix[keep_mask]
-            print(f"WARNING: trial_keep masks keep {kept}/{current_trials} trials but expected {expected_trials}.", flush=True)
     if current_trials > expected_trials:
         print(f"WARNING: Behavior matrix has {current_trials} trials; truncating to {expected_trials} to match data.", flush=True)
         return behavior_matrix[:expected_trials]
@@ -310,7 +192,7 @@ def _load_manifest_segments(manifest_path, expected_trials):
         return [expected_trials], []
     manifest = pd.read_csv(manifest_path, sep="\t").sort_values("offset_start")
     segment_lengths = []
-    run_boundaries = []
+    transition_boundaries = []
     cumulative = 0
     for row in manifest.itertuples(index=False):
         start = int(row.offset_start)
@@ -321,13 +203,13 @@ def _load_manifest_segments(manifest_path, expected_trials):
         segment_lengths.append(length)
         cumulative += length
         if cumulative < expected_trials:
-            run_boundaries.append(cumulative)
+            transition_boundaries.append(cumulative)
     if cumulative != expected_trials:
         print(f"WARNING: Manifest trials ({cumulative}) do not match expected_trials ({expected_trials}).", flush=True)
         if cumulative < expected_trials:
             segment_lengths.append(expected_trials - cumulative)
-    run_boundaries = sorted({int(boundary) for boundary in run_boundaries if 0 < int(boundary) < expected_trials})
-    return segment_lengths, run_boundaries
+    transition_boundaries = sorted({int(boundary) for boundary in transition_boundaries if 0 < int(boundary) < expected_trials})
+    return segment_lengths, transition_boundaries
 
 def _build_block_boundaries(total_trials, block_size):
     total_trials = int(total_trials)
@@ -373,229 +255,72 @@ def _load_group_behavior_matrix(group_base_path, group_label, expected_trials):
     behavior_matrix = _align_behavior_matrix(behavior_matrix, expected_trials)
     return behavior_matrix, manifest_path
 
-def _load_subject_behavior_matrix(base_path, sub, ses, expected_trials, trial_keep_run1=None, trial_keep_run2=None):
-    behavior_root = os.path.expanduser(os.environ.get("FMRI_BEHAVIOR_DIR", "/Data/zahra/behaviour"))
-    sub_digits = str(sub).strip()
-    if sub_digits.isdigit():
-        sub_digits = sub_digits.zfill(3)
-    else:
-        sub_digits = _extract_subject_digits(sub_digits)
-
-    run1_path = join(behavior_root, f"PSPD{sub_digits}_ses_{ses}_run_1.npy")
-    run2_path = join(behavior_root, f"PSPD{sub_digits}_ses_{ses}_run_2.npy")
-    run1_behavior = _optional_numpy_load(run1_path)
-    run2_behavior = _optional_numpy_load(run2_path)
-    if run1_behavior is not None and run2_behavior is not None:
-        run1_behavior = run1_behavior
-        run2_behavior = run2_behavior
-        if run1_behavior.ndim == 1:
-            run1_behavior = run1_behavior[:, None]
-        if run2_behavior.ndim == 1:
-            run2_behavior = run2_behavior[:, None]
-        behavior_matrix = np.concatenate((run1_behavior, run2_behavior), axis=0)
-        behavior_matrix = _align_behavior_matrix(behavior_matrix, expected_trials, trial_keep_run1, trial_keep_run2)
-        return behavior_matrix
-
-    mat_path = join(base_path, f"PSPD00{sub}_OFF_behav_metrics.mat" if ses == 1 else f"PSPD00{sub}_ON_behav_metrics.mat")
-    if not os.path.exists(mat_path):
-        raise FileNotFoundError("Could not find behavior data. Checked run-wise npy files under "
-            f"{behavior_root} and MAT file: {mat_path}")
-    behav_data = loadmat(mat_path)
-    behav_metrics = behav_data["behav_metrics"]
-    behav_block = np.stack(behav_metrics[0], axis=0)
-    _, _, num_metrics = behav_block.shape
-    behavior_matrix = behav_block.reshape(-1, num_metrics)
-    behavior_matrix = _align_behavior_matrix(behavior_matrix, expected_trials, trial_keep_run1, trial_keep_run2)
-    return behavior_matrix
-
 group_label = os.environ.get("FMRI_GROUP_LABEL", "group").strip() or "group"
 group_concat_dir = _resolve_group_concat_dir(data_base, group_label)
-group_mode_env = _parse_bool_env("FMRI_USE_GROUP_CONCAT", default=None)
-if group_mode_env is None:
-    use_group_concat = group_concat_dir is not None
-else:
-    use_group_concat = bool(group_mode_env)
+if group_concat_dir is None:
+    raise FileNotFoundError(
+        "Group mode is required, but no valid group-concat directory was found. "
+        "Set FMRI_GROUP_CONCAT_DIR or place group files under FMRI_OPT_DATA_DIR/group_concat."
+    )
+base_path = group_concat_dir
+print(f"Data mode: group-concat | base_path={base_path}", flush=True)
 
-if use_group_concat:
-    if group_concat_dir is None:
-        raise FileNotFoundError("FMRI_USE_GROUP_CONCAT=1, but no valid group_concat directory was found.")
-    data_root = group_concat_dir
-else:
-    sub_data_root = os.path.join(data_base, f"sub{sub_dir}_ses{ses_dir}")
-    alt_sub_data_root = os.path.join(data_base, f"sub{sub}_ses{ses}")
-    if os.path.isdir(sub_data_root):
-        data_root = sub_data_root
-    elif os.path.isdir(alt_sub_data_root):
-        data_root = alt_sub_data_root
-    else:
-        data_root = data_base
-base_path = data_root
-print(f"Data mode: {'group-concat' if use_group_concat else 'subject'} | base_path={base_path}", flush=True)
+anatomy_root = os.path.expanduser(os.environ.get("FMRI_ANATOMY_MASK_DIR", "/Data/zahra/anatomy_masks"))
+anat_img_path = _resolve_existing_path(join(anatomy_root, "MNI152_T1_2mm_brain.nii.gz"), join(anatomy_root, "MNI152_T1_1mm_brain.nii.gz"))
+anat_path = anat_img_path
+brain_mask_path = _resolve_existing_path(join(anatomy_root, "MNI152_T1_2mm_brain_mask.nii.gz"), join(anatomy_root, "MNI152_T1_1mm_brain_mask.nii.gz"))
+csf_mask_path = _resolve_existing_path(join(anatomy_root, "MNI152_T1_2mm_brain_seg_csf.nii.gz"), join(anatomy_root, "MNI152_T1_1mm_brain_seg_csf.nii.gz"))
+gray_mask_path = _resolve_existing_path(join(anatomy_root, "MNI152_T1_2mm_brain_seg_gm.nii.gz"), join(anatomy_root, "MNI152_T1_1mm_brain_seg_gm.nii.gz"))
 
-if use_group_concat:
-    anatomy_root = os.path.expanduser(os.environ.get("FMRI_ANATOMY_MASK_DIR", "/Data/zahra/anatomy_masks"))
-    anat_root = anatomy_root
-    anat_path = _resolve_existing_path(join(anatomy_root, "MNI152_T1_2mm_brain.nii.gz"), join(anatomy_root, "MNI152_T1_1mm_brain.nii.gz"))
-    brain_mask_path = _resolve_existing_path(join(anatomy_root, "MNI152_T1_2mm_brain_mask.nii.gz"), join(anatomy_root, "MNI152_T1_1mm_brain_mask.nii.gz"))
-    csf_mask_path = _resolve_existing_path(join(anatomy_root, "MNI152_T1_2mm_brain_seg_csf.nii.gz"), join(anatomy_root, "MNI152_T1_1mm_brain_seg_csf.nii.gz"))
-    gray_mask_path = _resolve_existing_path(join(anatomy_root, "MNI152_T1_2mm_brain_seg_gm.nii.gz"), join(anatomy_root, "MNI152_T1_1mm_brain_seg_gm.nii.gz"))
-else:
-    anat_root = base_path
-    brain_mask_path = f"{anat_root}/sub-pd00{sub}_ses-{ses}_T1w_brain_mask.nii.gz"
-    csf_mask_path = f"{anat_root}/sub-pd00{sub}_ses-{ses}_T1w_brain_pve_0.nii.gz"
-    gray_mask_path = f"{anat_root}/sub-pd00{sub}_ses-{ses}_T1w_brain_pve_1.nii.gz"
-    anat_path = _resolve_existing_path(f"{anat_root}/sub-pd00{sub}_ses-{ses}_T1w_brain.nii.gz")
-
-anat_img = nib.load(anat_path)
+anat_img = nib.load(anat_img_path)
 brain_mask = nib.load(brain_mask_path).get_fdata().astype(np.float16)
 csf_mask = nib.load(csf_mask_path).get_fdata().astype(np.float16)
 gray_mask = nib.load(gray_mask_path).get_fdata().astype(np.float16)
 
-trial_keep_run1 = None
-trial_keep_run2 = None
-group_manifest_path = None
+nan_mask_group_path = _resolve_numpy_path(join(base_path, f"nan_mask_flat_{group_label}.npy"), join(base_path, f"mask_all_nan_{group_label}.npy"))
+active_coords_group_path = _resolve_numpy_path(join(base_path, f"active_coords_{group_label}.npy"))
+active_flat_group_path = _resolve_numpy_path(join(base_path, f"active_flat_indices__{group_label}.npy"))
+beta_group_path = _resolve_numpy_path(join(base_path, f"beta_volume_filter_{group_label}.npy"), join(base_path, f"cleaned_beta_volume_{group_label}.npy"))
+bold_group_path = _resolve_numpy_path(join(base_path, f"active_bold_{group_label}.npy"))
 
-if use_group_concat:
-    nan_mask_group_path = _resolve_numpy_path(join(base_path, f"nan_mask_flat_{group_label}.npy"), join(base_path, f"mask_all_nan_{group_label}.npy"))
-    active_coords_group_path = _resolve_numpy_path(join(base_path, f"active_coords_{group_label}.npy"))
-    active_flat_group_path = _resolve_numpy_path(join(base_path, f"active_flat_indices__{group_label}.npy"))
-    beta_group_path = _resolve_numpy_path(join(base_path, f"beta_volume_filter_{group_label}.npy"), join(base_path, f"cleaned_beta_volume_{group_label}.npy"))
-    bold_group_path = _resolve_numpy_path(join(base_path, f"active_bold_{group_label}.npy"))
+shared_nan_mask_flat = np.asarray(np.load(nan_mask_group_path, mmap_mode="r")).ravel()
+nan_mask_flat = shared_nan_mask_flat.copy()
+active_coords = _normalize_active_coords(np.load(active_coords_group_path, allow_pickle=True))
+active_flat_idx = np.asarray(np.load(active_flat_group_path, mmap_mode="r"), dtype=np.int64).ravel()
+beta_clean = np.load(beta_group_path, mmap_mode="r")
+bold_clean = np.load(bold_group_path, mmap_mode="r")
+volume_shape = anat_img.shape[:3]
+expected_mask_size = int(np.prod(volume_shape))
+if shared_nan_mask_flat.size != expected_mask_size:
+    raise ValueError(f"Group nan mask size ({shared_nan_mask_flat.size}) does not match anatomy volume size ({expected_mask_size}).")
 
-    shared_nan_mask_flat = np.asarray(np.load(nan_mask_group_path, mmap_mode="r")).ravel()
-    nan_mask_flat = shared_nan_mask_flat.copy()
-    active_coords = _normalize_active_coords(np.load(active_coords_group_path, allow_pickle=True))
-    active_flat_idx = np.asarray(np.load(active_flat_group_path, mmap_mode="r"), dtype=np.int64).ravel()
-    beta_clean = np.load(beta_group_path, mmap_mode="r")
-    bold_clean = np.load(bold_group_path, mmap_mode="r")
-    volume_shape = anat_img.shape[:3]
-    expected_mask_size = int(np.prod(volume_shape))
-    if shared_nan_mask_flat.size != expected_mask_size:
-        raise ValueError(f"Group nan mask size ({shared_nan_mask_flat.size}) does not match anatomy volume size ({expected_mask_size}).")
+num_trials = int(bold_clean.shape[1])
+if beta_clean.shape[1] != num_trials:
+    print(f"WARNING: Trial counts differ (bold={num_trials}, beta={beta_clean.shape[1]}); using bold count.", flush=True)
 
-    num_trials = int(bold_clean.shape[1])
-    if beta_clean.shape[1] != num_trials:
-        print(f"WARNING: Trial counts differ (bold={num_trials}, beta={beta_clean.shape[1]}); using bold count.", flush=True)
-    run1_trials = num_trials
-    run2_trials = 0
-    trials_per_run = num_trials
+group_manifest_path = join(base_path, f"concat_manifest_{group_label}.tsv")
+_, transition_boundaries = _load_manifest_segments(group_manifest_path, num_trials)
+group_block_trials = int(os.environ.get("FMRI_GROUP_BLOCK_TRIALS", "90"))
+fixed_group_boundaries = _build_block_boundaries(num_trials, group_block_trials)
+if fixed_group_boundaries:
+    manifest_boundary_set = set(transition_boundaries)
+    missing_boundaries = [boundary for boundary in fixed_group_boundaries if boundary not in manifest_boundary_set]
+    if missing_boundaries:
+        preview = missing_boundaries[:8]
+        tail = "..." if len(missing_boundaries) > 8 else ""
+        print(f"INFO: Adding {len(missing_boundaries)} fixed {group_block_trials}-trial block boundaries "
+              f"for transition safety: {preview}{tail}", flush=True)
+    transition_boundaries = sorted(set(transition_boundaries).union(fixed_group_boundaries))
 
-    group_manifest_path = join(base_path, f"concat_manifest_{group_label}.tsv")
-    trial_segment_lengths, run_boundaries = _load_manifest_segments(group_manifest_path, num_trials)
-    if not trial_segment_lengths:
-        trial_segment_lengths = [num_trials]
-    group_block_trials = int(os.environ.get("FMRI_GROUP_BLOCK_TRIALS", "90"))
-    fixed_group_boundaries = _build_block_boundaries(num_trials, group_block_trials)
-    if fixed_group_boundaries:
-        manifest_boundary_set = set(run_boundaries)
-        missing_boundaries = [boundary for boundary in fixed_group_boundaries if boundary not in manifest_boundary_set]
-        if missing_boundaries:
-            preview = missing_boundaries[:8]
-            tail = "..." if len(missing_boundaries) > 8 else ""
-            print(f"INFO: Adding {len(missing_boundaries)} fixed {group_block_trials}-trial block boundaries "
-                  f"for transition safety: {preview}{tail}", flush=True)
-        run_boundaries = sorted(set(run_boundaries).union(fixed_group_boundaries))
-
-    behavior_matrix, used_manifest = _load_group_behavior_matrix(base_path, group_label, num_trials)
-    print(f"Loaded group behavior matrix from manifest: {used_manifest}", flush=True)
-else:
-    # glm_dict = np.load(f"{base_path}/TYPED_FITHRF_GLMDENOISE_RR_sub{sub}_ses{ses}.npy", allow_pickle=True).item()
-    # beta_glm = glm_dict["betasmd"]
-    nan_mask_run1_path = _resolve_numpy_path(join(base_path, f"nan_mask_flat_sub0{sub}_ses{ses}_run1.npy"), f"data/nan_mask_flat_sub{sub}_ses{ses}_run1.npy")
-    nan_mask_run2_path = _resolve_numpy_path(join(base_path, f"nan_mask_flat_sub0{sub}_ses{ses}_run2.npy"), f"data/nan_mask_flat_sub{sub}_ses{ses}_run2.npy")
-    active_coords_run1_path = join(base_path, f"active_coords_sub0{sub}_ses{ses}_run1.npy")
-    active_coords_run2_path = join(base_path, f"active_coords_sub0{sub}_ses{ses}_run2.npy")
-    nan_mask_flat_run1 = _optional_numpy_load(nan_mask_run1_path)
-    nan_mask_flat_run2 = np.load(nan_mask_run2_path)
-    active_coords_run1 = _optional_numpy_load(active_coords_run1_path, allow_pickle=True)
-    if active_coords_run1 is None:
-        active_coords_run1 = _optional_numpy_load(f"data/sub0{sub}_ses0{ses}/active_coords_sub0{sub}_ses{ses}_run1.npy", allow_pickle=True)
-    active_coords_run2 = _optional_numpy_load(active_coords_run2_path, allow_pickle=True)
-    if active_coords_run2 is None:
-        active_coords_run2 = np.load(f"data/sub0{sub}_ses0{ses}/active_coords_sub0{sub}_ses{ses}_run2.npy", allow_pickle=True)
-
-    beta_filtered_run1 = _optional_numpy_load(join(base_path, f"beta_volume_filter_sub0{sub}_ses{ses}_run1.npy"))
-    if beta_filtered_run1 is None:
-        beta_filtered_run1 = _optional_numpy_load(f"data/sub0{sub}_ses0{ses}/beta_volume_filter_sub0{sub}_ses{ses}_run1.npy")
-    beta_filtered_run2 = _optional_numpy_load(join(base_path, f"beta_volume_filter_sub0{sub}_ses{ses}_run2.npy"))
-    if beta_filtered_run2 is None:
-        beta_filtered_run2 = np.load(f"data/sub0{sub}_ses0{ses}/beta_volume_filter_sub0{sub}_ses{ses}_run2.npy")
-
-    trial_keep_run1 = _optional_numpy_load(join(base_path, "trial_keep_run1.npy"))
-    trial_keep_run2 = _optional_numpy_load(join(base_path, "trial_keep_run2.npy"))
-    if trial_keep_run1 is None:
-        trial_keep_run1 = _load_trial_keep_mask(1, base_path)
-    if trial_keep_run2 is None:
-        trial_keep_run2 = _load_trial_keep_mask(2, base_path)
-
-    single_run_mode = nan_mask_flat_run1 is None or beta_filtered_run1 is None or active_coords_run1 is None
-    run2_bold_path = _resolve_existing_path(join(base_path, f"fmri_sub{sub}_ses{ses}_run2.nii.gz"), join(base_path, f"fmri_sub{sub}_ses{ses}_run2.npy"),
-                                            glob_candidates=(join(base_path, f"sub-pd00{sub}_ses-{ses}_run-2*_bold*_reg.nii.gz")))
-    bold_img_run2 = nib.load(run2_bold_path) if run2_bold_path.endswith((".nii", ".nii.gz")) else None
-    if bold_img_run2 is None:
-        bold_img_run2 = nib.Nifti1Image(np.load(run2_bold_path, mmap_mode="r"), affine=np.eye(4))
-    volume_shape = bold_img_run2.shape[:3]
-
-    if single_run_mode:
-        print("WARNING: Run1 preprocessed arrays not found; running in single-run mode (run2 only).", flush=True)
-        shared_nan_mask_flat = nan_mask_flat_run2
-        nan_mask_flat = nan_mask_flat_run2.ravel()
-        beta_clean = beta_filtered_run2
-    else:
-        run1_bold_path = _resolve_existing_path(join(base_path, f"fmri_sub{sub}_ses{ses}_run1.nii.gz"), join(base_path, f"fmri_sub{sub}_ses{ses}_run1.npy"),
-                                                glob_candidates=(join(base_path, f"sub-pd00{sub}_ses-{ses}_run-1*_bold*_reg.nii.gz")))
-        bold_img_run1 = nib.load(run1_bold_path) if run1_bold_path.endswith((".nii", ".nii.gz")) else None
-        if bold_img_run1 is None:
-            bold_img_run1 = nib.Nifti1Image(np.load(run1_bold_path, mmap_mode="r"), affine=np.eye(4))
-        volume_shape = bold_img_run1.shape[:3]
-
-        beta_filtered_run1, beta_filtered_run2, shared_nan_mask_flat, shared_flat_indices = synchronize_beta_voxels(beta_filtered_run1, beta_filtered_run2,
-                                                                                                                    nan_mask_flat_run1, nan_mask_flat_run2)
-        beta_clean, nan_mask_flat = combine_filtered_betas(beta_filtered_run1, beta_filtered_run2, shared_nan_mask_flat.ravel(), shared_flat_indices)
-
-    clean_active_bold_run1 = _optional_numpy_load(join(base_path, f"active_bold_sub0{sub}_ses{ses}_run1.npy"))
-    if clean_active_bold_run1 is None:
-        clean_active_bold_run1 = _optional_numpy_load(f"data/sub0{sub}_ses0{ses}/active_bold_sub0{sub}_ses{ses}_run1.npy")
-    clean_active_bold_run2 = _optional_numpy_load(join(base_path, f"active_bold_sub0{sub}_ses{ses}_run2.npy"))
-    if clean_active_bold_run2 is None:
-        clean_active_bold_run2 = np.load(f"data/sub0{sub}_ses0{ses}/active_bold_sub0{sub}_ses{ses}_run2.npy")
-
-    if single_run_mode:
-        coords_tuple = tuple(axis for axis in active_coords_run2)
-        active_flat_idx = np.ravel_multi_index(coords_tuple, volume_shape)
-        active_coords = np.column_stack(coords_tuple)
-        bold_clean = clean_active_bold_run2
-    else:
-        active_flat_idx, active_coords, bold_clean = combine_active_run_data(active_coords_run1, active_coords_run2, clean_active_bold_run1,
-                                                                             clean_active_bold_run2, volume_shape, shared_nan_mask_flat)
-    active_coords = np.asarray(active_coords)
-    num_trials = int(bold_clean.shape[1])
-    if beta_clean.shape[1] != num_trials:
-        print(f"WARNING: Trial counts differ (bold={num_trials}, beta={beta_clean.shape[1]}); using bold count.", flush=True)
-
-    if single_run_mode:
-        run1_trials = 0
-        run2_trials = num_trials
-    else:
-        run1_trials = int(clean_active_bold_run1.shape[1])
-        run2_trials = int(clean_active_bold_run2.shape[1])
-        if (run1_trials + run2_trials) != num_trials:
-            print(f"WARNING: Run trial counts (run1={run1_trials}, run2={run2_trials}), do not match bold total ({num_trials}).", flush=True)
-    trials_per_run = run1_trials if run1_trials > 0 else num_trials
-    run_boundaries = [run1_trials] if run1_trials > 0 and run2_trials > 0 else []
-    trial_segment_lengths = [int(length) for length in (run1_trials, run2_trials) if int(length) > 0]
-    if not trial_segment_lengths:
-        trial_segment_lengths = [num_trials]
-
-    behavior_matrix = _load_subject_behavior_matrix(base_path, sub, ses, num_trials, trial_keep_run1=trial_keep_run1, trial_keep_run2=trial_keep_run2)
+behavior_matrix, used_manifest = _load_group_behavior_matrix(base_path, group_label, num_trials)
+print(f"Loaded group behavior matrix from manifest: {used_manifest}", flush=True)
 
 active_coords = np.asarray(active_coords)
-run_boundaries = sorted({int(boundary) for boundary in (run_boundaries or []) if 0 < int(boundary) < num_trials})
+transition_boundaries = sorted({int(boundary) for boundary in (transition_boundaries or []) if 0 < int(boundary) < num_trials})
 print(f"Combined active_flat_idx: {active_flat_idx.shape}", flush=True)
 print(f"Combined clean_active_bold: {bold_clean.shape}", flush=True)
 print(f"Combined active_coords: {active_coords.shape}", flush=True)
-print(f"Using num_trials={num_trials}, trials_per_run={trials_per_run}, "
-    f"(run1={run1_trials}, run2={run2_trials}), boundaries={run_boundaries[:8]}{'...' if len(run_boundaries) > 8 else ''}.", flush=True)
+print(f"Using num_trials={num_trials}, boundaries={transition_boundaries[:8]}{'...' if len(transition_boundaries) > 8 else ''}.", flush=True)
 print(f"Behavior matrix shape: {behavior_matrix.shape}", flush=True)
 
 # Mask anatomical volume to the functional voxel set and compute adjacency/degree matrices.
@@ -654,14 +379,10 @@ def _empca_model_path():
     cache_dir_env = os.environ.get("FMRI_EMPCA_CACHE_DIR", "").strip()
     if cache_dir_env:
         cache_dir = os.path.expanduser(cache_dir_env)
-    elif use_group_concat:
-        cache_dir = base_path
     else:
-        cache_dir = f"data/sub0{sub}_ses0{ses}"
+        cache_dir = base_path
     os.makedirs(cache_dir, exist_ok=True)
-    if use_group_concat:
-        return join(cache_dir, f"empca_model_{group_label}.npy")
-    return join(cache_dir, f"empca_model_sub0{sub}_ses{ses}.npy")
+    return join(cache_dir, f"empca_model_{group_label}.npy")
 
 def apply_empca(bold_clean):
     def prepare_for_empca(data):
@@ -1347,7 +1068,7 @@ def evaluate_bold_bold_projection_corr(voxel_weights, data):
     return projection, correlations
 
 #%%
-def _split_run_folds(trial_count, num_folds):
+def _split_contiguous_folds(trial_count, num_folds):
     trial_count = int(trial_count)
     num_folds = int(num_folds)
     if trial_count < 0:
@@ -1367,140 +1088,32 @@ def _split_run_folds(trial_count, num_folds):
         start = end
     return folds
 
-def build_custom_kfold_splits(total_trials, num_folds=5, trials_per_run=None, run1_trials=None, run2_trials=None,
-                              segment_lengths=None, split_by_segments=True):
+def build_custom_kfold_splits(total_trials, num_folds=10):
     total_trials = int(total_trials)
     num_folds = int(num_folds)
-
-    def _build_global_contiguous_folds(run1_trials_local, run2_trials_local):
-        all_trials = np.arange(total_trials, dtype=np.int64)
-        contiguous_folds = _split_run_folds(total_trials, num_folds)
-        run1_cut = int(run1_trials_local) if run1_trials_local is not None else 0
-        run2_count = int(run2_trials_local) if run2_trials_local is not None else 0
-
-        folds = []
-        for fold_idx, test_indices in enumerate(contiguous_folds, start=1):
-            test_indices = np.asarray(test_indices, dtype=np.int64)
-            train_mask = np.ones(total_trials, dtype=bool)
-            train_mask[test_indices] = False
-            train_indices = all_trials[train_mask]
-
-            if run1_cut > 0 and run2_count > 0:
-                test_run1 = test_indices[test_indices < run1_cut]
-                test_run2 = test_indices[test_indices >= run1_cut]
-                run2_fold = fold_idx if test_run2.size else None
-            else:
-                test_run1 = test_indices
-                test_run2 = np.array([], dtype=np.int64)
-                run2_fold = None
-
-            folds.append(
-                {
-                    "fold_id": fold_idx,
-                    "train_indices": train_indices,
-                    "test_indices": test_indices,
-                    "test_run1": test_run1,
-                    "test_run2": test_run2,
-                    "run1_fold": fold_idx,
-                    "run2_fold": run2_fold,
-                }
-            )
-        return folds
-
-    def _build_single_axis_folds(segment_lengths):
-        segment_lengths = [int(length) for length in segment_lengths if int(length) > 0]
-        if not segment_lengths:
-            segment_lengths = [total_trials]
-        if sum(segment_lengths) != total_trials:
-            print(f"WARNING: segment length sum ({sum(segment_lengths)}) does not match total_trials ({total_trials}); "
-                "falling back to a single segment.", flush=True)
-            segment_lengths = [total_trials]
-
-        segment_offsets = np.cumsum([0] + segment_lengths[:-1], dtype=np.int64)
-        segment_folds = [_split_run_folds(length, num_folds) for length in segment_lengths]
-        all_trials = np.arange(total_trials, dtype=np.int64)
-        folds = []
-        for fold_idx in range(num_folds):
-            test_parts = []
-            for offset, folds_for_segment in zip(segment_offsets, segment_folds):
-                local_test = folds_for_segment[fold_idx]
-                if local_test.size:
-                    test_parts.append(local_test + offset)
-            if test_parts:
-                test_indices = np.sort(np.concatenate(test_parts))
-            else:
-                test_indices = np.array([], dtype=np.int64)
-            train_mask = np.ones(all_trials.size, dtype=bool)
-            train_mask[test_indices] = False
-            train_indices = all_trials[train_mask]
-            test_run1 = test_parts[0] if len(test_parts) > 0 else np.array([], dtype=np.int64)
-            test_run2 = test_parts[1] if len(test_parts) > 1 else np.array([], dtype=np.int64)
-            folds.append(
-                {
-                    "fold_id": fold_idx + 1,
-                    "train_indices": train_indices,
-                    "test_indices": test_indices,
-                    "test_run1": test_run1,
-                    "test_run2": test_run2,
-                    "run1_fold": fold_idx + 1,
-                    "run2_fold": fold_idx + 1 if len(segment_lengths) > 1 else None,
-                }
-            )
-        return folds
-
-    if split_by_segments and segment_lengths is not None:
-        return _build_single_axis_folds(segment_lengths)
-
-    if run1_trials is None or run2_trials is None:
-        if trials_per_run is None:
-            trials_per_run = total_trials // 2
-        run1_trials = trials_per_run
-        run2_trials = total_trials - run1_trials
-
-    run1_trials = int(run1_trials)
-    run2_trials = int(run2_trials)
-    if (run1_trials + run2_trials) != total_trials:
-        print(f"WARNING: run trial counts ({run1_trials}+{run2_trials}) do not match total_trials ({total_trials}); "
-              "using contiguous global folds.", flush=True)
-        return _build_global_contiguous_folds(run1_trials, run2_trials)
-
-    if not split_by_segments:
-        return _build_global_contiguous_folds(run1_trials, run2_trials)
-
-    if run1_trials == 0 or run2_trials == 0:
-        return _build_global_contiguous_folds(run1_trials, run2_trials)
-
-    run1_folds = _split_run_folds(run1_trials, num_folds)
-    run2_folds = _split_run_folds(run2_trials, num_folds)
-
-    total_trials = run1_trials + run2_trials
-    folds = []
     all_trials = np.arange(total_trials, dtype=np.int64)
-    fold_id = 1
-    for run1_fold_idx, test_run1 in enumerate(run1_folds, start=1):
-        for run2_fold_idx, test_run2 in enumerate(run2_folds, start=1):
-            test_run2_global = test_run2 + run1_trials
-            test_indices = np.concatenate((test_run1, test_run2_global))
-            train_mask = np.ones(total_trials, dtype=bool)
-            train_mask[test_indices] = False
-            train_indices = all_trials[train_mask]
-            folds.append({"fold_id": fold_id, "train_indices": train_indices, "test_indices": test_indices, 
-                          "test_run1": test_run1, "test_run2": test_run2_global, "run1_fold": run1_fold_idx, "run2_fold": run2_fold_idx})
-            fold_id += 1
+    test_folds = _split_contiguous_folds(total_trials, num_folds)
+    folds = []
+    for fold_idx, test_indices in enumerate(test_folds, start=1):
+        test_indices = np.asarray(test_indices, dtype=np.int64)
+        train_mask = np.ones(total_trials, dtype=bool)
+        train_mask[test_indices] = False
+        train_indices = all_trials[train_mask]
+        folds.append({"fold_id": fold_idx, "train_indices": train_indices, "test_indices": test_indices})
     return folds
 
-def _crosses_any_boundary(idx_current, idx_next, run_boundaries):
-    if not run_boundaries:
+def _crosses_any_boundary(idx_current, idx_next, transition_boundaries):
+    if not transition_boundaries:
         return False
-    for boundary in run_boundaries:
+    for boundary in transition_boundaries:
         if idx_current < boundary <= idx_next:
             return True
     return False
 
-def calcu_matrices_func(beta_pca, bold_pca, behave_mat, behave_indice, trial_len, num_trials, trial_indices, run_boundaries):
+def calcu_matrices_func(beta_pca, bold_pca, behave_mat, behave_indice, trial_len, num_trials, trial_indices, transition_boundaries):
     bold_pca_reshape = bold_pca.reshape(bold_pca.shape[0], num_trials, trial_len)
     behavior_selected = behave_mat[:, behave_indice]
-    run_boundaries = sorted({int(boundary) for boundary in (run_boundaries or []) if int(boundary) > 0})
+    transition_boundaries = sorted({int(boundary) for boundary in (transition_boundaries or []) if int(boundary) > 0})
 
     counts = np.count_nonzero(np.isfinite(beta_pca), axis=-1)
     sums = np.nansum(np.abs(beta_pca), axis=-1)
@@ -1519,7 +1132,7 @@ def calcu_matrices_func(beta_pca, bold_pca, behave_mat, behave_indice, trial_len
         idx_next = trial_indices[i + 1]
         if (idx_next - idx_current) != 1:
             continue
-        if _crosses_any_boundary(idx_current, idx_next, run_boundaries):
+        if _crosses_any_boundary(idx_current, idx_next, transition_boundaries):
             continue
         x1 = bold_pca_reshape[:, i, :]
         x2 = bold_pca_reshape[:, i + 1, :]
@@ -1535,7 +1148,7 @@ def calcu_matrices_func(beta_pca, bold_pca, behave_mat, behave_indice, trial_len
         idx_next = trial_indices[i + 1]
         if (idx_next - idx_current) != 1:
             continue
-        if _crosses_any_boundary(idx_current, idx_next, run_boundaries):
+        if _crosses_any_boundary(idx_current, idx_next, transition_boundaries):
             continue
         x1 = beta_pca[:, i]
         x2 = beta_pca[:, i + 1]
@@ -1547,7 +1160,7 @@ def calcu_matrices_func(beta_pca, bold_pca, behave_mat, behave_indice, trial_len
 
     return C_task, C_bold, C_beta, behavior_selected
 
-def prepare_data_func(projection_data, trial_indices, trial_length, run_boundaries, normalization_info):
+def prepare_data_func(projection_data, trial_indices, trial_length, transition_boundaries, normalization_info):
     effective_num_trials = trial_indices.size
     behavior_subset = projection_data["behavior_matrix"][trial_indices]
     behavior_vector_full = normalization_info["behavior_vector_full"]
@@ -1567,7 +1180,7 @@ def prepare_data_func(projection_data, trial_indices, trial_length, run_boundari
 
     (C_task, C_bold, C_beta, _) = calcu_matrices_func(beta_pca, bold_pca_components, behavior_subset, behave_indice,
                                                       trial_len=trial_length, num_trials=effective_num_trials,
-                                                      trial_indices=trial_indices, run_boundaries=run_boundaries)
+                                                      trial_indices=trial_indices, transition_boundaries=transition_boundaries)
     skew_task = C_task - C_task.T
     skew_bold = C_bold - C_bold.T
     skew_beta = C_beta - C_beta.T
@@ -2011,18 +1624,11 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
         print(f"\n===== Fold {fold_idx}/{total_folds} =====", flush=True)
         test_indices, train_indices = split["test_indices"], split["train_indices"]
         test_desc = _describe_trial_span(test_indices)
-        run1_desc = _describe_trial_span(split.get("test_run1", []))
-        run2_desc = _describe_trial_span(split.get("test_run2", []))
-        if run2_desc is None:
-            test_text = f"{test_desc[0]}-{test_desc[1]}" if test_desc else "n/a"
-            print(f"Test trials (1-based): {test_text}", flush=True)
-        else:
-            run1_text = f"{run1_desc[0]}-{run1_desc[1]}" if run1_desc else "n/a"
-            run2_text = f"{run2_desc[0]}-{run2_desc[1]}" if run2_desc else "n/a"
-            print(f"Test trials (1-based): run1 {run1_text}, run2 {run2_text}", flush=True)
+        test_text = f"{test_desc[0]}-{test_desc[1]}" if test_desc else "n/a"
+        print(f"Test trials (1-based): {test_text}", flush=True)
         normalization_info = compute_fold_normalization(projection_data, train_indices, behave_indice)
-        train_data = prepare_data_func(projection_data, train_indices, trial_len, run_boundaries, normalization_info)
-        test_data = prepare_data_func(projection_data, test_indices, trial_len, run_boundaries, normalization_info)
+        train_data = prepare_data_func(projection_data, train_indices, trial_len, transition_boundaries, normalization_info)
+        test_data = prepare_data_func(projection_data, test_indices, trial_len, transition_boundaries, normalization_info)
 
         train_corr_norms = {"num": _matrix_norm_summary(train_data["C_corr_num"]), "den": _matrix_norm_summary(train_data["C_corr_den"])}
         test_corr_norms = {"num": _matrix_norm_summary(test_data["C_corr_num"]), "den": _matrix_norm_summary(test_data["C_corr_den"])}
@@ -2113,8 +1719,6 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 weight_stats = {"component_weights": _array_summary(component_weights), "voxel_weights": _array_summary(voxel_weights)}
                 log_entry = {"fold": fold_idx,
                     "test_span": test_desc,
-                    "run1_test_span": run1_desc,
-                    "run2_test_span": run2_desc,
                     "alphas": {"task": task_alpha, "bold": bold_alpha, "beta": beta_alpha, "smooth": smooth_alpha},
                     "gamma": gamma_value,
                     "corr_weight": corr_weight,
@@ -2349,27 +1953,14 @@ if __name__ == "__main__":
     if num_folds_env:
         num_folds = int(num_folds_env)
     else:
-        num_folds = 10 if use_group_concat else 5
+        num_folds = 10
 
-    split_by_segments_env = _parse_bool_env("FMRI_SPLIT_BY_SEGMENTS", default=None)
-    if split_by_segments_env is None:
-        split_by_segments = not use_group_concat
-    else:
-        split_by_segments = bool(split_by_segments_env)
-    segment_lengths_for_split = trial_segment_lengths if split_by_segments else None
-
-    fold_splits = build_custom_kfold_splits(num_trials, num_folds=num_folds, trials_per_run=trials_per_run,
-                                            run1_trials=run1_trials, run2_trials=run2_trials,
-                                            segment_lengths=segment_lengths_for_split,
-                                            split_by_segments=split_by_segments)
-    split_mode = "segment-aligned" if split_by_segments else "global-contiguous"
-    segment_count = len(segment_lengths_for_split) if segment_lengths_for_split is not None else 1
+    fold_splits = build_custom_kfold_splits(num_trials, num_folds=num_folds)
     fold_sizes = [int(split["test_indices"].size) for split in fold_splits]
-    print(f"Constructed {len(fold_splits)} folds using num_folds={num_folds} ({split_mode}) "
-          f"across {segment_count} segment(s).", flush=True)
+    print(f"Constructed {len(fold_splits)} folds using num_folds={num_folds} (global-contiguous).", flush=True)
     print(f"Fold test sizes: min={min(fold_sizes)}, max={max(fold_sizes)}, "
           f"mean={float(np.mean(fold_sizes)):.2f}", flush=True)
     run_cross_run_experiment(selected_alphas, selected_gammas, fold_splits, projection_data)
 
     # trial_indices = np.arange(projection_data["behavior_matrix"].shape[0], dtype=int)
-    # run_data = prepare_data_func(projection_data, trial_indices, trial_len, trials_per_run, projection_data)
+    # run_data = prepare_data_func(projection_data, trial_indices, trial_len, transition_boundaries, projection_data)
