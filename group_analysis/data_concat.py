@@ -294,7 +294,10 @@ def main():
             sorter = np.argsort(flat_active)
             sorted_flat = flat_active[sorter]
             positions = np.searchsorted(sorted_flat, union_flat)
-            present = (positions < sorted_flat.size) & (sorted_flat[positions] == union_flat)
+            valid = positions < sorted_flat.size
+            present = np.zeros(union_flat.size, dtype=bool)
+            if np.any(valid):
+                present[valid] = sorted_flat[positions[valid]] == union_flat[valid]
             idx = np.full(union_flat.size, -1, dtype=int)
             if np.any(present):
                 idx[present] = sorter[positions[present]]
