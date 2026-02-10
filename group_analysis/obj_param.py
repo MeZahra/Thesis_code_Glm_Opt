@@ -36,7 +36,16 @@ from scipy.spatial import cKDTree
 from scipy.stats import t as student_t
 import pingouin as pg
 
-LOG_FILE = "run_metrics_log.jsonl"
+DEFAULT_RESULTS_DIR = "/Data/zahra/results_beta_preprocessed/group_concat"
+RESULTS_DIR = os.path.abspath(os.path.expanduser(os.environ.get("FMRI_RESULTS_DIR", DEFAULT_RESULTS_DIR)))
+os.makedirs(RESULTS_DIR, exist_ok=True)
+LOG_FILE = join(RESULTS_DIR, "run_metrics_log.jsonl")
+
+def _result_path(path):
+    expanded = os.path.expanduser(str(path))
+    if os.path.isabs(expanded):
+        return expanded
+    return join(RESULTS_DIR, expanded)
 
 
 def _array_summary(array):
@@ -264,6 +273,7 @@ if group_concat_dir is None:
     )
 base_path = group_concat_dir
 print(f"Data mode: group-concat | base_path={base_path}", flush=True)
+print(f"Results directory: {RESULTS_DIR}", flush=True)
 
 anatomy_root = os.path.expanduser(os.environ.get("FMRI_ANATOMY_MASK_DIR", "/Data/zahra/anatomy_masks"))
 anat_img_path = _resolve_existing_path(join(anatomy_root, "MNI152_T1_2mm_brain.nii.gz"), join(anatomy_root, "MNI152_T1_1mm_brain.nii.gz"))
@@ -380,7 +390,7 @@ def _empca_model_path():
     if cache_dir_env:
         cache_dir = os.path.expanduser(cache_dir_env)
     else:
-        cache_dir = base_path
+        cache_dir = RESULTS_DIR
     os.makedirs(cache_dir, exist_ok=True)
     return join(cache_dir, f"empca_model_{group_label}.npy")
 
@@ -389,9 +399,9 @@ def apply_empca(bold_clean):
         W = np.isfinite(data)
         Y = np.where(np.isfinite(data), data, 0.0)
         row_weight = W.sum(axis=0, keepdims=True).astype(np.float64)
-        mean = np.divide((Y * W).sum(axis=0, keepdims=True), row_weight, out=np.zeros_like(row_weight, dtype=np.float64), where=row_weight > 0)
+        mean = np.divide((Y * W).sum(axis=0, keepdims=True), row_weight, out=np.zeros_like(row_weight), where=row_weight > 0)
         centered = Y - mean
-        var = np.divide((W * centered**2).sum(axis=0, keepdims=True), row_weight, out=np.zeros_like(row_weight, dtype=np.float64), where=row_weight > 0)
+        var = np.divide((W * centered**2).sum(axis=0, keepdims=True), row_weight, out=np.zeros_like(row_weight), where=row_weight > 0)
         scale = np.sqrt(var)
         z = np.divide(centered, np.maximum(scale, 1e-6), out=np.zeros_like(centered), where=row_weight > 0)
         return z, W
@@ -435,21 +445,21 @@ def _compute_global_normalization(behavior_matrix, beta_pca_full, behavior_index
     behavior_vector = behavior_matrix[:, behavior_index].ravel()
     behavior_finite_mask = np.isfinite(behavior_vector)
 
-    behavior_centered_full = np.full_like(behavior_vector, np.nan, dtype=np.float64)
+    behavior_centered_full = np.full_like(behavior_vector, np.nan)
     behavior_mean = np.nanmean(behavior_vector[behavior_finite_mask])
     behavior_centered_full[behavior_finite_mask] = behavior_vector[behavior_finite_mask] - behavior_mean
     behavior_norm = np.linalg.norm(behavior_centered_full[behavior_finite_mask])
     if not np.isfinite(behavior_norm) or behavior_norm <= 0:
         behavior_norm = 1.0
 
-    behavior_normalized_full = np.full_like(behavior_vector, np.nan, dtype=np.float64)
+    behavior_normalized_full = np.full_like(behavior_vector, np.nan)
     behavior_normalized_full[behavior_finite_mask] = behavior_centered_full[behavior_finite_mask] / behavior_norm
 
     behavior_mask = behavior_finite_mask[None, :]
     beta_valid_mask = np.isfinite(beta_pca_full) & behavior_mask
     beta_counts = beta_valid_mask.sum(axis=1, keepdims=True)
     beta_sum = np.nansum(np.where(beta_valid_mask, beta_pca_full, 0.0), axis=1, keepdims=True)
-    beta_mean = np.divide(beta_sum, beta_counts, out=np.zeros_like(beta_sum, dtype=np.float64), where=beta_counts > 0)
+    beta_mean = np.divide(beta_sum, beta_counts, out=np.zeros_like(beta_sum), where=beta_counts > 0)
     beta_centered_full = beta_pca_full - beta_mean
 
     return {"behavior_vector_full": behavior_vector, "behavior_centered_full": behavior_centered_full,
@@ -468,19 +478,19 @@ def compute_fold_normalization(projection_data, train_indices, behavior_index):
     behavior_train_mask = train_mask & behavior_mask
 
     behavior_mean = float(np.nanmean(behavior_vector_full[behavior_train_mask])) if np.any(behavior_train_mask) else 0.0
-    behavior_centered_full = np.full_like(behavior_vector_full, np.nan, dtype=np.float64)
+    behavior_centered_full = np.full_like(behavior_vector_full, np.nan)
     behavior_centered_full[behavior_mask] = behavior_vector_full[behavior_mask] - behavior_mean
     behavior_norm = float(np.linalg.norm(behavior_centered_full[behavior_train_mask])) if np.any(behavior_train_mask) else 1.0
     if not np.isfinite(behavior_norm) or behavior_norm <= 0:
         behavior_norm = 1.0
 
-    behavior_normalized_full = np.full_like(behavior_vector_full, np.nan, dtype=np.float64)
+    behavior_normalized_full = np.full_like(behavior_vector_full, np.nan)
     behavior_normalized_full[behavior_mask] = behavior_centered_full[behavior_mask] / behavior_norm
 
     beta_valid_train = np.isfinite(beta_pca_full) & behavior_train_mask[None, :]
     beta_counts = beta_valid_train.sum(axis=1, keepdims=True)
     beta_sum = np.nansum(np.where(beta_valid_train, beta_pca_full, 0.0), axis=1, keepdims=True)
-    beta_mean = np.divide(beta_sum, beta_counts, out=np.zeros_like(beta_sum, dtype=np.float64), where=beta_counts > 0)
+    beta_mean = np.divide(beta_sum, beta_counts, out=np.zeros_like(beta_sum), where=beta_counts > 0)
     beta_centered_full = beta_pca_full - beta_mean
 
     return {"behavior_vector_full": behavior_vector_full, "behavior_centered_full": behavior_centered_full, "behavior_normalized_full": behavior_normalized_full,
@@ -555,7 +565,7 @@ def save_brain_map(correlations, active_coords, volume_shape, anat_img, file_pre
         colorbar_max = float(np.percentile(finite_values, 99.5))
 
     corr_img = nib.Nifti1Image(volume, anat_img.affine, anat_img.header)
-    volume_path = f"{result_prefix}_{file_prefix}.nii.gz"
+    volume_path = _result_path(f"{result_prefix}_{file_prefix}.nii.gz")
     nib.save(corr_img, volume_path)
 
     if np.any(np.isfinite(display_values)):
@@ -566,14 +576,14 @@ def save_brain_map(correlations, active_coords, volume_shape, anat_img, file_pre
         display_volume[display_volume < threshold_value] = 0.0
         display_img = nib.Nifti1Image(display_volume, anat_img.affine, anat_img.header)
         display = plotting.view_img(display_img, bg_img=anat_img, colorbar=True, symmetric_cmap=False,cmap='jet', threshold=threshold_value)
-        display.save_as_html(f"{result_prefix}_{file_prefix}.html")
+        display.save_as_html(_result_path(f"{result_prefix}_{file_prefix}.html"))
         # display.close()
     return
 
 def enhance_bold_visualization(input_file, anat_img=None, output_prefix=None,
                                percentiles=(90, 95, 99), min_cluster_sizes=(100, 75, 50),
                                vmax_percentile=99.9, map_title=None):
-    input_file = os.path.abspath(str(input_file))
+    input_file = _result_path(input_file)
     if not os.path.exists(input_file):
         raise FileNotFoundError(f"Input file not found: {input_file}")
 
@@ -584,6 +594,7 @@ def enhance_bold_visualization(input_file, anat_img=None, output_prefix=None,
         else:
             base_name = os.path.splitext(base_name)[0]
         output_prefix = os.path.join(os.path.dirname(input_file), f"{base_name}_bold")
+    output_prefix = _result_path(output_prefix)
 
     if len(percentiles) != len(min_cluster_sizes):
         raise ValueError("percentiles and min_cluster_sizes must be the same length.")
@@ -764,7 +775,7 @@ def _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_dir, 
             atlas_mni_img.to_filename(atlas_mni_path)
             _apply_flirt(atlas_mni_path, anat_path, mat_path, atlas_anat_path, flirt_path)
             atlas_in_anat_img = nib.load(atlas_anat_path)
-            atlas_in_anat = nib.Nifti1Image(atlas_in_anat_img.get_fdata(dtype=np.float32), atlas_in_anat_img.affine, atlas_in_anat_img.header)
+            atlas_in_anat = nib.Nifti1Image(atlas_in_anat_img.get_fdata(), atlas_in_anat_img.affine, atlas_in_anat_img.header)
     else:
         atlas_in_anat = image.resample_to_img(atlas_img, anat_img, interpolation="nearest", force_resample=True, copy_header=True)
 
@@ -780,8 +791,8 @@ def _align_atlas_to_reference(atlas_img, anat_img, anat_path, ref_img, out_dir, 
 def _combine_atlas_data(cort_data, cort_labels, sub_data, sub_labels):
     if cort_data.shape != sub_data.shape:
         raise ValueError("Cortical and subcortical atlas shapes do not match.")
-    combined = np.asarray(cort_data, dtype=np.int32).copy()
-    sub_data = np.asarray(sub_data, dtype=np.int32)
+    combined = np.asarray(cort_data).copy()
+    sub_data = np.asarray(sub_data)
     offset = len(cort_labels)
     insert_mask = (combined == 0) & (sub_data > 0)
     combined[insert_mask] = sub_data[insert_mask] + offset
@@ -815,7 +826,7 @@ def _prepare_atlas_context(anat_img, anat_path, ref_img, output_dir, atlas_thres
         if atlas_img.shape[:3] == ref_img.shape[:3] and np.allclose(atlas_img.affine, ref_img.affine):
             with open(labels_path, "r", encoding="utf-8") as handle:
                 labels = json.load(handle)
-            atlas_data = atlas_img.get_fdata(dtype=np.float32).astype(np.int32)
+            atlas_data = atlas_img.get_fdata().astype(np.int32)
             return {"atlas_data": atlas_data, "labels": labels, "shape": atlas_img.shape[:3], "affine": atlas_img.affine, "path": atlas_cache_path,
                     "registration_method": "cached", "atlas_threshold": atlas_threshold}
 
@@ -827,11 +838,11 @@ def _prepare_atlas_context(anat_img, anat_path, ref_img, output_dir, atlas_thres
     cort_in_ref, registration_method = _align_atlas_to_reference(cort_img, anat_img, anat_path, ref_img, output_dir, assume_mni=assume_mni, return_method=True)
     sub_in_ref = _align_atlas_to_reference(sub_img, anat_img, anat_path, ref_img, output_dir, assume_mni=assume_mni, return_method=False)
 
-    cort_data = np.rint(cort_in_ref.get_fdata(dtype=np.float32)).astype(np.int32)
-    sub_data = np.rint(sub_in_ref.get_fdata(dtype=np.float32)).astype(np.int32)
+    cort_data = np.rint(cort_in_ref.get_fdata())
+    sub_data = np.rint(sub_in_ref.get_fdata())
     combined_data, combined_labels = _combine_atlas_data(cort_data, cort_labels, sub_data, sub_labels)
 
-    combined_img = nib.Nifti1Image(combined_data.astype(np.int32), ref_img.affine, ref_img.header)
+    combined_img = nib.Nifti1Image(combined_data, ref_img.affine, ref_img.header)
     nib.save(combined_img, atlas_cache_path)
     with open(labels_path, "w", encoding="utf-8") as handle:
         json.dump(combined_labels, handle, indent=2)
@@ -841,9 +852,10 @@ def _prepare_atlas_context(anat_img, anat_path, ref_img, output_dir, atlas_thres
 
 def _analyze_weight_map_regions(voxel_weights_path, atlas_context, output_prefix, motor_label_patterns, threshold_percentile=95):
     weights_img = nib.load(voxel_weights_path)
-    weights_data = weights_img.get_fdata(dtype=np.float32)
+    weights_data = weights_img.get_fdata()
     atlas_data = atlas_context["atlas_data"]
     labels = atlas_context["labels"]
+    output_prefix = _result_path(output_prefix)
 
     active_mask = np.isfinite(weights_data)
     if not np.any(active_mask):
@@ -920,6 +932,7 @@ def _analyze_weight_map_regions(voxel_weights_path, atlas_context, output_prefix
     return summary_payload
 
 def _load_projection_series(series_path):
+    series_path = _result_path(series_path)
     if not os.path.exists(series_path):
         return {}
     loaded = np.load(series_path, allow_pickle=True)
@@ -938,7 +951,7 @@ def _merge_projection_series(existing_series, new_series):
     for gamma_value, projection in new_series:
         if projection is None:
             continue
-        merged[float(gamma_value)] = np.asarray(projection, dtype=np.float64).ravel()
+        merged[float(gamma_value)] = np.asarray(projection).ravel()
     return merged
 
 #%% 
@@ -984,7 +997,7 @@ def calcu_penalty_terms(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smoo
 def _build_objective_matrices(total_penalty, corr_num, corr_den, gamma_value, corr_weight=1.0, eps=1e-8):
     A_mat = gamma_value * total_penalty - corr_weight * corr_num
     A_mat = 0.5 * (A_mat + A_mat.T)
-    eye = np.eye(A_mat.shape[0], dtype=np.float64)
+    eye = np.eye(A_mat.shape[0])
     if corr_weight == 0:
         B_mat = eye
         return A_mat + eps * eye, B_mat
@@ -1084,18 +1097,18 @@ def _split_contiguous_folds(trial_count, num_folds):
     start = 0
     for block_size in fold_sizes:
         end = start + block_size
-        folds.append(np.arange(start, end, dtype=np.int64))
+        folds.append(np.arange(start, end))
         start = end
     return folds
 
 def build_custom_kfold_splits(total_trials, num_folds=10):
     total_trials = int(total_trials)
     num_folds = int(num_folds)
-    all_trials = np.arange(total_trials, dtype=np.int64)
+    all_trials = np.arange(total_trials)
     test_folds = _split_contiguous_folds(total_trials, num_folds)
     folds = []
     for fold_idx, test_indices in enumerate(test_folds, start=1):
-        test_indices = np.asarray(test_indices, dtype=np.int64)
+        test_indices = np.asarray(test_indices)
         train_mask = np.ones(total_trials, dtype=bool)
         train_mask[test_indices] = False
         train_indices = all_trials[train_mask]
@@ -1247,7 +1260,7 @@ def solve_soc_problem(run_data, alpha_task, alpha_bold, alpha_beta, alpha_smooth
         return grad
 
     constraints = [{"type": "eq", "fun": lambda w: np.linalg.norm(w) - 1.0, "jac": lambda w: w / (np.linalg.norm(w) + 1e-12)}]
-    initial_weights = np.full(n_components, 1.0 / np.sqrt(n_components), dtype=np.float64)
+    initial_weights = np.full(n_components, 1.0 / np.sqrt(n_components))
     result = minimize(_objective, initial_weights, jac=_objective_grad, constraints=constraints, 
                       method="SLSQP", options={"maxiter": 1000, "ftol": 1e-8, "disp": True})
     solution_weights = np.asarray(result.x)
@@ -1289,7 +1302,7 @@ def solve_soc_problem_eig(run_data, alpha_task, alpha_bold, alpha_beta, alpha_sm
     eigvals, eigvecs = eigh(A_mat, B_mat)
     finite_mask = np.isfinite(eigvals)
     min_idx = int(np.nanargmin(eigvals))
-    solution_weights = np.asarray(eigvecs[:, min_idx], dtype=np.float64).ravel()
+    solution_weights = np.asarray(eigvecs[:, min_idx]).ravel()
     b_norm = float(np.sqrt(solution_weights.T @ B_mat @ solution_weights))
     solution_weights = solution_weights / b_norm
 
@@ -1313,6 +1326,7 @@ def solve_soc_problem_eig(run_data, alpha_task, alpha_bold, alpha_beta, alpha_sm
 
 def plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, gamma_value, output_path,
                          max_trials=10, series_label=None, trial_indices_array=None, trial_windows=None):
+    output_path = _result_path(output_path)
     num_trials_total, trial_length = y_trials.shape
     time_axis = np.arange(trial_length)
     fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
@@ -1377,12 +1391,13 @@ def plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, gamma_val
     return output_path
 
 def plot_projection_beta_sweep(gamma_projection_series, task_alpha, bold_alpha, beta_alpha, output_path, series_label=None, trial_indices=None):
+    output_path = _result_path(output_path)
     sorted_series = sorted(gamma_projection_series, key=lambda item: item[0])
-    max_trials = max(np.asarray(series, dtype=np.float64).ravel().size for _, series in sorted_series)
+    max_trials = max(np.asarray(series).ravel().size for _, series in sorted_series)
     fig_height = 5.0 if max_trials <= 120 else 6.5
     trial_indices_array = None
     if trial_indices is not None:
-        trial_indices_array = np.asarray(trial_indices, dtype=np.int64).ravel()
+        trial_indices_array = np.asarray(trial_indices).ravel()
     axis_reference = None
     if trial_indices_array is not None and trial_indices_array.size:
         axis_reference = trial_indices_array[:min(trial_indices_array.size, max_trials)] + 1
@@ -1391,7 +1406,7 @@ def plot_projection_beta_sweep(gamma_projection_series, task_alpha, bold_alpha, 
 
     fig, ax = plt.subplots(figsize=(10, fig_height))
     for idx, (gamma_value, projection) in enumerate(sorted_series):
-        y_trials = np.asarray(projection, dtype=np.float64).ravel()
+        y_trials = np.asarray(projection).ravel()
         finite_vals = y_trials[np.isfinite(y_trials)]
         cv_val = np.nanstd(finite_vals) / abs(np.nanmean(finite_vals))
         if trial_indices_array is not None:
@@ -1430,9 +1445,10 @@ def plot_projection_beta_sweep(gamma_projection_series, task_alpha, bold_alpha, 
     return output_path
 
 def plot_fold_metric_box(fold_values, title, ylabel, output_path, highlight_threshold=None):
+    output_path = _result_path(output_path)
     sorted_values = sorted(fold_values, key=lambda item: item[0])
-    fold_ids = np.array([int(idx) for idx, _ in sorted_values], dtype=np.int64)
-    raw_values = np.array([float(val) if np.isfinite(val) else np.nan for _, val in sorted_values], dtype=np.float64)
+    fold_ids = np.array([int(idx) for idx, _ in sorted_values])
+    raw_values = np.array([float(val) if np.isfinite(val) else np.nan for _, val in sorted_values])
     finite_mask = np.isfinite(raw_values)
     finite_values = raw_values[finite_mask]
     finite_ids = fold_ids[finite_mask]
@@ -1479,6 +1495,7 @@ def plot_fold_metric_box(fold_values, title, ylabel, output_path, highlight_thre
     return output_path
 
 def plot_train_test_total_loss_box(train_values, test_values, title, ylabel, output_path):
+    output_path = _result_path(output_path)
     def _prepare(entries):
         sorted_entries = sorted(entries, key=lambda item: item[0])
         fold_ids = np.array([int(idx) for idx, _ in sorted_entries])
@@ -1544,7 +1561,7 @@ def plot_train_test_total_loss_box(train_values, test_values, title, ylabel, out
     ax.set_ylabel(ylabel)
     ax.set_title(title)
 
-    all_values = np.concatenate(plot_data) if plot_data else np.array([], dtype=np.float64)
+    all_values = np.concatenate(plot_data) if plot_data else np.array([])
     use_scalar_formatter = True
     if all_values.size:
         max_abs = np.nanmax(np.abs(all_values))
@@ -1604,7 +1621,7 @@ projected = coeff_pinv @ (laplacian_matrix @ coeff_pinv.T)
 projection_data["C_smooth"] = standardize_matrix(projected)
 
 def _describe_trial_span(indices):
-    indices = np.asarray(indices, dtype=np.int64).ravel()
+    indices = np.asarray(indices).ravel()
     if indices.size == 0:
         return None
     return (int(indices[0] + 1), int(indices[-1] + 1))
@@ -1662,7 +1679,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 print(f"  Loss terms -> {loss_report}", flush=True)
 
                 # Preserve the optimized weight signs so correlation metrics match the optimized objective
-                component_weights = np.asarray(solution["weights"], dtype=np.float64)
+                component_weights = np.asarray(solution["weights"])
                 coeff_pinv = np.asarray(train_data["coeff_pinv"])
                 voxel_weights = coeff_pinv.T @ component_weights
 
@@ -1824,7 +1841,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
         if atlas_data_dir:
             atlas_data_dir = os.path.expanduser(atlas_data_dir)
         else:
-            atlas_data_dir = os.path.join(base_path, "atlas_cache")
+            atlas_data_dir = os.path.join(RESULTS_DIR, "atlas_cache")
         if atlas_analysis_enabled:
             os.makedirs(atlas_data_dir, exist_ok=True)
 
@@ -1844,7 +1861,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             weights_title = f"ICC={weights_icc:.3f}"
             save_brain_map(weights_avg * 1000, active_coords, volume_shape, anat_img, avg_prefix, result_prefix="voxel_weights_mean", map_title=weights_title,
                 display_threshold_ratio=0.8)
-            voxel_weights_path = f"voxel_weights_mean_{avg_prefix}.nii.gz"
+            voxel_weights_path = _result_path(f"voxel_weights_mean_{avg_prefix}.nii.gz")
             if os.path.exists(voxel_weights_path):
                 try:
                     enhance_bold_visualization(voxel_weights_path, anat_img=anat_img, map_title=weights_title)
@@ -1855,7 +1872,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                         weights_img = nib.load(voxel_weights_path)
                         if (atlas_context is None or atlas_context.get("shape") != weights_img.shape[:3]
                             or not np.allclose(atlas_context.get("affine"), weights_img.affine)):
-                            atlas_context = _prepare_atlas_context(anat_img, anat_path, weights_img, os.getcwd(), atlas_threshold=atlas_threshold,
+                            atlas_context = _prepare_atlas_context(anat_img, anat_path, weights_img, RESULTS_DIR, atlas_threshold=atlas_threshold,
                                                                    data_dir=atlas_data_dir, assume_mni=atlas_assume_mni)
                         output_prefix = f"voxel_weights_mean_{avg_prefix}"
                         _analyze_weight_map_regions(voxel_weights_path, atlas_context, output_prefix, motor_label_patterns, threshold_percentile=95)
@@ -1891,14 +1908,14 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 bold_projection_trials= bold_projection_signal.reshape(num_trials, trial_len)
                 bold_plot_path = f"y_projection_bold_{avg_prefix}.png"
                 plot_projection_bold(bold_projection_trials, task_alpha, bold_alpha, beta_alpha, gamma_value, bold_plot_path, 
-                                     series_label="Active BOLD space (weights avg)", trial_indices_array=np.arange(num_trials, dtype=np.int64))
+                                     series_label="Active BOLD space (weights avg)", trial_indices_array=np.arange(num_trials))
 
         if fold_avg_projection_series:
             for avg_series_key in sorted(fold_avg_projection_series.keys()):
                 task_alpha, bold_alpha, beta_alpha, smooth_alpha, corr_weight = avg_series_key
                 gamma_series = fold_avg_projection_series[avg_series_key]
                 avg_base_prefix = (f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}")
-                avg_series_storage = f"gamma_series_voxel_{avg_base_prefix}.npy"
+                avg_series_storage = _result_path(f"gamma_series_voxel_{avg_base_prefix}.npy")
                 existing_avg = _load_projection_series(avg_series_storage)
                 merged_avg = _merge_projection_series(existing_avg, gamma_series)
                 np.save(avg_series_storage, merged_avg, allow_pickle=True)
