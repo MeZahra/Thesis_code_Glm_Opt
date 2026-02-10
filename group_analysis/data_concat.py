@@ -3,10 +3,10 @@
 Concatenate preprocessed beta/BOLD data across all subjects/sessions/runs.
 
 This script builds a group voxel mask based on cleaned_beta_volume files
-(voxels that are finite in at least one input file). It then concatenates
-trials across all inputs (all sessions/runs) and writes group-level outputs
-that can be consumed by group_analysis/obj_param.py (via SUB/SES and
-FMRI_OPT_DATA_DIR).
+(voxels with trial coverage above a configured threshold across all runs,
+after trial_keep masking when available). It then concatenates trials across
+all inputs (all sessions/runs) and writes group-level outputs that can be
+consumed by group_analysis/obj_param.py (via SUB/SES and FMRI_OPT_DATA_DIR).
 
 Note: To avoid a massive 4D volume, cleaned_beta_volume is stored as a 2D
 array (n_union_voxels x total_trials). Use common_mask_* to rebuild volumes
@@ -90,10 +90,12 @@ def _validate_inputs(entries):
         raise FileNotFoundError("\n".join(msg))
 
 
-def _build_union_mask(entries):
-    union_mask = None
+def _build_union_mask(entries, trial_keep_root=None, min_trial_coverage=0.70):
+    coverage_counts_flat = None
     volume_shape = None
     trial_len = None
+    total_trials = 0
+    missing_trial_keep = []
     for entry in entries:
         vol = np.load(entry["cleaned_beta"], mmap_mode="r")
         if volume_shape is None:
@@ -118,14 +120,32 @@ def _build_union_mask(entries):
                 f"Trial length mismatch: {entry['active_bold']} has {active_bold.shape[2]} "
                 f"but expected {trial_len}."
             )
+        n_trials = entry["n_trials"]
+        total_trials += n_trials
+        trial_keep, trial_keep_path = _load_trial_keep_mask(trial_keep_root, entry, n_trials)
+        entry["trial_keep"] = trial_keep
+        entry["trial_keep_path"] = trial_keep_path
+        if trial_keep is None and trial_keep_path is not None and trial_keep_root is not None:
+            missing_trial_keep.append((entry["tag"], trial_keep_path))
 
-        valid = np.any(np.isfinite(vol), axis=-1)
-        union_mask = valid if union_mask is None else (union_mask | valid)
-    if union_mask is None:
+        if trial_keep is not None:
+            valid_count = np.count_nonzero(np.isfinite(vol[..., trial_keep]), axis=-1)
+        else:
+            valid_count = np.count_nonzero(np.isfinite(vol), axis=-1)
+        flat_count = valid_count.reshape(-1).astype(np.uint32, copy=False)
+        if coverage_counts_flat is None:
+            coverage_counts_flat = np.zeros(flat_count.size, dtype=np.uint32)
+        coverage_counts_flat += flat_count
+
+    if coverage_counts_flat is None:
         raise RuntimeError("No cleaned_beta_volume files found to build a union mask.")
+    if total_trials <= 0:
+        raise RuntimeError("No trials found across inputs.")
+    coverage_flat = coverage_counts_flat.astype(np.float32) / float(total_trials)
+    union_mask = coverage_flat.reshape(volume_shape) > float(min_trial_coverage)
     if not np.any(union_mask):
         raise RuntimeError("Union mask is empty after aggregation.")
-    return union_mask, volume_shape, trial_len
+    return union_mask, volume_shape, trial_len, coverage_flat, missing_trial_keep
 
 
 def _resolve_trial_keep_root(path):
@@ -173,6 +193,7 @@ def main():
     parser.add_argument("--group-label", default="group")
     parser.add_argument("--dtype", default="float32")
     parser.add_argument("--trial-keep-root", default="/Data/zahra/results_glm")
+    parser.add_argument("--min-trial-coverage", type=float, default=0.70)
     args = parser.parse_args()
 
     in_root = os.path.expanduser(args.in_root)
@@ -191,16 +212,35 @@ def main():
     if not entries:
         raise FileNotFoundError(f"No cleaned_beta_volume files found under {in_root}")
     _validate_inputs(entries)
+    if not (0.0 <= float(args.min_trial_coverage) < 1.0):
+        raise ValueError(f"--min-trial-coverage must be in [0, 1), got {args.min_trial_coverage}.")
 
     entries.sort(key=lambda e: (e["sub_tag"], e["ses"], e["run"]))
-    union_mask, volume_shape, trial_len = _build_union_mask(entries)
+    trial_keep_root = _resolve_trial_keep_root(args.trial_keep_root)
+    union_mask, volume_shape, trial_len, coverage_flat, missing_trial_keep = _build_union_mask(
+        entries, trial_keep_root=trial_keep_root, min_trial_coverage=args.min_trial_coverage
+    )
     union_flat = np.flatnonzero(union_mask)
     n_union = int(union_flat.size)
     total_trials = int(sum(entry["n_trials"] for entry in entries))
-    trial_keep_root = _resolve_trial_keep_root(args.trial_keep_root)
+    retained_coverage = coverage_flat[union_flat]
+    if missing_trial_keep:
+        print(
+            f"Warning: missing trial_keep for {len(missing_trial_keep)} run(s); using all trials for those runs.",
+            flush=True,
+        )
 
     print(f"Found {len(entries)} runs across subjects.", flush=True)
+    print(
+        f"Voxel trial coverage filter: > {args.min_trial_coverage:.2f} "
+        f"(computed across {total_trials} concatenated trials).",
+        flush=True,
+    )
     print(f"Union voxel count: {n_union}", flush=True)
+    print(
+        f"Retained voxel coverage range: [{retained_coverage.min():.3f}, {retained_coverage.max():.3f}]",
+        flush=True,
+    )
     print(f"Total trials (all runs): {total_trials}", flush=True)
 
     group_label = str(args.group_label)
@@ -277,12 +317,8 @@ def main():
             n_trials = entry["n_trials"]
             flat_view = vol.reshape(-1, n_trials)
             beta_chunk = flat_view[union_flat]
-            trial_keep, trial_keep_path = _load_trial_keep_mask(trial_keep_root, entry, n_trials)
-            if trial_keep is None and trial_keep_path is not None and trial_keep_root is not None:
-                print(
-                    f"Warning: missing trial_keep for {entry['tag']} at {trial_keep_path}.",
-                    flush=True,
-                )
+            trial_keep = entry.get("trial_keep")
+            trial_keep_path = entry.get("trial_keep_path")
             if trial_keep is not None:
                 beta_chunk[:, ~trial_keep] = np.nan
             beta_mm[:, offset : offset + n_trials] = beta_chunk
