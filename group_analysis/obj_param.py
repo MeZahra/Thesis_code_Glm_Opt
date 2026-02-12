@@ -11,6 +11,7 @@ from glob import glob
 from collections import defaultdict
 from datetime import datetime
 from os.path import join
+import gc
 import sys
 
 try:
@@ -381,8 +382,9 @@ def select_empca_components(model, variance_threshold=0.8):
     model.nvec = target_components
     model.eigvec = model.eigvec[:target_components]
     model.coeff = model.coeff[:, :target_components]
-    model.solve_model()
-    model.dof = model.data[model._unmasked].size - model.eigvec.size - model.nvec * model.nobs
+    if hasattr(model, "solve_model") and hasattr(model, "data"):
+        model.solve_model()
+        model.dof = model.data[model._unmasked].size - model.eigvec.size - model.nvec * model.nobs
     return model
 
 def _empca_model_path():
@@ -395,35 +397,55 @@ def _empca_model_path():
     return join(cache_dir, f"empca_model_{group_label}.npy")
 
 def apply_empca(bold_clean):
+    low_memory = os.environ.get("FMRI_LOW_MEMORY", "0").strip().lower() in ("1", "true", "yes")
+    nvec = int(os.environ.get("FMRI_EMPCA_NVEC", "50" if low_memory else "100"))
+
     def prepare_for_empca(data):
         W = np.isfinite(data)
-        Y = np.where(np.isfinite(data), data, 0.0)
-        row_weight = W.sum(axis=0, keepdims=True).astype(np.float64)
-        mean = np.divide((Y * W).sum(axis=0, keepdims=True), row_weight, out=np.zeros_like(row_weight), where=row_weight > 0)
-        centered = Y - mean
-        var = np.divide((W * centered**2).sum(axis=0, keepdims=True), row_weight, out=np.zeros_like(row_weight), where=row_weight > 0)
+        Y = np.where(W, data, np.float32(0.0)).astype(np.float32, copy=False)
+        row_weight = W.sum(axis=0, keepdims=True).astype(np.float32)
+        mean = np.divide((Y * W).sum(axis=0, keepdims=True), row_weight, out=np.zeros(row_weight.shape, dtype=np.float32), where=row_weight > 0)
+        Y -= mean  # in-place centering, reuse Y
+        var = np.divide((W * Y**2).sum(axis=0, keepdims=True), row_weight, out=np.zeros(row_weight.shape, dtype=np.float32), where=row_weight > 0)
         scale = np.sqrt(var)
-        z = np.divide(centered, np.maximum(scale, 1e-6), out=np.zeros_like(centered), where=row_weight > 0)
-        return z, W
-    
-    X_reshap = bold_clean.reshape(bold_clean.shape[0], -1)
+        np.divide(Y, np.maximum(scale, np.float32(1e-6)), out=Y, where=row_weight > 0)
+        return Y, W
+
+    X_reshap = np.asarray(bold_clean, dtype=np.float32).reshape(bold_clean.shape[0], -1)
     Yc, W = prepare_for_empca(X_reshap.T)
-    Yc = Yc.T
-    W = W.T
-    print("begin empca...", flush=True)
-    m = empca(Yc.astype(np.float32, copy=False), W.astype(np.float32, copy=False), nvec=100, niter=10)
+    del X_reshap; gc.collect()
+    Yc = np.ascontiguousarray(Yc.T)
+    W = np.ascontiguousarray(W.T)
+    gc.collect()
+    print(f"begin empca (nvec={nvec}, low_memory={low_memory})...", flush=True)
+    m = empca(Yc, W, nvec=nvec, niter=10)
+    del Yc, W; gc.collect()
     model_path = _empca_model_path()
     np.save(model_path, m)
     print(f"Saved EMPCA model to {model_path}", flush=True)
     return m
 
+class _EmpcaModelProxy:
+    """Lightweight wrapper so dict-format cached models can be used like Model objects."""
+    def __init__(self, eigvec, coeff):
+        self.eigvec = np.asarray(eigvec)
+        self.nvec = self.eigvec.shape[0]
+        self.coeff = np.asarray(coeff)
+        self.nobs = self.coeff.shape[0]
+
 def load_or_fit_empca_model(bold_clean):
     model_path = _empca_model_path()
+    n_voxels = bold_clean.shape[0]
     if os.path.exists(model_path):
         print(f"Loading existing EMPCA model from {model_path}", flush=True)
         m = np.load(model_path, allow_pickle=True).item()
-        m = select_empca_components(m, variance_threshold=0.80)
-        return m
+        if isinstance(m, dict):
+            m = _EmpcaModelProxy(m["eigvec"], m["coeff"])
+        if m.coeff.shape[0] != n_voxels:
+            print(f"WARNING: Cached EMPCA model has {m.coeff.shape[0]} voxels but data has {n_voxels}. Re-fitting.", flush=True)
+        else:
+            m = select_empca_components(m, variance_threshold=0.80)
+            return m
     return apply_empca(bold_clean)
 
 def build_pca_dataset(bold_clean, beta_clean, behavioral_matrix, nan_mask_flat, active_coords, active_flat_indices, trial_length, num_trials):
