@@ -6,12 +6,20 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from glob import glob
 from collections import defaultdict
 from datetime import datetime
 from os.path import join
-from empca.empca import empca
+
+try:
+    from empca.empca import empca
+except ModuleNotFoundError:
+    repo_root = os.path.abspath(join(os.path.dirname(__file__), ".."))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from empca.empca import empca
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -30,6 +38,21 @@ from scipy.stats import t as student_t
 import pingouin as pg
 
 LOG_FILE = "run_metrics_log.jsonl"
+OUTPUT_DIR = None
+
+
+def _output_path(path):
+    path = str(path)
+    if os.path.isabs(path) or OUTPUT_DIR is None:
+        return path
+    return os.path.join(OUTPUT_DIR, path)
+
+
+def _ensure_parent_dir(path):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return path
 
 
 def _array_summary(array):
@@ -65,11 +88,12 @@ def _sanitize_for_json(obj):
         return obj
     return str(obj)
 
-def _append_run_log(entry, path=LOG_FILE):
+def _append_run_log(entry, path=None):
     payload = dict(entry)
     payload["timestamp"] = datetime.utcnow().isoformat() + "Z"
     payload = _sanitize_for_json(payload)
-    with open(path, "a") as log_file:
+    log_path = _ensure_parent_dir(_output_path(path or LOG_FILE))
+    with open(log_path, "a") as log_file:
         log_file.write(json.dumps(payload) + "\n")
 
 def synchronize_beta_voxels(beta_run1, beta_run2, mask_run1, mask_run2):
@@ -162,10 +186,13 @@ def compute_distance_weighted_adjacency(coords, affine, radius_mm=3.0, sigma_mm=
     return adjacency, degree_matrix
 # %%
 # Subject/session (edit these only; SUB/SES env vars override when set)
-sub = os.environ.get("SUB", "9")
+sub = os.environ.get("SUB", "13")
 ses = int(os.environ.get("SES", "1"))
 sub_dir = str(sub).zfill(2)
 ses_dir = str(ses).zfill(2)
+output_root_default = f"/Data/zahra/opt_results/sub-pd0{sub}"
+OUTPUT_DIR = os.path.expanduser(os.environ.get("FMRI_OPT_OUTPUT_DIR", output_root_default))
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 num_trials = 180  # default; updated after loading data
 trial_len = 9
 behave_indice = 1 #1/RT
@@ -442,11 +469,13 @@ def apply_empca(bold_clean):
     W = W.T
     print("begin empca...", flush=True)
     m = empca(Yc.astype(np.float32, copy=False), W.astype(np.float32, copy=False), nvec=100, niter=10)
-    np.save(f'data/sub0{sub}_ses0{ses}/empca_model_sub{sub}_ses{ses}.npy', m)
+    empca_save_path = _ensure_parent_dir(_output_path(f"empca_model_sub{sub}_ses{ses}.npy"))
+    np.save(empca_save_path, m)
     return m
 
 def load_or_fit_empca_model(bold_clean):
-    model_path = f"data/sub0{sub}_ses0{ses}/empca_model_sub0{sub}_ses{ses}.npy"
+    # model_path = f"data/sub0{sub}_ses0{ses}/empca_model_sub0{sub}_ses{ses}.npy"
+    model_path = f"/Data/zahra/results_beta_preprocessed/sub-pd0{sub}/empca_model_sub-pd0{sub}_ses-{ses}.npy"
     if os.path.exists(model_path):
         print(f"Loading existing EMPCA model from {model_path}", flush=True)
         m = np.load(model_path, allow_pickle=True).item()
@@ -593,7 +622,7 @@ def save_brain_map(correlations, active_coords, volume_shape, anat_img, file_pre
         colorbar_max = float(np.percentile(finite_values, 99.5))
 
     corr_img = nib.Nifti1Image(volume, anat_img.affine, anat_img.header)
-    volume_path = f"{result_prefix}_{file_prefix}.nii.gz"
+    volume_path = _ensure_parent_dir(_output_path(f"{result_prefix}_{file_prefix}.nii.gz"))
     nib.save(corr_img, volume_path)
 
     if np.any(np.isfinite(display_values)):
@@ -604,7 +633,8 @@ def save_brain_map(correlations, active_coords, volume_shape, anat_img, file_pre
         display_volume[display_volume < threshold_value] = 0.0
         display_img = nib.Nifti1Image(display_volume, anat_img.affine, anat_img.header)
         display = plotting.view_img(display_img, bg_img=anat_img, colorbar=True, symmetric_cmap=False,cmap='jet', threshold=threshold_value)
-        display.save_as_html(f"{result_prefix}_{file_prefix}.html")
+        html_path = _ensure_parent_dir(_output_path(f"{result_prefix}_{file_prefix}.html"))
+        display.save_as_html(html_path)
         # display.close()
     return
 
@@ -622,6 +652,13 @@ def enhance_bold_visualization(input_file, anat_img=None, output_prefix=None,
         else:
             base_name = os.path.splitext(base_name)[0]
         output_prefix = os.path.join(os.path.dirname(input_file), f"{base_name}_bold")
+    else:
+        output_prefix = _output_path(output_prefix)
+
+    output_prefix = str(output_prefix)
+    output_dir = os.path.dirname(output_prefix)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     if len(percentiles) != len(min_cluster_sizes):
         raise ValueError("percentiles and min_cluster_sizes must be the same length.")
@@ -679,21 +716,21 @@ def enhance_bold_visualization(input_file, anat_img=None, output_prefix=None,
     for pct, thr, min_size, data_thr, clusters, _ in filtered_results:
         img_thr = nib.Nifti1Image(data_thr.astype(np.float32), img.affine, img.header)
         view = plotting.view_img(img_thr, bg_img=anat_img, cmap="hot", symmetric_cmap=False, threshold=thr, vmax=vmax, colorbar=True, title=map_title)
-        out_html = f"{output_prefix}_thr{pct}.html"
+        out_html = _ensure_parent_dir(f"{output_prefix}_thr{pct}.html")
         view.save_as_html(out_html)
         print(f"Saved: {out_html}", flush=True)
 
         display = plotting.plot_stat_map(img_thr, bg_img=anat_img,cmap="hot", symmetric_cbar=False, threshold=thr, vmax=vmax, colorbar=True, title=map_title, display_mode="ortho")
-        png_path = f"{output_prefix}_thr{pct}.png"
+        png_path = _ensure_parent_dir(f"{output_prefix}_thr{pct}.png")
         display.savefig(png_path, dpi=150)
         display.close()
         print(f"Saved: {png_path}", flush=True)
 
-        nii_path = f"{output_prefix}_thr{pct}.nii.gz"
+        nii_path = _ensure_parent_dir(f"{output_prefix}_thr{pct}.nii.gz")
         img_thr.to_filename(nii_path)
         print(f"Saved: {nii_path}", flush=True)
 
-    original_file = f"{output_prefix}_original.nii.gz"
+    original_file = _ensure_parent_dir(f"{output_prefix}_original.nii.gz")
     nib.save(img, original_file)
     print(f"\nSaved original activation map: {original_file}", flush=True)
     print("\nProcessing complete!", flush=True)
@@ -880,6 +917,7 @@ def _prepare_atlas_context(anat_img, anat_path, ref_img, output_dir, atlas_thres
             "registration_method": registration_method, "atlas_threshold": atlas_threshold}
 
 def _analyze_weight_map_regions(voxel_weights_path, atlas_context, output_prefix, motor_label_patterns, threshold_percentile=95):
+    output_prefix = _output_path(output_prefix)
     weights_img = nib.load(voxel_weights_path)
     weights_data = weights_img.get_fdata(dtype=np.float32)
     atlas_data = atlas_context["atlas_data"]
@@ -913,9 +951,11 @@ def _analyze_weight_map_regions(voxel_weights_path, atlas_context, output_prefix
     motor_indices = _select_label_indices(labels, motor_label_patterns) if motor_label_patterns else []
     motor_mask = active_mask & np.isin(atlas_data, motor_indices)
     motor_coords = np.column_stack(np.nonzero(motor_mask))
-    np.savez(f"{output_prefix}_motor_voxel_indicies.npz", indices=motor_coords)
+    motor_coords_path = _ensure_parent_dir(f"{output_prefix}_motor_voxel_indicies.npz")
+    np.savez(motor_coords_path, indices=motor_coords)
     suprath_coords = np.column_stack(np.nonzero(suprath_mask))
-    np.savez(f"{output_prefix}_selected_voxel_indicies.npz", indices=suprath_coords)
+    suprath_coords_path = _ensure_parent_dir(f"{output_prefix}_selected_voxel_indicies.npz")
+    np.savez(suprath_coords_path, indices=suprath_coords)
 
     records = []
     for idx in range(1, len(labels)):
@@ -931,7 +971,7 @@ def _analyze_weight_map_regions(voxel_weights_path, atlas_context, output_prefix
         summary_df = pd.DataFrame(records).sort_values("suprathreshold_voxels", ascending=False)
     else:
         summary_df = pd.DataFrame(columns=["label_index", "label", "active_voxels", "suprathreshold_voxels", "pct_suprathreshold", "pct_of_active_region"])
-    summary_csv = f"{output_prefix}_atlas_region_distribution_thr{int(threshold_percentile)}.csv"
+    summary_csv = _ensure_parent_dir(f"{output_prefix}_atlas_region_distribution_thr{int(threshold_percentile)}.csv")
     summary_df.to_csv(summary_csv, index=False)
 
     motor_suprath = int(np.sum([suprath_counts[idx] for idx in motor_indices])) if motor_indices else 0
@@ -939,7 +979,7 @@ def _analyze_weight_map_regions(voxel_weights_path, atlas_context, output_prefix
     motor_pct = (motor_suprath / total_suprath * 100.0) if total_suprath else 0.0
     motor_region_pct = (motor_suprath / motor_active * 100.0) if motor_active else 0.0
 
-    summary_json = f"{output_prefix}_atlas_region_distribution_thr{int(threshold_percentile)}.json"
+    summary_json = _ensure_parent_dir(f"{output_prefix}_atlas_region_distribution_thr{int(threshold_percentile)}.json")
     summary_payload = {"voxel_weights_path": voxel_weights_path,
         "atlas_path": atlas_context.get("path"),
         "atlas_threshold": atlas_context.get("atlas_threshold"),
@@ -960,6 +1000,7 @@ def _analyze_weight_map_regions(voxel_weights_path, atlas_context, output_prefix
     return summary_payload
 
 def _load_projection_series(series_path):
+    series_path = _output_path(series_path)
     if not os.path.exists(series_path):
         return {}
     loaded = np.load(series_path, allow_pickle=True)
@@ -1409,6 +1450,7 @@ def plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, gamma_val
     hyperparam_label = f"alpha_task={task_alpha:g}, alpha_bold={bold_alpha:g}, alpha_beta={beta_alpha:g}, gamma={gamma_value:g}"
     fig.suptitle(f"{figure_title}\n{hyperparam_label}", fontsize=13)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
+    output_path = _ensure_parent_dir(_output_path(output_path))
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
     return output_path
@@ -1462,6 +1504,7 @@ def plot_projection_beta_sweep(gamma_projection_series, task_alpha, bold_alpha, 
     ax.grid(True, linestyle="--", alpha=0.3)
     ax.legend(loc="best", fontsize=9, ncol=2)
     fig.tight_layout()
+    output_path = _ensure_parent_dir(_output_path(output_path))
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
     return output_path
@@ -1511,6 +1554,7 @@ def plot_fold_metric_box(fold_values, title, ylabel, output_path, highlight_thre
     if nan_count:
         ax.annotate(f"{nan_count} fold(s) skipped (NaN)", xy=(0.02, 0.95), xycoords="axes fraction",fontsize=8, color="#c44e52", ha="left", va="top")
     fig.tight_layout()
+    output_path = _ensure_parent_dir(_output_path(output_path))
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
     return output_path
@@ -1597,6 +1641,7 @@ def plot_train_test_total_loss_box(train_values, test_values, title, ylabel, out
                     fontsize=8, color="#c44e52", ha="left", va="top")
 
     fig.tight_layout()
+    output_path = _ensure_parent_dir(_output_path(output_path))
     fig.savefig(output_path, dpi=300)
     plt.close(fig)
     return output_path
@@ -1611,7 +1656,7 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
     if data is not None:
         trial_indices = data.get("trial_indices")
     if plot_trials:
-        plot_path = f"y_projection_trials_{file_prefix}.png"
+        plot_path = _output_path(f"y_projection_trials_{file_prefix}.png")
         plot_projection_bold(y_trials, task_alpha, bold_alpha, beta_alpha, gamma_value, plot_path, series_label="Active BOLD space", trial_indices_array=trial_indices)
 
     voxel_weights = voxel_weights.ravel()
@@ -1829,14 +1874,14 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 if created_loss_plot:
                     print(f"  Saved train/test total loss fold plot for {combo_label} -> {created_loss_plot}", flush=True)
 
-            train_gamma_entries = metric_records.get("train_gamma_ratio", [])
-            test_gamma_entries = metric_records.get("test_gamma_ratio", [])
-            if train_gamma_entries or test_gamma_entries:
-                gamma_title = f"Gamma-penalty ratio across folds ({combo_label})"
-                gamma_path = f"gamma_penalty_ratio_{metrics_prefix}_train_vs_test.png"
-                created_gamma_plot = plot_train_test_total_loss_box(train_gamma_entries, test_gamma_entries, gamma_title, "gamma * penalty / corr_den", gamma_path)
-                if created_gamma_plot:
-                    print(f"  Saved gamma-penalty ratio fold plot for {combo_label} -> {created_gamma_plot}", flush=True)
+            # train_gamma_entries = metric_records.get("train_gamma_ratio", [])
+            # test_gamma_entries = metric_records.get("test_gamma_ratio", [])
+            # if train_gamma_entries or test_gamma_entries:
+            #     gamma_title = f"Gamma-penalty ratio across folds ({combo_label})"
+            #     gamma_path = f"gamma_penalty_ratio_{metrics_prefix}_train_vs_test.png"
+            #     created_gamma_plot = plot_train_test_total_loss_box(train_gamma_entries, test_gamma_entries, gamma_title, "gamma * penalty / corr_den", gamma_path)
+            #     if created_gamma_plot:
+            #         print(f"  Saved gamma-penalty ratio fold plot for {combo_label} -> {created_gamma_plot}", flush=True)
 
     if fold_output_tracker:
         print("\n===== Saving fold-averaged spatial maps and projections =====", flush=True)
@@ -1856,7 +1901,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
         if atlas_data_dir:
             atlas_data_dir = os.path.expanduser(atlas_data_dir)
         else:
-            atlas_data_dir = os.path.join(base_path, "atlas_cache")
+            atlas_data_dir = os.path.join(OUTPUT_DIR, "atlas_cache")
         if atlas_analysis_enabled:
             os.makedirs(atlas_data_dir, exist_ok=True)
 
@@ -1876,7 +1921,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             weights_title = f"ICC={weights_icc:.3f}"
             save_brain_map(weights_avg * 1000, active_coords, volume_shape, anat_img, avg_prefix, result_prefix="voxel_weights_mean", map_title=weights_title,
                 display_threshold_ratio=0.8)
-            voxel_weights_path = f"voxel_weights_mean_{avg_prefix}.nii.gz"
+            voxel_weights_path = _output_path(f"voxel_weights_mean_{avg_prefix}.nii.gz")
             if os.path.exists(voxel_weights_path):
                 try:
                     enhance_bold_visualization(voxel_weights_path, anat_img=anat_img, map_title=weights_title)
@@ -1887,7 +1932,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                         weights_img = nib.load(voxel_weights_path)
                         if (atlas_context is None or atlas_context.get("shape") != weights_img.shape[:3]
                             or not np.allclose(atlas_context.get("affine"), weights_img.affine)):
-                            atlas_context = _prepare_atlas_context(anat_img, anat_path, weights_img, os.getcwd(), atlas_threshold=atlas_threshold,
+                            atlas_context = _prepare_atlas_context(anat_img, anat_path, weights_img, OUTPUT_DIR, atlas_threshold=atlas_threshold,
                                                                    data_dir=atlas_data_dir, assume_mni=atlas_assume_mni)
                         output_prefix = f"voxel_weights_mean_{avg_prefix}"
                         _analyze_weight_map_regions(voxel_weights_path, atlas_context, output_prefix, motor_label_patterns, threshold_percentile=95)
@@ -1922,21 +1967,23 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 num_trials = bold_projection_signal.size // trial_len
                 bold_projection_trials= bold_projection_signal.reshape(num_trials, trial_len)
                 bold_plot_path = f"y_projection_bold_{avg_prefix}.png"
-                plot_projection_bold(bold_projection_trials, task_alpha, bold_alpha, beta_alpha, gamma_value, bold_plot_path, 
-                                     series_label="Active BOLD space (weights avg)", trial_indices_array=np.arange(num_trials, dtype=np.int64))
+                # plot_projection_bold(bold_projection_trials, task_alpha, bold_alpha, beta_alpha, gamma_value, bold_plot_path, 
+                #                      series_label="Active BOLD space (weights avg)", trial_indices_array=np.arange(num_trials, dtype=np.int64))
 
         if fold_avg_projection_series:
             for avg_series_key in sorted(fold_avg_projection_series.keys()):
                 task_alpha, bold_alpha, beta_alpha, smooth_alpha, corr_weight = avg_series_key
                 gamma_series = fold_avg_projection_series[avg_series_key]
                 avg_base_prefix = (f"foldavg_sub{sub}_ses{ses}_task{task_alpha:g}_bold{bold_alpha:g}_beta{beta_alpha:g}_smooth{smooth_alpha:g}")
-                avg_series_storage = f"gamma_series_voxel_{avg_base_prefix}.npy"
+                avg_series_storage = _output_path(f"gamma_series_voxel_{avg_base_prefix}.npy")
                 existing_avg = _load_projection_series(avg_series_storage)
                 merged_avg = _merge_projection_series(existing_avg, gamma_series)
-                np.save(avg_series_storage, merged_avg, allow_pickle=True)
+                np.save(_ensure_parent_dir(avg_series_storage), merged_avg, allow_pickle=True)
                 aggregate_plot_path = f"y_projection_trials_voxel_{avg_base_prefix}_all_gammas.png"
                 merged_avg_sorted = sorted(merged_avg.items(), key=lambda item: item[0])
-                plot_projection_beta_sweep(merged_avg_sorted, task_alpha, bold_alpha, beta_alpha, aggregate_plot_path, series_label="Voxel space (fold avg)")
+                y_signal_path = _ensure_parent_dir(_output_path(f"y_signal_sub{sub}_ses{ses}.npy"))
+                np.save(y_signal_path, merged_avg_sorted, allow_pickle=True)
+                # plot_projection_beta_sweep(merged_avg_sorted, task_alpha, bold_alpha, beta_alpha, aggregate_plot_path, series_label="Voxel space (fold avg)")
 
     if aggregate_metrics:
         print("\n===== Cross-fold average metrics =====", flush=True)

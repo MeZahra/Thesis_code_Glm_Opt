@@ -56,6 +56,14 @@ def _array_summary(array):
         return {"min": np.nan, "max": np.nan, "mean": np.nan, "var": np.nan}
     return {"min": float(np.min(finite)), "max": float(np.max(finite)), "mean": float(np.mean(finite)), "var": float(np.var(finite))}
 
+def _nan_summary():
+    return {"min": np.nan, "max": np.nan, "mean": np.nan, "var": np.nan}
+
+def _summary_or_nan(array_like):
+    if array_like is None:
+        return _nan_summary()
+    return _array_summary(array_like)
+
 def _matrix_norm_summary(matrix):
     mat = np.asarray(matrix, dtype=np.float64)
     finite = np.isfinite(mat)
@@ -228,6 +236,16 @@ def _build_block_boundaries(total_trials, block_size):
         return []
     return list(range(block_size, total_trials, block_size))
 
+def _manifest_int(row, field, default):
+    value = getattr(row, field, default)
+    if value is None:
+        return default
+    if isinstance(value, str) and not value.strip():
+        return default
+    if pd.isna(value):
+        return default
+    return int(value)
+
 def _load_group_behavior_matrix(group_base_path, group_label, expected_trials):
     manifest_path = _resolve_existing_path(join(group_base_path, f"concat_manifest_{group_label}.tsv"))
     behavior_root = os.path.expanduser(os.environ.get("FMRI_BEHAVIOR_DIR", "/Data/zahra/behaviour"))
@@ -239,6 +257,7 @@ def _load_group_behavior_matrix(group_base_path, group_label, expected_trials):
         ses_id = int(row.ses)
         run_id = int(row.run)
         run_trials = int(row.n_trials)
+        run_trials_source = _manifest_int(row, "n_trials_source", run_trials)
         behavior_path = join(behavior_root, f"PSPD{sub_digits}_ses_{ses_id}_run_{run_id}.npy")
         if not os.path.exists(behavior_path):
             raise FileNotFoundError(f"Missing behavior file for manifest row {row.sub_tag} ses-{ses_id} run-{run_id}: {behavior_path}")
@@ -246,17 +265,30 @@ def _load_group_behavior_matrix(group_base_path, group_label, expected_trials):
         run_behavior = np.asarray(np.load(behavior_path), dtype=np.float64)
         if run_behavior.ndim == 1:
             run_behavior = run_behavior[:, None]
-        run_behavior = _align_behavior_matrix(run_behavior, run_trials)
+        run_behavior = _align_behavior_matrix(run_behavior, run_trials_source)
 
         trial_keep_path = str(getattr(row, "trial_keep_path", "") or "").strip()
         if trial_keep_path and trial_keep_path.lower() != "nan" and os.path.exists(trial_keep_path):
             trial_keep = np.asarray(np.load(trial_keep_path), dtype=bool)
-            if trial_keep.size == run_behavior.shape[0]:
-                run_behavior = run_behavior.copy()
-                run_behavior[~trial_keep, :] = np.nan
+            if trial_keep.size == run_trials_source:
+                kept_count = int(np.count_nonzero(trial_keep))
+                if run_trials == kept_count and run_trials_source != run_trials:
+                    # Compact group-concat mode: masked trials were removed from output arrays.
+                    run_behavior = run_behavior[trial_keep, :]
+                elif run_trials == run_trials_source:
+                    # Legacy mode: masked trials are retained as NaN columns.
+                    run_behavior = run_behavior.copy()
+                    run_behavior[~trial_keep, :] = np.nan
+                else:
+                    print(
+                        f"WARNING: Unexpected run length mapping for {row.sub_tag} ses-{ses_id} run-{run_id} "
+                        f"(manifest n_trials={run_trials}, n_trials_source={run_trials_source}, kept={kept_count}).",
+                        flush=True,
+                    )
             else:
                 print(f"WARNING: trial_keep length mismatch for {row.sub_tag} ses-{ses_id} run-{run_id} "
-                    f"({trial_keep.size} vs {run_behavior.shape[0]}).", flush=True)
+                    f"({trial_keep.size} vs {run_trials_source}).", flush=True)
+        run_behavior = _align_behavior_matrix(run_behavior, run_trials)
         behavior_chunks.append(run_behavior)
 
     if not behavior_chunks:
@@ -399,6 +431,7 @@ def _empca_model_path():
 def apply_empca(bold_clean):
     low_memory = os.environ.get("FMRI_LOW_MEMORY", "0").strip().lower() in ("1", "true", "yes")
     nvec = int(os.environ.get("FMRI_EMPCA_NVEC", "50" if low_memory else "100"))
+    pca_backend = os.environ.get("FMRI_PCA_BACKEND", "empca").strip().lower()
 
     def prepare_for_empca(data):
         W = np.isfinite(data)
@@ -412,18 +445,52 @@ def apply_empca(bold_clean):
         return Y, W
 
     X_reshap = np.asarray(bold_clean, dtype=np.float32).reshape(bold_clean.shape[0], -1)
-    Yc, W = prepare_for_empca(X_reshap.T)
-    del X_reshap; gc.collect()
-    Yc = np.ascontiguousarray(Yc.T)
-    W = np.ascontiguousarray(W.T)
-    gc.collect()
-    print(f"begin empca (nvec={nvec}, low_memory={low_memory})...", flush=True)
-    m = empca(Yc, W, nvec=nvec, niter=10)
-    del Yc, W; gc.collect()
+    if pca_backend in ("randomized_svd", "rsvd", "svd"):
+        from sklearn.utils.extmath import randomized_svd
+
+        finite = np.isfinite(X_reshap)
+        X = np.where(finite, X_reshap, np.float32(0.0)).astype(np.float32, copy=False)
+        col_count = finite.sum(axis=0, keepdims=True).astype(np.float32)
+        col_mean = np.divide((X * finite).sum(axis=0, keepdims=True), col_count,
+                             out=np.zeros(col_count.shape, dtype=np.float32), where=col_count > 0)
+        X -= col_mean
+        col_var = np.divide((finite * (X ** 2)).sum(axis=0, keepdims=True), col_count,
+                            out=np.zeros(col_count.shape, dtype=np.float32), where=col_count > 0)
+        col_scale = np.sqrt(col_var)
+        np.divide(X, np.maximum(col_scale, np.float32(1e-6)), out=X, where=col_count > 0)
+        del finite, col_count, col_mean, col_var, col_scale, X_reshap
+        gc.collect()
+
+        n_components = max(1, min(int(nvec), int(min(X.shape) - 1)))
+        print(f"begin randomized_svd (nvec={n_components}, low_memory={low_memory})...", flush=True)
+        U, S, Vt = randomized_svd(X, n_components=n_components, n_iter=5, random_state=0)
+        coeff = (U * S[np.newaxis, :]).astype(np.float32, copy=False)
+        eigvec = Vt.astype(np.float32, copy=False)
+        m = _EmpcaModelProxy(eigvec, coeff)
+        del U, S, Vt, X, coeff, eigvec
+        gc.collect()
+    else:
+        Yc, W = prepare_for_empca(X_reshap.T)
+        del X_reshap; gc.collect()
+        Yc = np.ascontiguousarray(Yc.T)
+        W = np.ascontiguousarray(W.T)
+        gc.collect()
+        print(f"begin empca (nvec={nvec}, low_memory={low_memory})...", flush=True)
+        m = empca(Yc, W, nvec=nvec, niter=10)
+        del Yc, W
+        gc.collect()
+
     model_path = _empca_model_path()
-    np.save(model_path, m)
-    print(f"Saved EMPCA model to {model_path}", flush=True)
-    return m
+    compact_model = {
+        "eigvec": np.asarray(m.eigvec, dtype=np.float32),
+        "coeff": np.asarray(m.coeff, dtype=np.float32),
+    }
+    np.save(model_path, compact_model, allow_pickle=True)
+    print(f"Saved compact EMPCA model to {model_path}", flush=True)
+    compact_proxy = _EmpcaModelProxy(compact_model["eigvec"], compact_model["coeff"])
+    del m, compact_model
+    gc.collect()
+    return compact_proxy
 
 class _EmpcaModelProxy:
     """Lightweight wrapper so dict-format cached models can be used like Model objects."""
@@ -569,38 +636,124 @@ def _compute_matrix_icc(data):
     fold_idx, voxel_idx = np.meshgrid(np.arange(n_folds, dtype=int), np.arange(n_vox, dtype=int), indexing="ij")
     df = pd.DataFrame({"targets": voxel_idx.ravel(), "raters": fold_idx.ravel(), "ratings": data.ravel()})
     df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["ratings"])
-    icc_table = pg.intraclass_corr(data=df, targets="targets", raters="raters", ratings="ratings")
+    # pingouin requires a minimum amount of finite data; return NaN when unavailable.
+    if df.shape[0] < 5 or df["targets"].nunique() < 2 or df["raters"].nunique() < 2:
+        return np.nan
+    try:
+        icc_table = pg.intraclass_corr(data=df, targets="targets", raters="raters", ratings="ratings")
+    except Exception:
+        return np.nan
     icc2 = icc_table.loc[icc_table["Type"] == "ICC2", "ICC"]
     if icc2.empty or not np.isfinite(icc2.iloc[0]):
         return np.nan
     return icc2.iloc[0]
 
 def save_brain_map(correlations, active_coords, volume_shape, anat_img, file_prefix, result_prefix="active_bold_corr",
-                   map_title=None, display_threshold_ratio=None):
-    coord_arrays = tuple(np.asarray(axis, dtype=int) for axis in active_coords)
-    display_values = np.abs(correlations.ravel())
-    volume = np.full(volume_shape, np.nan)
-    colorbar_max = None
-    if coord_arrays and coord_arrays[0].size:
-        volume[coord_arrays] = display_values
-        finite_values = display_values[np.isfinite(display_values)]
-        colorbar_max = float(np.percentile(finite_values, 99.5))
+                   map_title=None, display_threshold_ratio=None, use_abs=True, symmetric_cmap=False, gray_mask_data=None):
+    if tuple(volume_shape) != tuple(anat_img.shape[:3]):
+        raise ValueError(
+            f"Volume shape mismatch for {result_prefix}_{file_prefix}: "
+            f"{tuple(volume_shape)} vs anatomy {tuple(anat_img.shape[:3])}"
+        )
 
-    corr_img = nib.Nifti1Image(volume, anat_img.affine, anat_img.header)
+    coord_arrays = tuple(np.asarray(axis, dtype=int).ravel() for axis in active_coords)
+    if len(coord_arrays) != 3:
+        raise ValueError(f"active_coords must contain 3 axes, got {len(coord_arrays)}.")
+    n_active_voxels = int(coord_arrays[0].size)
+    if not all(axis.size == n_active_voxels for axis in coord_arrays):
+        raise ValueError("active_coords axes have inconsistent lengths.")
+
+    raw_values = np.asarray(correlations).ravel()
+    if raw_values.size != n_active_voxels:
+        raise ValueError(
+            f"Correlation/value vector length ({raw_values.size}) does not match active voxel count ({n_active_voxels})."
+        )
+    map_values = np.abs(raw_values) if use_abs else raw_values
+
+    volume = np.full(volume_shape, np.nan, dtype=np.float32)
+    if n_active_voxels:
+        volume[coord_arrays] = map_values.astype(np.float32, copy=False)
+
+    # Use a float image header so NaNs outside active voxels are preserved on disk.
+    corr_img = nib.Nifti1Image(volume.astype(np.float32, copy=False), anat_img.affine)
     volume_path = _result_path(f"{result_prefix}_{file_prefix}.nii.gz")
     nib.save(corr_img, volume_path)
 
-    if np.any(np.isfinite(display_values)):
-        display_volume = np.nan_to_num(volume, nan=0.0, posinf=0.0, neginf=0.0)
-        display_volume = np.clip(display_volume, 0.0, colorbar_max)
-        clamped_ratio = np.clip(display_threshold_ratio, 0.0, 1.0)
-        threshold_value = colorbar_max * clamped_ratio
-        display_volume[display_volume < threshold_value] = 0.0
-        display_img = nib.Nifti1Image(display_volume, anat_img.affine, anat_img.header)
-        display = plotting.view_img(display_img, bg_img=anat_img, colorbar=True, symmetric_cmap=False,cmap='jet', threshold=threshold_value)
-        display.save_as_html(_result_path(f"{result_prefix}_{file_prefix}.html"))
-        # display.close()
-    return
+    active_mask = np.zeros(volume_shape, dtype=bool)
+    if n_active_voxels:
+        active_mask[coord_arrays] = True
+    finite_mask = np.isfinite(volume)
+    n_finite_voxels = int(np.count_nonzero(finite_mask))
+    active_subset_ok = bool(np.all(~finite_mask | active_mask))
+
+    gray_overlap_pct = None
+    if gray_mask_data is not None:
+        gray_binary = np.asarray(gray_mask_data) > 0.5
+        if gray_binary.shape != tuple(volume_shape):
+            raise ValueError(
+                f"Gray mask shape mismatch: {gray_binary.shape} vs volume {tuple(volume_shape)}."
+            )
+        gray_overlap_pct = (
+            float(np.count_nonzero(finite_mask & gray_binary) / n_finite_voxels * 100.0)
+            if n_finite_voxels > 0
+            else 0.0
+        )
+
+    qc_payload = {
+        "map_path": volume_path,
+        "shape_ok": bool(corr_img.shape[:3] == anat_img.shape[:3]),
+        "affine_ok": bool(np.allclose(corr_img.affine, anat_img.affine)),
+        "active_subset_ok": active_subset_ok,
+        "n_active_voxels": n_active_voxels,
+        "n_finite_voxels": n_finite_voxels,
+        "gray_overlap_pct": gray_overlap_pct,
+        "use_abs": bool(use_abs),
+        "symmetric_cmap": bool(symmetric_cmap),
+    }
+    qc_path = _result_path(f"{result_prefix}_{file_prefix}_space_qc.json")
+    with open(qc_path, "w", encoding="utf-8") as handle:
+        json.dump(qc_payload, handle, indent=2)
+
+    if not (qc_payload["shape_ok"] and qc_payload["affine_ok"] and qc_payload["active_subset_ok"]):
+        raise ValueError(f"Space QC failed for {volume_path}; see {qc_path}.")
+
+    finite_values = map_values[np.isfinite(map_values)]
+    if finite_values.size:
+        colorbar_source = np.abs(finite_values) if symmetric_cmap else finite_values
+        colorbar_max = float(np.percentile(colorbar_source, 99.5))
+        if not np.isfinite(colorbar_max) or colorbar_max <= 0:
+            colorbar_max = float(np.max(colorbar_source)) if colorbar_source.size else 0.0
+        if np.isfinite(colorbar_max) and colorbar_max > 0:
+            clamped_ratio = float(np.clip(0.0 if display_threshold_ratio is None else display_threshold_ratio, 0.0, 1.0))
+            display_volume = np.nan_to_num(volume, nan=0.0, posinf=0.0, neginf=0.0)
+            threshold_value = colorbar_max * clamped_ratio
+            if symmetric_cmap:
+                display_volume[np.abs(display_volume) < threshold_value] = 0.0
+                display = plotting.view_img(
+                    nib.Nifti1Image(display_volume.astype(np.float32, copy=False), anat_img.affine),
+                    bg_img=anat_img,
+                    colorbar=True,
+                    symmetric_cmap=True,
+                    cmap="cold_hot",
+                    threshold=threshold_value,
+                    vmax=colorbar_max,
+                    title=map_title,
+                )
+            else:
+                display_volume = np.clip(display_volume, 0.0, colorbar_max)
+                display_volume[display_volume < threshold_value] = 0.0
+                display = plotting.view_img(
+                    nib.Nifti1Image(display_volume.astype(np.float32, copy=False), anat_img.affine),
+                    bg_img=anat_img,
+                    colorbar=True,
+                    symmetric_cmap=False,
+                    cmap="jet",
+                    threshold=threshold_value,
+                    vmax=colorbar_max,
+                    title=map_title,
+                )
+            display.save_as_html(_result_path(f"{result_prefix}_{file_prefix}.html"))
+    return {"volume_path": volume_path, "qc_path": qc_path}
 
 def enhance_bold_visualization(input_file, anat_img=None, output_prefix=None,
                                percentiles=(90, 95, 99), min_cluster_sizes=(100, 75, 50),
@@ -860,11 +1013,12 @@ def _prepare_atlas_context(anat_img, anat_path, ref_img, output_dir, atlas_thres
     cort_in_ref, registration_method = _align_atlas_to_reference(cort_img, anat_img, anat_path, ref_img, output_dir, assume_mni=assume_mni, return_method=True)
     sub_in_ref = _align_atlas_to_reference(sub_img, anat_img, anat_path, ref_img, output_dir, assume_mni=assume_mni, return_method=False)
 
-    cort_data = np.rint(cort_in_ref.get_fdata())
-    sub_data = np.rint(sub_in_ref.get_fdata())
+    cort_data = np.rint(cort_in_ref.get_fdata()).astype(np.int32, copy=False)
+    sub_data = np.rint(sub_in_ref.get_fdata()).astype(np.int32, copy=False)
     combined_data, combined_labels = _combine_atlas_data(cort_data, cort_labels, sub_data, sub_labels)
+    combined_data = np.asarray(combined_data, dtype=np.int32)
 
-    combined_img = nib.Nifti1Image(combined_data, ref_img.affine, ref_img.header)
+    combined_img = nib.Nifti1Image(combined_data.astype(np.int16), ref_img.affine, ref_img.header)
     nib.save(combined_img, atlas_cache_path)
     with open(labels_path, "w", encoding="utf-8") as handle:
         json.dump(combined_labels, handle, indent=2)
@@ -893,11 +1047,11 @@ def _analyze_weight_map_regions(voxel_weights_path, atlas_context, output_prefix
     threshold_value = float(np.percentile(active_values, threshold_percentile))
     suprath_mask = active_mask & (np.abs(weights_data) >= threshold_value)
 
-    active_labels = atlas_data[active_mask]
+    active_labels = np.asarray(atlas_data[active_mask], dtype=np.int32)
     active_labels = active_labels[(active_labels > 0) & (active_labels < len(labels))]
     active_counts = np.bincount(active_labels, minlength=len(labels))
 
-    suprath_labels = atlas_data[suprath_mask]
+    suprath_labels = np.asarray(atlas_data[suprath_mask], dtype=np.int32)
     suprath_labels = suprath_labels[(suprath_labels > 0) & (suprath_labels < len(labels))]
     suprath_counts = np.bincount(suprath_labels, minlength=len(labels))
 
@@ -1242,8 +1396,13 @@ def prepare_data_func(projection_data, trial_indices, trial_length, transition_b
     C_corr_num = C_corr_num / corr_scale
     C_corr_den = C_corr_den / corr_scale
 
-    beta_subset = projection_data["beta_clean"][:, trial_indices]
-    bold_subset = projection_data["bold_clean"][:, trial_indices, :]
+    store_fold_data = os.environ.get("FMRI_STORE_FOLD_DATA", "1").strip().lower() not in ("0", "false", "no")
+    if store_fold_data:
+        beta_subset = projection_data["beta_clean"][:, trial_indices]
+        bold_subset = projection_data["bold_clean"][:, trial_indices, :]
+    else:
+        beta_subset = None
+        bold_subset = None
 
     return {"nan_mask_flat": projection_data["nan_mask_flat"],
         "active_coords": tuple(np.array(coord) for coord in projection_data["active_coords"]),
@@ -1625,7 +1784,7 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
 # # %%
 ridge_penalty = 1e-3
 solver_name = "MOSEK"
-penalty_sweep = [(0.8, 1, 0.5, 1.2, 1.0)] #for sub09   gamma = 1.5
+penalty_sweep = [(0.8, 0.8, 0.5, 0.6, 1.0)]
 # penalty_sweep = [(0.8, 1.5, 0.8, 2, 1.0)] #for sub10  gamma = 1.5
 # penalty_sweep = [(1, 2, 1, 3, 1.0)] #for sub10  gamma = 2
 # penalty_sweep = [(0.8, 1.5, 0.8, 2, 1.0), (0, 1.5, 0.8, 2, 1.0), (0.8, 0, 0.8, 2, 1.0), (0.8, 1.5, 0, 2, 1.0), 
@@ -1634,7 +1793,21 @@ penalty_sweep = [(0.8, 1, 0.5, 1.2, 1.0)] #for sub09   gamma = 1.5
 alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha,
     "smooth_penalty": smooth_alpha, "corr_weight": corr_weight}
     for task_alpha, bold_alpha, beta_alpha, smooth_alpha, corr_weight in penalty_sweep]
-gamma_sweep= [1.5]
+gamma_sweep= [1.0]
+
+penalty_sweep_env = os.environ.get("FMRI_PENALTY_SWEEP_JSON", "").strip()
+if penalty_sweep_env:
+    parsed_penalties = json.loads(penalty_sweep_env)
+    penalty_sweep = [tuple(float(v) for v in combo) for combo in parsed_penalties]
+    alpha_sweep = [{"task_penalty": task_alpha, "bold_penalty": bold_alpha, "beta_penalty": beta_alpha,
+        "smooth_penalty": smooth_alpha, "corr_weight": corr_weight}
+        for task_alpha, bold_alpha, beta_alpha, smooth_alpha, corr_weight in penalty_sweep]
+    print(f"Using penalty_sweep from FMRI_PENALTY_SWEEP_JSON with {len(alpha_sweep)} combos.", flush=True)
+
+gamma_sweep_env = os.environ.get("FMRI_GAMMA_SWEEP_JSON", "").strip()
+if gamma_sweep_env:
+    gamma_sweep = [float(v) for v in json.loads(gamma_sweep_env)]
+    print(f"Using gamma_sweep from FMRI_GAMMA_SWEEP_JSON: {gamma_sweep}", flush=True)
 # SAVE_PER_FOLD_VOXEL_MAPS = False  # disable individual fold voxel-weight plots; averages saved later
 
 projection_data = build_pca_dataset(bold_clean, beta_clean, behavior_matrix, nan_mask_flat, active_coords, active_flat_idx, trial_len, num_trials)
@@ -1651,6 +1824,18 @@ def _describe_trial_span(indices):
 def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projection_data):
     total_folds = len(fold_splits)
     bold_pca_components = projection_data["pca_model"].eigvec
+    skip_voxel_corr = os.environ.get("FMRI_SKIP_VOXEL_CORR", "0").strip().lower() in ("1", "true", "yes")
+    skip_projection_outputs = os.environ.get("FMRI_SKIP_PROJECTION_OUTPUTS", "0").strip().lower() in ("1", "true", "yes")
+    store_fold_data = os.environ.get("FMRI_STORE_FOLD_DATA", "1").strip().lower() not in ("0", "false", "no")
+    skip_bold_viz = os.environ.get("FMRI_SKIP_BOLD_VIZ", "0").strip().lower() in ("1", "true", "yes")
+    if skip_voxel_corr:
+        print("FMRI_SKIP_VOXEL_CORR enabled: skipping expensive per-voxel correlation maps during fold training.", flush=True)
+    if skip_projection_outputs:
+        print("FMRI_SKIP_PROJECTION_OUTPUTS enabled: skipping per-fold projection plot computations.", flush=True)
+    if not store_fold_data:
+        print("FMRI_STORE_FOLD_DATA disabled: fold trial tensors will not be materialized in memory.", flush=True)
+    if skip_bold_viz:
+        print("FMRI_SKIP_BOLD_VIZ enabled: skipping enhance_bold_visualization outputs.", flush=True)
     aggregate_metrics = defaultdict(lambda: {"train_corr": [], "train_p": [], "test_corr": [], "test_p": [],
                                              "train_total_loss": [], "test_total_loss": [], "train_gamma_ratio": [], "test_gamma_ratio": []})
     fold_metric_records = defaultdict(lambda: defaultdict(list))
@@ -1705,16 +1890,24 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 coeff_pinv = np.asarray(train_data["coeff_pinv"])
                 voxel_weights = coeff_pinv.T @ component_weights
 
-                projection_signal, voxel_correlations = evaluate_bold_bold_projection_corr(voxel_weights, train_data)
-                beta_projection_signal, beta_voxel_correlations = evaluate_beta_bold_projection_corr(voxel_weights, train_data)
+                if skip_voxel_corr:
+                    projection_signal = None
+                    voxel_correlations = np.full(voxel_weights.shape[0], np.nan, dtype=np.float32)
+                    beta_voxel_correlations = np.full(voxel_weights.shape[0], np.nan, dtype=np.float32)
+                else:
+                    projection_signal, voxel_correlations = evaluate_bold_bold_projection_corr(voxel_weights, train_data)
+                    _, beta_voxel_correlations = evaluate_beta_bold_projection_corr(voxel_weights, train_data)
 
-                y_projection_voxel = save_projection_outputs(component_weights, bold_pca_components, trial_len, file_prefix,
-                                                             task_alpha, bold_alpha, beta_alpha, gamma_value,
-                                                             voxel_weights=voxel_weights, beta_clean=train_data["beta_clean"],
-                                                             data=train_data, bold_projection=projection_signal, plot_trials=False) 
+                if skip_projection_outputs:
+                    y_projection_voxel = None
+                else:
+                    y_projection_voxel = save_projection_outputs(component_weights, bold_pca_components, trial_len, file_prefix,
+                                                                 task_alpha, bold_alpha, beta_alpha, gamma_value,
+                                                                 voxel_weights=voxel_weights, beta_clean=train_data["beta_clean"],
+                                                                 data=train_data, bold_projection=projection_signal, plot_trials=False)
                 fold_outputs = fold_output_tracker[metrics_key]
-                fold_outputs["component_weights"].append(np.abs(component_weights))
-                fold_outputs["voxel_weights"].append(np.abs(voxel_weights))
+                fold_outputs["component_weights"].append(component_weights)
+                fold_outputs["voxel_weights"].append(voxel_weights)
                 fold_outputs["bold_corr"].append(np.abs(voxel_correlations))
                 fold_outputs["beta_corr"].append(np.abs(beta_voxel_correlations))
 
@@ -1750,8 +1943,8 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 print(f"  Train metrics -> corr: {train_metrics['pearson']:.4f}", flush=True)
                 print(f"  Test metrics  -> corr: {test_metrics['pearson']:.4f},", flush=True)
 
-                input_stats = {"beta_clean": _array_summary(train_data["beta_clean"]),
-                    "active_bold": _array_summary(train_data["active_bold"]),
+                input_stats = {"beta_clean": _summary_or_nan(train_data["beta_clean"]),
+                    "active_bold": _summary_or_nan(train_data["active_bold"]),
                     "behavior_observed": _array_summary(train_data["behavior_observed"]),
                     "beta_centered": _array_summary(train_data["beta_centered"]),
                     "normalized_behaviors": _array_summary(train_data["normalized_behaviors"])}
@@ -1878,17 +2071,44 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
 
             weights_stack = np.stack(fold_outputs["voxel_weights"], axis=0)
             weights_avg = np.nanmean(weights_stack, axis=0)
+            weights_abs_avg = np.nanmean(np.abs(weights_stack), axis=0)
             weights_icc = _compute_matrix_icc(weights_stack)
             print(f"  ICC (weights across folds/voxels): {weights_icc:.4f}" if np.isfinite(weights_icc) else "  ICC (weights) could not be computed", flush=True)
             weights_title = f"ICC={weights_icc:.3f}"
-            save_brain_map(weights_avg * 1000, active_coords, volume_shape, anat_img, avg_prefix, result_prefix="voxel_weights_mean", map_title=weights_title,
-                display_threshold_ratio=0.8)
+            save_brain_map(
+                weights_avg * 1000,
+                active_coords,
+                volume_shape,
+                anat_img,
+                avg_prefix,
+                result_prefix="voxel_weights_mean",
+                map_title=weights_title,
+                display_threshold_ratio=0.8,
+                use_abs=False,
+                symmetric_cmap=True,
+                gray_mask_data=gray_mask,
+            )
+            save_brain_map(
+                weights_abs_avg * 1000,
+                active_coords,
+                volume_shape,
+                anat_img,
+                avg_prefix,
+                result_prefix="voxel_weights_absmean",
+                map_title=weights_title,
+                display_threshold_ratio=0.8,
+                use_abs=True,
+                symmetric_cmap=False,
+                gray_mask_data=gray_mask,
+            )
             voxel_weights_path = _result_path(f"voxel_weights_mean_{avg_prefix}.nii.gz")
+            atlas_summary = None
             if os.path.exists(voxel_weights_path):
-                try:
-                    enhance_bold_visualization(voxel_weights_path, anat_img=anat_img, map_title=weights_title)
-                except Exception as exc:
-                    print(f"  Bold viz enhancement failed for {voxel_weights_path}: {exc}", flush=True)
+                if not skip_bold_viz:
+                    try:
+                        enhance_bold_visualization(voxel_weights_path, anat_img=anat_img, map_title=weights_title)
+                    except Exception as exc:
+                        print(f"  Bold viz enhancement failed for {voxel_weights_path}: {exc}", flush=True)
                 if atlas_analysis_enabled:
                     try:
                         weights_img = nib.load(voxel_weights_path)
@@ -1897,7 +2117,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                             atlas_context = _prepare_atlas_context(anat_img, anat_path, weights_img, RESULTS_DIR, atlas_threshold=atlas_threshold,
                                                                    data_dir=atlas_data_dir, assume_mni=atlas_assume_mni)
                         output_prefix = f"voxel_weights_mean_{avg_prefix}"
-                        _analyze_weight_map_regions(voxel_weights_path, atlas_context, output_prefix, motor_label_patterns, threshold_percentile=95)
+                        atlas_summary = _analyze_weight_map_regions(voxel_weights_path, atlas_context, output_prefix, motor_label_patterns, threshold_percentile=95)
                     except Exception as exc:
                         print(f" WARNING: Atlas region analysis failed for {voxel_weights_path}: {exc}", flush=True)
             else:
@@ -1909,7 +2129,7 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             print(f"  ICC (bold corr across folds/voxels): {bold_corr_icc:.4f}" if np.isfinite(bold_corr_icc) else "  ICC (bold corr) could not be computed", flush=True)
             bold_title = f"ICC={bold_corr_icc:.3f}"
             save_brain_map(bold_corr_avg, active_coords, volume_shape, anat_img, avg_prefix, result_prefix="active_bold_corr_mean", map_title=bold_title,
-                           display_threshold_ratio=0.8)
+                           display_threshold_ratio=0.8, gray_mask_data=gray_mask)
 
             beta_corr_stack = np.stack(np.abs(fold_outputs["beta_corr"]), axis=0)
             beta_corr_avg = np.nanmean(beta_corr_stack, axis=0)
@@ -1917,9 +2137,36 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             print(f"  ICC (beta corr across folds/voxels): {beta_corr_icc:.4f}" if np.isfinite(beta_corr_icc) else "  ICC (beta corr) could not be computed", flush=True)
             beta_title = f"ICC={beta_corr_icc:.3f}"
             save_brain_map(beta_corr_avg, active_coords, volume_shape, anat_img, avg_prefix, result_prefix=f"active_beta_corr_mean", map_title=beta_title,
-                           display_threshold_ratio=0.8)
+                           display_threshold_ratio=0.8, gray_mask_data=gray_mask)
+
+            motor_pct_value = None
+            if isinstance(atlas_summary, dict):
+                raw_motor_pct = atlas_summary.get("motor_suprathreshold_pct")
+                if isinstance(raw_motor_pct, (int, float, np.floating)) and np.isfinite(raw_motor_pct):
+                    motor_pct_value = float(raw_motor_pct)
+
+            combo_summary = {
+                "task_penalty": float(task_alpha),
+                "bold_penalty": float(bold_alpha),
+                "beta_penalty": float(beta_alpha),
+                "smooth_penalty": float(smooth_alpha),
+                "gamma": float(gamma_value),
+                "corr_weight": float(corr_weight),
+                "weights_icc": float(weights_icc) if np.isfinite(weights_icc) else None,
+                "bold_corr_icc": float(bold_corr_icc) if np.isfinite(bold_corr_icc) else None,
+                "beta_corr_icc": float(beta_corr_icc) if np.isfinite(beta_corr_icc) else None,
+                "motor_suprathreshold_pct": motor_pct_value,
+                "voxel_weights_mean_path": _result_path(f"voxel_weights_mean_{avg_prefix}.nii.gz"),
+                "voxel_weights_absmean_path": _result_path(f"voxel_weights_absmean_{avg_prefix}.nii.gz"),
+            }
+            combo_summary_path = _result_path(f"combo_summary_{avg_prefix}.json")
+            with open(combo_summary_path, "w", encoding="utf-8") as handle:
+                json.dump(combo_summary, handle, indent=2)
 
             projection_avg = _compute_projection(weights_avg, projection_data["beta_clean"])
+            projection_path = _result_path(f"projection_voxel_{avg_prefix}.npy")
+            np.save(projection_path, projection_avg.astype(np.float32))
+
             avg_series_key = (task_alpha, bold_alpha, beta_alpha, smooth_alpha, corr_weight)
             fold_avg_projection_series[avg_series_key].append((gamma_value, projection_avg))
 
@@ -1927,10 +2174,10 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
             if bold_clean_full is not None:
                 bold_projection_signal, _ = _compute_bold_projection(weights_avg, {"active_bold": bold_clean_full})
                 num_trials = bold_projection_signal.size // trial_len
-                bold_projection_trials= bold_projection_signal.reshape(num_trials, trial_len)
-                bold_plot_path = f"y_projection_bold_{avg_prefix}.png"
-                plot_projection_bold(bold_projection_trials, task_alpha, bold_alpha, beta_alpha, gamma_value, bold_plot_path, 
-                                     series_label="Active BOLD space (weights avg)", trial_indices_array=np.arange(num_trials))
+                # bold_projection_trials= bold_projection_signal.reshape(num_trials, trial_len)
+                # bold_plot_path = f"y_projection_bold_{avg_prefix}.png"
+                # plot_projection_bold(bold_projection_trials, task_alpha, bold_alpha, beta_alpha, gamma_value, bold_plot_path, 
+                                    #  series_label="Active BOLD space (weights avg)", trial_indices_array=np.arange(num_trials))
 
         if fold_avg_projection_series:
             for avg_series_key in sorted(fold_avg_projection_series.keys()):
@@ -1941,9 +2188,9 @@ def run_cross_run_experiment(alpha_settings, gamma_values, fold_splits, projecti
                 existing_avg = _load_projection_series(avg_series_storage)
                 merged_avg = _merge_projection_series(existing_avg, gamma_series)
                 np.save(avg_series_storage, merged_avg, allow_pickle=True)
-                aggregate_plot_path = f"y_projection_trials_voxel_{avg_base_prefix}_all_gammas.png"
-                merged_avg_sorted = sorted(merged_avg.items(), key=lambda item: item[0])
-                plot_projection_beta_sweep(merged_avg_sorted, task_alpha, bold_alpha, beta_alpha, aggregate_plot_path, series_label="Voxel space (fold avg)")
+                # aggregate_plot_path = f"y_projection_trials_voxel_{avg_base_prefix}_all_gammas.png"
+                # merged_avg_sorted = sorted(merged_avg.items(), key=lambda item: item[0])
+                # plot_projection_beta_sweep(merged_avg_sorted, task_alpha, bold_alpha, beta_alpha, aggregate_plot_path, series_label="Voxel space (fold avg)")
 
     if aggregate_metrics:
         print("\n===== Cross-fold average metrics =====", flush=True)

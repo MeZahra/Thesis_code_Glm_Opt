@@ -194,6 +194,11 @@ def main():
     parser.add_argument("--dtype", default="float32")
     parser.add_argument("--trial-keep-root", default="/Data/zahra/results_glm")
     parser.add_argument("--min-trial-coverage", type=float, default=0.70)
+    parser.add_argument(
+        "--keep-masked-trials",
+        action="store_true",
+        help="Keep trial_keep-masked trials as all-NaN columns in group outputs.",
+    )
     args = parser.parse_args()
 
     in_root = os.path.expanduser(args.in_root)
@@ -223,6 +228,24 @@ def main():
     union_flat = np.flatnonzero(union_mask)
     n_union = int(union_flat.size)
     total_trials = int(sum(entry["n_trials"] for entry in entries))
+    drop_masked_trials = not bool(args.keep_masked_trials)
+
+    source_trial_keep_parts = []
+    for entry in entries:
+        trial_keep = entry.get("trial_keep")
+        if trial_keep is None:
+            source_keep = np.ones(entry["n_trials"], dtype=bool)
+        else:
+            source_keep = np.asarray(trial_keep, dtype=bool)
+        entry["source_trial_keep"] = source_keep
+        source_trial_keep_parts.append(source_keep)
+    source_trial_keep_concat = np.concatenate(source_trial_keep_parts, axis=0)
+    trial_kept_indices = np.flatnonzero(source_trial_keep_concat).astype(np.int64, copy=False)
+    trial_removed_indices = np.flatnonzero(~source_trial_keep_concat).astype(np.int64, copy=False)
+    output_source_indices = (
+        trial_kept_indices if drop_masked_trials else np.arange(total_trials, dtype=np.int64)
+    )
+    output_trials = int(output_source_indices.size)
     retained_coverage = coverage_flat[union_flat]
     if missing_trial_keep:
         print(
@@ -241,7 +264,17 @@ def main():
         f"Retained voxel coverage range: [{retained_coverage.min():.3f}, {retained_coverage.max():.3f}]",
         flush=True,
     )
-    print(f"Total trials (all runs): {total_trials}", flush=True)
+    print(f"Total source trials (all runs): {total_trials}", flush=True)
+    if drop_masked_trials:
+        print(
+            f"Dropping trial_keep-masked trials: removed={trial_removed_indices.size}, kept={output_trials}",
+            flush=True,
+        )
+    else:
+        print(
+            f"Keeping masked trials as NaN columns: masked={trial_removed_indices.size}, output_trials={output_trials}",
+            flush=True,
+        )
 
     group_label = str(args.group_label)
     tag_ses = str(args.tag_ses)
@@ -257,6 +290,10 @@ def main():
     common_mask_flat_path = os.path.join(out_dir, f"common_mask_flat_{tag_hyphen}.npy")
     np.save(common_mask_path, union_mask)
     np.save(common_mask_flat_path, union_mask.ravel())
+    np.save(os.path.join(out_dir, f"trial_keep_concat_{tag_hyphen}.npy"), source_trial_keep_concat)
+    np.save(os.path.join(out_dir, f"trial_kept_indices_{tag_hyphen}.npy"), trial_kept_indices)
+    np.save(os.path.join(out_dir, f"trial_removed_indices_{tag_hyphen}.npy"), trial_removed_indices)
+    np.save(os.path.join(out_dir, f"trial_output_source_indices_{tag_hyphen}.npy"), output_source_indices)
 
     active_coords = np.unravel_index(union_flat, volume_shape)
     active_flat_indices = union_flat
@@ -275,7 +312,7 @@ def main():
     if not np.issubdtype(beta_dtype, np.floating):
         raise ValueError(f"beta dtype must be floating to support NaN masking, got {beta_dtype}")
     beta_path = os.path.join(out_dir, f"beta_volume_filter_{tag_hyphen}.npy")
-    beta_mm = open_memmap(beta_path, mode="w+", dtype=beta_dtype, shape=(n_union, total_trials))
+    beta_mm = open_memmap(beta_path, mode="w+", dtype=beta_dtype, shape=(n_union, output_trials))
 
     cleaned_path = os.path.join(out_dir, f"cleaned_beta_volume_{tag_hyphen}.npy")
     _safe_symlink(beta_path, cleaned_path)
@@ -291,7 +328,7 @@ def main():
         active_bold_path,
         mode="w+",
         dtype=active_dtype,
-        shape=(n_union, total_trials, trial_len),
+        shape=(n_union, output_trials, trial_len),
     )
 
     manifest_path = os.path.join(out_dir, f"concat_manifest_{tag_hyphen}.tsv")
@@ -301,10 +338,13 @@ def main():
             [
                 "offset_start",
                 "offset_end",
+                "source_offset_start",
+                "source_offset_end",
                 "sub_tag",
                 "ses",
                 "run",
                 "n_trials",
+                "n_trials_source",
                 "cleaned_beta",
                 "trial_keep_path",
                 "trial_keep_kept",
@@ -312,18 +352,23 @@ def main():
         )
 
         offset = 0
+        source_offset = 0
         for entry in entries:
             vol = np.load(entry["cleaned_beta"], mmap_mode="r")
             n_trials = entry["n_trials"]
             flat_view = vol.reshape(-1, n_trials)
-            beta_chunk = flat_view[union_flat]
             trial_keep = entry.get("trial_keep")
+            source_keep = entry["source_trial_keep"]
+            write_keep = source_keep if drop_masked_trials else np.ones(n_trials, dtype=bool)
+            n_trials_kept = int(np.count_nonzero(write_keep))
+
+            beta_chunk = flat_view[union_flat][:, write_keep]
             trial_keep_path = entry.get("trial_keep_path")
-            if trial_keep is not None:
+            if trial_keep is not None and not drop_masked_trials:
                 beta_chunk[:, ~trial_keep] = np.nan
-            beta_mm[:, offset : offset + n_trials] = beta_chunk
+            beta_mm[:, offset : offset + n_trials_kept] = beta_chunk
             if cleaned_mm is not None and cleaned_mm is not beta_mm:
-                cleaned_mm[:, offset : offset + n_trials] = beta_chunk
+                cleaned_mm[:, offset : offset + n_trials_kept] = beta_chunk
 
             coords = np.load(entry["active_coords"], allow_pickle=True)
             flat_active = np.ravel_multi_index(coords, volume_shape)
@@ -339,27 +384,40 @@ def main():
                 idx[present] = sorter[positions[present]]
 
             active_bold = np.load(entry["active_bold"], mmap_mode="r")
-            active_slice = active_mm[:, offset : offset + n_trials, :]
+            active_slice = active_mm[:, offset : offset + n_trials_kept, :]
             active_slice[:] = np.nan
             if np.any(present):
-                active_slice[present, :, :] = active_bold[idx[present]]
-            if trial_keep is not None:
+                active_slice[present, :, :] = active_bold[idx[present]][:, write_keep, :]
+            if trial_keep is not None and not drop_masked_trials:
                 active_slice[:, ~trial_keep, :] = np.nan
 
             writer.writerow(
                 [
                     offset,
-                    offset + n_trials,
+                    offset + n_trials_kept,
+                    source_offset,
+                    source_offset + n_trials,
                     entry["sub_tag"],
                     entry["ses"],
                     entry["run"],
+                    n_trials_kept,
                     n_trials,
                     entry["cleaned_beta"],
                     trial_keep_path or "",
-                    int(trial_keep.sum()) if trial_keep is not None else "",
+                    int(np.count_nonzero(source_keep)),
                 ]
             )
-            offset += n_trials
+            offset += n_trials_kept
+            source_offset += n_trials
+
+        if offset != output_trials:
+            raise RuntimeError(
+                f"Output trial count mismatch while writing: wrote {offset}, expected {output_trials}."
+            )
+        if source_offset != total_trials:
+            raise RuntimeError(
+                f"Source trial count mismatch while writing: consumed {source_offset}, expected {total_trials}."
+            )
 
     beta_mm.flush()
     active_mm.flush()
