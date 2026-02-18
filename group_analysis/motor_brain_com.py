@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-"""Compute run/session trial-variance summaries for projection and behavior.
-
-This script:
-1. Loads a projection vector saved by group_analysis/obj_param.py.
-2. Uses concat_manifest + trial_keep_run*.npy files to split trials per run.
-3. Computes projection variance over kept trials for each subject/session/run.
-4. Loads behavior from /Data/zahra/behaviour, uses column 2 (index 1), and
-   computes behavior variance over the same kept trials.
-5. Scales both variance distributions (z-score or min-max) for comparison.
-6. Saves per-run CSV summaries and distribution plots.
-"""
-
 import argparse
 import os
 import re
@@ -22,7 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import statsmodels.formula.api as smf
-from scipy.stats import binomtest, gaussian_kde, rankdata, ttest_1samp, ttest_rel, wilcoxon
+from scipy.stats import gaussian_kde, ttest_1samp, ttest_rel, wilcoxon
 
 DEFAULT_MANIFEST_PATH = "/Data/zahra/results_beta_preprocessed/group_concat/concat_manifest_group.tsv"
 DEFAULT_TRIAL_KEEP_ROOT = "/Data/zahra/results_glm"
@@ -203,64 +190,6 @@ def split_projection_by_run(projection, manifest_df, trial_keep_root):
     return run_segments, layout
 
 
-def compute_run_variances(run_segments):
-    rows = []
-    for segment in run_segments:
-        values = np.asarray(segment["values"], dtype=np.float64)
-        finite_values = values[np.isfinite(values)]
-        if finite_values.size == 0:
-            mean_value = np.nan
-            variance = np.nan
-        else:
-            mean_value = float(np.mean(finite_values))
-            variance = float(np.var(finite_values))
-
-        rows.append(
-            {
-                "sub_tag": segment["sub_tag"],
-                "ses": segment["ses"],
-                "run": segment["run"],
-                "n_trials_source": int(segment["n_trials_source"]),
-                "n_trials_kept": int(finite_values.size),
-                "mean_projection": mean_value,
-                "variance_projection": variance,
-            }
-        )
-
-    return pd.DataFrame(rows)
-
-
-def compute_behavior_variances(run_segments, behavior_root, behavior_column):
-    rows = []
-    for segment in run_segments:
-        _, kept_behavior, behavior_path = _load_run_kept_projection_behavior(
-            segment, behavior_root, behavior_column
-        )
-        n_trials_source = int(segment["n_trials_source"])
-        finite_values = kept_behavior[np.isfinite(kept_behavior)]
-        if finite_values.size == 0:
-            mean_value = np.nan
-            variance = np.nan
-        else:
-            mean_value = float(np.mean(finite_values))
-            variance = float(np.var(finite_values))
-
-        rows.append(
-            {
-                "sub_tag": segment["sub_tag"],
-                "ses": int(segment["ses"]),
-                "run": int(segment["run"]),
-                "n_trials_behavior_source": n_trials_source,
-                "n_trials_behavior_kept": int(finite_values.size),
-                "mean_behavior_col2": mean_value,
-                "variance_behavior_col2": variance,
-                "behavior_path": behavior_path,
-            }
-        )
-
-    return pd.DataFrame(rows)
-
-
 def _coefficient_of_variation(values):
     values = np.asarray(values, dtype=np.float64)
     finite_values = values[np.isfinite(values)]
@@ -277,12 +206,55 @@ def _coefficient_of_variation(values):
     return mean_value, std_value, cv_value
 
 
-def compute_sub_ses_run_cvs(run_segments, behavior_root, behavior_column):
-    rows = []
+def compute_run_behavior_tables(run_segments, behavior_root, behavior_column):
+    run_rows = []
+    behavior_rows = []
+    cv_rows = []
+
     for segment in run_segments:
-        kept_projection, kept_behavior, _ = _load_run_kept_projection_behavior(
+        proj_values = np.asarray(segment["values"], dtype=np.float64)
+        proj_finite = proj_values[np.isfinite(proj_values)]
+        if proj_finite.size == 0:
+            proj_mean = np.nan
+            proj_var = np.nan
+        else:
+            proj_mean = float(np.mean(proj_finite))
+            proj_var = float(np.var(proj_finite))
+        run_rows.append(
+            {
+                "sub_tag": str(segment["sub_tag"]),
+                "ses": int(segment["ses"]),
+                "run": int(segment["run"]),
+                "n_trials_source": int(segment["n_trials_source"]),
+                "n_trials_kept": int(proj_finite.size),
+                "mean_projection": proj_mean,
+                "variance_projection": proj_var,
+            }
+        )
+
+        kept_projection, kept_behavior, behavior_path = _load_run_kept_projection_behavior(
             segment, behavior_root, behavior_column
         )
+        beh_finite = kept_behavior[np.isfinite(kept_behavior)]
+        if beh_finite.size == 0:
+            beh_mean = np.nan
+            beh_var = np.nan
+        else:
+            beh_mean = float(np.mean(beh_finite))
+            beh_var = float(np.var(beh_finite))
+        behavior_rows.append(
+            {
+                "sub_tag": str(segment["sub_tag"]),
+                "ses": int(segment["ses"]),
+                "run": int(segment["run"]),
+                "n_trials_behavior_source": int(segment["n_trials_source"]),
+                "n_trials_behavior_kept": int(beh_finite.size),
+                "mean_behavior_col2": beh_mean,
+                "variance_behavior_col2": beh_var,
+                "behavior_path": behavior_path,
+            }
+        )
+
         finite_mask = np.isfinite(kept_projection) & np.isfinite(kept_behavior)
         projection_values = kept_projection[finite_mask]
         behavior_values = kept_behavior[finite_mask]
@@ -290,7 +262,7 @@ def compute_sub_ses_run_cvs(run_segments, behavior_root, behavior_column):
         proj_mean, proj_std, proj_cv = _coefficient_of_variation(projection_values)
         beh_mean, beh_std, beh_cv = _coefficient_of_variation(behavior_values)
 
-        rows.append(
+        cv_rows.append(
             {
                 "sub_tag": str(segment["sub_tag"]),
                 "ses": int(segment["ses"]),
@@ -305,77 +277,11 @@ def compute_sub_ses_run_cvs(run_segments, behavior_root, behavior_column):
             }
         )
 
-    return pd.DataFrame(rows)
-
-
-def fit_projection_behavior_unit_calibration(run_segments, behavior_root, behavior_column):
-    projection_chunks = []
-    behavior_chunks = []
-    for segment in run_segments:
-        kept_projection, kept_behavior, _ = _load_run_kept_projection_behavior(
-            segment, behavior_root, behavior_column
-        )
-        finite_mask = np.isfinite(kept_projection) & np.isfinite(kept_behavior)
-        if np.any(finite_mask):
-            projection_chunks.append(kept_projection[finite_mask])
-            behavior_chunks.append(kept_behavior[finite_mask])
-
-    if not projection_chunks:
-        raise RuntimeError("No finite projection/behavior trial pairs for unit calibration.")
-    projection_all = np.concatenate(projection_chunks)
-    behavior_all = np.concatenate(behavior_chunks)
-    if projection_all.size < 2:
-        raise RuntimeError("Need at least 2 finite paired trials for unit calibration.")
-
-    design = np.column_stack([projection_all, np.ones_like(projection_all)])
-    slope, intercept = np.linalg.lstsq(design, behavior_all, rcond=None)[0]
-    if not np.isfinite(slope) or not np.isfinite(intercept):
-        raise RuntimeError("Non-finite slope/intercept from projection-to-behavior calibration.")
-
-    corr = np.corrcoef(projection_all, behavior_all)[0, 1]
-    return {
-        "slope": float(slope),
-        "intercept": float(intercept),
-        "n_pairs": int(projection_all.size),
-        "trial_corr": float(corr) if np.isfinite(corr) else np.nan,
-    }
-
-
-def compute_unit_matched_variances(
-    run_segments, behavior_root, behavior_column, slope, intercept
-):
-    rows = []
-    for segment in run_segments:
-        kept_projection, kept_behavior, behavior_path = _load_run_kept_projection_behavior(
-            segment, behavior_root, behavior_column
-        )
-        finite_mask = np.isfinite(kept_projection) & np.isfinite(kept_behavior)
-        projection_finite = kept_projection[finite_mask]
-        behavior_finite = kept_behavior[finite_mask]
-
-        if projection_finite.size == 0:
-            variance_projection = np.nan
-            variance_behavior = np.nan
-        else:
-            projection_behavior_units = (slope * projection_finite) + intercept
-            variance_projection = float(np.var(projection_behavior_units))
-            variance_behavior = float(np.var(behavior_finite))
-
-        rows.append(
-            {
-                "sub_tag": segment["sub_tag"],
-                "ses": int(segment["ses"]),
-                "run": int(segment["run"]),
-                "n_trials_paired_finite": int(projection_finite.size),
-                "variance_projection_unit_matched": variance_projection,
-                "variance_behavior_unit_matched": variance_behavior,
-                "projection_to_behavior_slope": float(slope),
-                "projection_to_behavior_intercept": float(intercept),
-                "behavior_path": behavior_path,
-            }
-        )
-
-    return pd.DataFrame(rows)
+    return (
+        pd.DataFrame(run_rows),
+        pd.DataFrame(behavior_rows),
+        pd.DataFrame(cv_rows),
+    )
 
 
 def _scale_values(values, method):
@@ -672,117 +578,6 @@ def _density_grid(values, grid_points=512, pad_fraction=0.1, fallback_pad=0.25):
     return x
 
 
-def _paired_log_variance_space(projection_values, behavior_values, eps_scale=0.5):
-    """Map both modalities into a shared log-variance space without regression calibration."""
-    proj = np.asarray(projection_values, dtype=np.float64)
-    beh = np.asarray(behavior_values, dtype=np.float64)
-
-    paired_finite = np.isfinite(proj) & np.isfinite(beh)
-    positive = np.concatenate([proj[paired_finite], beh[paired_finite]])
-    positive = positive[positive > 0]
-    if positive.size == 0:
-        epsilon = 1e-12
-    else:
-        epsilon = max(float(np.min(positive)) * float(eps_scale), 1e-12)
-
-    proj_log = np.full(proj.shape, np.nan, dtype=np.float64)
-    beh_log = np.full(beh.shape, np.nan, dtype=np.float64)
-    proj_finite = np.isfinite(proj)
-    beh_finite = np.isfinite(beh)
-    proj_log[proj_finite] = np.log10(np.clip(proj[proj_finite], 0.0, None) + epsilon)
-    beh_log[beh_finite] = np.log10(np.clip(beh[beh_finite], 0.0, None) + epsilon)
-    return proj_log, beh_log, float(epsilon)
-
-
-def _to_percentile_scores(values):
-    values = np.asarray(values, dtype=np.float64)
-    scores = np.full(values.shape, np.nan, dtype=np.float64)
-    finite_mask = np.isfinite(values)
-    finite_values = values[finite_mask]
-    if finite_values.size == 0:
-        return scores
-    if finite_values.size == 1:
-        scores[finite_mask] = 0.5
-        return scores
-    ranks = rankdata(finite_values, method="average")
-    scores[finite_mask] = (ranks - 1.0) / (finite_values.size - 1.0)
-    return scores
-
-
-def _paired_quantile_space(projection_values, behavior_values):
-    """Scale-free paired space based on within-modality percentile ranks [0, 1]."""
-    proj = np.asarray(projection_values, dtype=np.float64)
-    beh = np.asarray(behavior_values, dtype=np.float64)
-    return _to_percentile_scores(proj), _to_percentile_scores(beh)
-
-
-def _paired_hypothesis_projection_less(projection_values, behavior_values, alpha=0.05):
-    """Test H1: projection < behavior on paired run/session values in H1 space."""
-    proj = np.asarray(projection_values, dtype=np.float64)
-    beh = np.asarray(behavior_values, dtype=np.float64)
-    paired_mask = np.isfinite(proj) & np.isfinite(beh)
-    proj = proj[paired_mask]
-    beh = beh[paired_mask]
-
-    result = {
-        "n_pairs": int(proj.size),
-        "alpha": float(alpha),
-        "mean_diff_proj_minus_beh": np.nan,
-        "median_diff_proj_minus_beh": np.nan,
-        "wilcoxon_p_less": np.nan,
-        "wilcoxon_stat": np.nan,
-        "ttest_p_less": np.nan,
-        "ttest_stat": np.nan,
-        "sign_test_p_less": np.nan,
-        "n_non_tied_pairs": 0,
-        "n_proj_less": 0,
-        "supports_hypothesis": False,
-        "decision_label": "insufficient_data",
-    }
-    if proj.size < 2:
-        return result
-
-    diff = proj - beh
-    result["mean_diff_proj_minus_beh"] = float(np.mean(diff))
-    result["median_diff_proj_minus_beh"] = float(np.median(diff))
-    non_tie_mask = diff != 0
-    n_non_tied = int(np.count_nonzero(non_tie_mask))
-    n_proj_less = int(np.count_nonzero(diff[non_tie_mask] < 0))
-    result["n_non_tied_pairs"] = n_non_tied
-    result["n_proj_less"] = n_proj_less
-    if n_non_tied > 0:
-        sign_res = binomtest(k=n_proj_less, n=n_non_tied, p=0.5, alternative="greater")
-        result["sign_test_p_less"] = float(sign_res.pvalue)
-
-    try:
-        w_stat, w_p = wilcoxon(proj, beh, alternative="less")
-        result["wilcoxon_stat"] = float(w_stat)
-        result["wilcoxon_p_less"] = float(w_p)
-    except ValueError:
-        pass
-
-    try:
-        t_res = ttest_rel(proj, beh, alternative="less", nan_policy="omit")
-        result["ttest_stat"] = float(t_res.statistic)
-        result["ttest_p_less"] = float(t_res.pvalue)
-    except TypeError:
-        t_res = ttest_rel(proj, beh, nan_policy="omit")
-        if np.isfinite(t_res.statistic) and np.isfinite(t_res.pvalue):
-            if t_res.statistic < 0:
-                result["ttest_p_less"] = float(t_res.pvalue / 2.0)
-            else:
-                result["ttest_p_less"] = float(1.0 - (t_res.pvalue / 2.0))
-            result["ttest_stat"] = float(t_res.statistic)
-
-    # Primary decision uses the one-sided Wilcoxon test.
-    if np.isfinite(result["wilcoxon_p_less"]):
-        supports = bool(result["wilcoxon_p_less"] < alpha)
-        result["supports_hypothesis"] = supports
-        result["decision_label"] = "support_H1_projection_less" if supports else "reject_H1_projection_less"
-
-    return result
-
-
 def plot_run_variance_density(run_df, out_path, grid_points=512):
     scale_factor = 1e7
     values = run_df["variance_projection"].to_numpy(dtype=np.float64)
@@ -830,28 +625,10 @@ def plot_run_variance_density(run_df, out_path, grid_points=512):
 def plot_scaled_variance_comparison_density(
     comparison_df,
     out_path,
-    scale_method,
-    alpha=0.05,
     grid_points=512,
-    hypothesis_projection_values=None,
-    hypothesis_behavior_values=None,
-    hypothesis_label=None,
     tail_annotate_threshold=80.0,
-    third_exclude_behavior_var_above=80.0,
     mixedlm_stats=None,
-    legacy_outlier_exclusion=False,
-    legacy_excluded_count=0,
 ):
-    # Keep legacy parameters for backward CLI compatibility.
-    _ = (
-        scale_method,
-        alpha,
-        hypothesis_projection_values,
-        hypothesis_behavior_values,
-        hypothesis_label,
-        third_exclude_behavior_var_above,
-    )
-
     projection_raw = comparison_df["variance_projection"].to_numpy(dtype=np.float64)
     behavior_raw = comparison_df["variance_behavior_col2"].to_numpy(dtype=np.float64)
     tail_text = None
@@ -921,7 +698,6 @@ def plot_scaled_variance_comparison_density(
     paired_mask = np.isfinite(paired_projection_log) & np.isfinite(paired_behavior_log)
     paired_projection_log = paired_projection_log[paired_mask]
     paired_behavior_log = paired_behavior_log[paired_mask]
-    excluded_count = int(np.count_nonzero(~paired_mask))
     if paired_projection_log.size == 0:
         raise RuntimeError(
             "No finite subject-median normalized log-variance pairs available for subplot 3."
@@ -951,67 +727,12 @@ def plot_scaled_variance_comparison_density(
     ax2.set_ylabel("Probability density")
     ax2.set_title("3) Subject-median log-rel comparison")
 
-    mean_diff = float(np.mean(paired_projection_log - paired_behavior_log))
-    logproj_std = float(np.std(paired_projection_log))
-    logbeh_std = float(np.std(paired_behavior_log))
+    stat_line = ""
+    if mixedlm_stats is not None and mixedlm_stats.get("analysis_method") == "mixedlm":
+        pval = float(mixedlm_stats.get("intercept_p_one_sided_less", np.nan))
+        p_text = f"{pval:.3g}" if np.isfinite(pval) else "nan"
+        stat_line = f"p(one-sided,<0)={p_text}"
 
-    stats = {
-        "n_pairs": int(paired_projection_log.size),
-        "excluded_pairs_for_norm_log": int(excluded_count),
-        "mean_diff_proj_minus_beh": float(mean_diff),
-        "std_projection_log_rel": logproj_std,
-        "std_behavior_log_rel": logbeh_std,
-        "decision_label": "subject_median_log_rel_plot",
-    }
-    if mixedlm_stats is not None:
-        stats["analysis_method"] = str(mixedlm_stats.get("analysis_method", "mixedlm"))
-        stats["decision_label"] = str(
-            mixedlm_stats.get("decision_label", stats["decision_label"])
-        )
-        stats["intercept_estimate"] = float(mixedlm_stats.get("intercept_estimate", np.nan))
-        stats["intercept_p_two_sided"] = float(
-            mixedlm_stats.get("intercept_p_two_sided", np.nan)
-        )
-        stats["intercept_p_one_sided_less"] = float(
-            mixedlm_stats.get("intercept_p_one_sided_less", np.nan)
-        )
-
-    def _fmt(x):
-        return f"{float(x):.3g}" if np.isfinite(x) else "nan"
-
-    # stat_lines = [
-    #     f"n={paired_projection_log.size}, nonfinite_excluded={excluded_count}",
-    #     f"mean diff={_fmt(mean_diff)}",
-    # ]
-    stat_lines = []
-    if mixedlm_stats is not None:
-        analysis_method = str(mixedlm_stats.get("analysis_method", "mixedlm"))
-        # stat_lines.append(f"analysis={analysis_method}")
-        if analysis_method == "mixedlm":
-            # stat_lines.append(
-            #     f"intercept={_fmt(mixedlm_stats.get('intercept_estimate', np.nan))}"
-            # )
-            stat_lines.append(
-                "p(one-sided,<0)="
-                f"{_fmt(mixedlm_stats.get('intercept_p_one_sided_less', np.nan))}"
-            )
-            # stat_lines.append(
-            #     "optimizer="
-            #     f"{mixedlm_stats.get('optimizer_used', 'nan')}, "
-            #     f"converged={mixedlm_stats.get('converged', False)}"
-            # )
-    #     else:
-    #         stat_lines.append(
-    #             "fallback Wilcoxon p(<0)="
-    #             f"{_fmt(mixedlm_stats.get('fallback_wilcoxon_p_less', np.nan))}"
-    #         )
-    #         stat_lines.append(
-    #             "fallback t-test p(<0)="
-    #             f"{_fmt(mixedlm_stats.get('fallback_ttest_p_less', np.nan))}"
-    #         )
-    # if bool(legacy_outlier_exclusion):
-    #     stat_lines.append(f"legacy excluded={int(legacy_excluded_count)}")
-    stat_line = "\n".join(stat_lines)
     ax2.text(
         0.98,
         0.98,
@@ -1026,10 +747,9 @@ def plot_scaled_variance_comparison_density(
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
-    return stats
 
 
-def plot_sub_ses_run_cv_comparison(run_cv_df, out_path, alpha=0.05, grid_points=512):
+def plot_sub_ses_run_cv_comparison(run_cv_df, out_path, grid_points=512):
     projection_cv = run_cv_df["cv_projection"].to_numpy(dtype=np.float64)
     behavior_cv = run_cv_df["cv_behavior_col2"].to_numpy(dtype=np.float64)
 
@@ -1178,12 +898,6 @@ def plot_sub_ses_run_cv_comparison(run_cv_df, out_path, alpha=0.05, grid_points=
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
-    return {
-        "n_pairs": int(paired_proj_raw.size),
-        "ttest_stat": t_stat,
-        "ttest_p_two_sided": t_p,
-        "decision_label": "paired_raw_cv_ttest",
-    }
 
 
 def main():
@@ -1227,50 +941,10 @@ def main():
         help="Significance threshold for H1: projection variance < behavior variance.",
     )
     parser.add_argument(
-        "--hypothesis-space",
-        default="subject_median_log_ratio",
-        choices=[
-            "subject_median_log_ratio",
-            "scaled",
-            "raw",
-            "paired_quantile",
-            "log_raw",
-            "unit_matched",
-        ],
-        help=(
-            "Primary statistics are always in subject-median log-ratio space. "
-            "This switch controls optional legacy paired-space reporting. "
-            "'subject_median_log_ratio' is the recommended default; "
-            "'scaled' uses separate modality scaling; "
-            "'raw' uses raw run variances; "
-            "'paired_quantile' uses within-modality percentile ranks; "
-            "'log_raw' uses a shared log10(var + eps) transform; "
-            "'unit_matched' keeps DEPRECATED trial-level linear calibration."
-        ),
-    )
-    parser.add_argument(
         "--tail-annotate-threshold",
         type=float,
         default=80.0,
         help="Annotate behavior-variance tail in subplot 2 for runs with variance > threshold.",
-    )
-    parser.add_argument(
-        "--third-exclude-behavior-var-above",
-        type=float,
-        default=80.0,
-        help=(
-            "DEPRECATED legacy option: exclude runs above this behavior-variance threshold "
-            "from legacy paired-space sensitivity stats only. Active only when "
-            "--legacy-outlier-exclusion is used. Set a negative value to disable."
-        ),
-    )
-    parser.add_argument(
-        "--legacy-outlier-exclusion",
-        action="store_true",
-        help=(
-            "DEPRECATED legacy sensitivity path: apply --third-exclude-behavior-var-above "
-            "to legacy paired-space stats. Primary mixed-model stats are never filtered."
-        ),
     )
     parser.add_argument("--out-dir", default=None, help="Output directory.")
     args = parser.parse_args()
@@ -1283,9 +957,8 @@ def main():
     projection = np.asarray(np.load(projection_path)).ravel()
     manifest_df = pd.read_csv(manifest_path, sep="\t")
 
-    run_segments, layout = split_projection_by_run(projection, manifest_df, trial_keep_root)
-    run_df = compute_run_variances(run_segments)
-    behavior_df = compute_behavior_variances(
+    run_segments, _ = split_projection_by_run(projection, manifest_df, trial_keep_root)
+    run_df, behavior_df, run_cv_df = compute_run_behavior_tables(
         run_segments,
         behavior_root=behavior_root,
         behavior_column=int(args.behavior_column),
@@ -1294,95 +967,6 @@ def main():
         run_df, behavior_df, scale_method=args.scale_method
     )
     comparison_df = add_subject_median_normalized_variance_features(comparison_df)
-    unit_matched_df = None
-    calibration = None
-    legacy_hypothesis_stats = None
-    legacy_hypothesis_label = None
-    legacy_excluded_count = 0
-    legacy_exclusion_threshold = None
-    legacy_outlier_active = False
-    log_eps = None
-    if args.hypothesis_space == "unit_matched":
-        calibration = fit_projection_behavior_unit_calibration(
-            run_segments, behavior_root=behavior_root, behavior_column=int(args.behavior_column)
-        )
-        unit_matched_df = compute_unit_matched_variances(
-            run_segments,
-            behavior_root=behavior_root,
-            behavior_column=int(args.behavior_column),
-            slope=calibration["slope"],
-            intercept=calibration["intercept"],
-        )
-        comparison_df = comparison_df.merge(
-            unit_matched_df[
-                [
-                    "sub_tag",
-                    "ses",
-                    "run",
-                    "n_trials_paired_finite",
-                    "variance_projection_unit_matched",
-                    "variance_behavior_unit_matched",
-                ]
-            ],
-            on=["sub_tag", "ses", "run"],
-            how="inner",
-            validate="one_to_one",
-        )
-
-    if args.hypothesis_space != "subject_median_log_ratio":
-        legacy_df = comparison_df.copy()
-        if bool(args.legacy_outlier_exclusion):
-            threshold = float(args.third_exclude_behavior_var_above)
-            if threshold >= 0.0:
-                behavior_for_mask = legacy_df["variance_behavior_col2"].to_numpy(dtype=np.float64)
-                keep_mask = np.isfinite(behavior_for_mask) & (behavior_for_mask <= threshold)
-                legacy_excluded_count = int(np.count_nonzero(~keep_mask))
-                legacy_df = legacy_df.loc[keep_mask].copy()
-                legacy_outlier_active = True
-                legacy_exclusion_threshold = threshold
-
-        if args.hypothesis_space == "scaled":
-            legacy_projection_values = legacy_df["variance_projection_scaled"].to_numpy(
-                dtype=np.float64
-            )
-            legacy_behavior_values = legacy_df["variance_behavior_scaled"].to_numpy(
-                dtype=np.float64
-            )
-            legacy_hypothesis_label = f"scaled ({args.scale_method}), paired"
-        elif args.hypothesis_space == "raw":
-            legacy_projection_values = legacy_df["variance_projection"].to_numpy(dtype=np.float64)
-            legacy_behavior_values = legacy_df["variance_behavior_col2"].to_numpy(dtype=np.float64)
-            legacy_hypothesis_label = "raw paired variances"
-        elif args.hypothesis_space == "paired_quantile":
-            legacy_projection_values, legacy_behavior_values = _paired_quantile_space(
-                legacy_df["variance_projection"].to_numpy(dtype=np.float64),
-                legacy_df["variance_behavior_col2"].to_numpy(dtype=np.float64),
-            )
-            legacy_hypothesis_label = "paired quantile ranks [0,1]"
-        elif args.hypothesis_space == "log_raw":
-            (
-                legacy_projection_values,
-                legacy_behavior_values,
-                log_eps,
-            ) = _paired_log_variance_space(
-                legacy_df["variance_projection"].to_numpy(dtype=np.float64),
-                legacy_df["variance_behavior_col2"].to_numpy(dtype=np.float64),
-            )
-            legacy_hypothesis_label = f"log10(raw var + eps={log_eps:.2g}), paired"
-        else:
-            legacy_projection_values = legacy_df["variance_projection_unit_matched"].to_numpy(
-                dtype=np.float64
-            )
-            legacy_behavior_values = legacy_df["variance_behavior_unit_matched"].to_numpy(
-                dtype=np.float64
-            )
-            legacy_hypothesis_label = "unit-matched paired variances (DEPRECATED)"
-
-        legacy_hypothesis_stats = _paired_hypothesis_projection_less(
-            legacy_projection_values,
-            legacy_behavior_values,
-            alpha=float(args.alpha),
-        )
 
     out_dir = args.out_dir
     if out_dir is None:
@@ -1391,187 +975,47 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     stem = os.path.splitext(os.path.basename(projection_path))[0]
-    run_csv_path = os.path.join(out_dir, f"{stem}_sub_ses_run_variance.csv")
-    behavior_csv_path = os.path.join(out_dir, f"{stem}_sub_ses_run_behavior_variance.csv")
-    compare_csv_path = os.path.join(
-        out_dir, f"{stem}_sub_ses_run_projection_behavior_variance.csv"
-    )
-    dist_plot_path = os.path.join(out_dir, f"{stem}_sub_ses_run_variance_density.png")
-    compare_plot_path = os.path.join(
-        out_dir, f"{stem}_projection_behavior_variance_scaled_density.png"
-    )
-    run_cv_csv_path = os.path.join(
-        out_dir, f"{stem}_sub_ses_run_projection_behavior_cv.csv"
-    )
-    run_cv_plot_path = os.path.join(
-        out_dir, f"{stem}_sub_ses_run_projection_behavior_cv_density.png"
-    )
-    unit_matched_csv_path = os.path.join(
-        out_dir, f"{stem}_sub_ses_run_projection_behavior_variance_unit_matched.csv"
-    )
-    mixedlm_stats_csv_path = os.path.join(
-        out_dir, f"{stem}_projection_behavior_mixedlm_stats.csv"
-    )
+    output_paths = {
+        "run_csv": os.path.join(out_dir, f"{stem}_sub_ses_run_variance.csv"),
+        "behavior_csv": os.path.join(out_dir, f"{stem}_sub_ses_run_behavior_variance.csv"),
+        "compare_csv": os.path.join(
+            out_dir, f"{stem}_sub_ses_run_projection_behavior_variance.csv"
+        ),
+        "run_density_plot": os.path.join(out_dir, f"{stem}_sub_ses_run_variance_density.png"),
+        "compare_density_plot": os.path.join(
+            out_dir, f"{stem}_projection_behavior_variance_scaled_density.png"
+        ),
+        "run_cv_csv": os.path.join(
+            out_dir, f"{stem}_sub_ses_run_projection_behavior_cv.csv"
+        ),
+        "run_cv_plot": os.path.join(
+            out_dir, f"{stem}_sub_ses_run_projection_behavior_cv_density.png"
+        ),
+        "mixedlm_csv": os.path.join(
+            out_dir, f"{stem}_projection_behavior_mixedlm_stats.csv"
+        ),
+    }
 
     mixedlm_stats = fit_subject_median_log_ratio_mixedlm(
         comparison_df, alpha=float(args.alpha)
     )
 
-    run_cv_df = compute_sub_ses_run_cvs(
-        run_segments, behavior_root=behavior_root, behavior_column=int(args.behavior_column)
-    )
+    run_df.to_csv(output_paths["run_csv"], index=False)
+    behavior_df.to_csv(output_paths["behavior_csv"], index=False)
+    comparison_df.to_csv(output_paths["compare_csv"], index=False)
+    run_cv_df.to_csv(output_paths["run_cv_csv"], index=False)
+    pd.DataFrame([mixedlm_stats]).to_csv(output_paths["mixedlm_csv"], index=False)
 
-    run_df.to_csv(run_csv_path, index=False)
-    behavior_df.to_csv(behavior_csv_path, index=False)
-    comparison_df.to_csv(compare_csv_path, index=False)
-    run_cv_df.to_csv(run_cv_csv_path, index=False)
-    pd.DataFrame([mixedlm_stats]).to_csv(mixedlm_stats_csv_path, index=False)
-    if unit_matched_df is not None:
-        unit_matched_df.to_csv(unit_matched_csv_path, index=False)
-    plot_run_variance_density(run_df, dist_plot_path)
-    comparison_plot_stats = plot_scaled_variance_comparison_density(
+    plot_run_variance_density(run_df, output_paths["run_density_plot"])
+    plot_scaled_variance_comparison_density(
         comparison_df,
-        compare_plot_path,
-        scale_method=args.scale_method,
-        alpha=float(args.alpha),
+        output_paths["compare_density_plot"],
         tail_annotate_threshold=float(args.tail_annotate_threshold),
-        third_exclude_behavior_var_above=float(args.third_exclude_behavior_var_above),
         mixedlm_stats=mixedlm_stats,
-        legacy_outlier_exclusion=legacy_outlier_active,
-        legacy_excluded_count=legacy_excluded_count,
     )
-    cv_hypothesis_stats = plot_sub_ses_run_cv_comparison(
-        run_cv_df, run_cv_plot_path, alpha=float(args.alpha)
-    )
+    plot_sub_ses_run_cv_comparison(run_cv_df, output_paths["run_cv_plot"])
 
-    paired_mask = np.isfinite(comparison_df["variance_projection"]) & np.isfinite(
-        comparison_df["variance_behavior_col2"]
-    )
-    if np.any(paired_mask):
-        paired_proj = comparison_df.loc[paired_mask, "variance_projection"].to_numpy(
-            dtype=np.float64
-        )
-        paired_beh = comparison_df.loc[paired_mask, "variance_behavior_col2"].to_numpy(
-            dtype=np.float64
-        )
-        if paired_proj.size >= 2:
-            corr_value = float(np.corrcoef(paired_proj, paired_beh)[0, 1])
-        else:
-            corr_value = np.nan
-    else:
-        corr_value = np.nan
-
-    print(f"Projection length: {projection.size}")
-    print(f"Projection layout: {layout}")
-    print(f"Run/session rows: {len(run_df)}")
-    print(f"Behavior root: {behavior_root}")
-    print(f"Behavior column: {args.behavior_column} (second column is index 1)")
-    print(f"Scale method: {args.scale_method}")
-    print(f"Hypothesis space: {args.hypothesis_space}")
-    print(f"Tail annotate threshold (subplot 2): {float(args.tail_annotate_threshold):.3f}")
-    if bool(args.legacy_outlier_exclusion):
-        if legacy_outlier_active:
-            print(
-                "DEPRECATED legacy exclusion active "
-                f"(behavior variance <= {legacy_exclusion_threshold:.3f}); "
-                f"excluded rows={legacy_excluded_count}"
-            )
-        else:
-            print(
-                "DEPRECATED legacy exclusion requested but inactive "
-                "(threshold disabled or no rows excluded)."
-            )
-    else:
-        print("Legacy outlier exclusion: disabled (primary mixed-model stats unfiltered).")
-    if calibration is not None:
-        print(
-            "DEPRECATED unit calibration (behavior ~= slope*projection + intercept): "
-            f"slope={calibration['slope']}, intercept={calibration['intercept']}, "
-            f"paired_trials={calibration['n_pairs']}, corr={calibration['trial_corr']}"
-        )
-    if log_eps is not None:
-        print(f"Log-raw shared transform epsilon: {log_eps}")
-    print(f"Hypothesis alpha: {float(args.alpha):.3f}")
-    print(f"Projection-vs-behavior variance correlation: {corr_value}")
-    print(
-        "Primary model stats (subject-median log-ratio): "
-        f"method={mixedlm_stats['analysis_method']}, "
-        f"optimizer={mixedlm_stats['optimizer_used']}, "
-        f"converged={mixedlm_stats['converged']}, "
-        f"n_rows_used={mixedlm_stats['n_rows_used']}, "
-        f"n_subjects={mixedlm_stats['n_subjects_used']}, "
-        f"intercept={mixedlm_stats['intercept_estimate']}, "
-        f"p_two_sided={mixedlm_stats['intercept_p_two_sided']}, "
-        f"p_one_sided_less={mixedlm_stats['intercept_p_one_sided_less']}, "
-        f"decision={mixedlm_stats['decision_label']}"
-    )
-    if mixedlm_stats.get("mixedlm_error_chain"):
-        print(f"MixedLM optimizer failures: {mixedlm_stats['mixedlm_error_chain']}")
-    if legacy_hypothesis_stats is not None:
-        print("DEPRECATED legacy paired-space report:")
-        print(f"  space={legacy_hypothesis_label}")
-        print(
-            "  one-sided Wilcoxon p(<): "
-            f"{legacy_hypothesis_stats['wilcoxon_p_less']}, "
-            f"W={legacy_hypothesis_stats['wilcoxon_stat']}, "
-            f"n_pairs={legacy_hypothesis_stats['n_pairs']}, "
-            f"decision={legacy_hypothesis_stats['decision_label']}"
-        )
-    print(
-        "Variance subplot stats (subject-median log-rel panel): "
-        f"n={comparison_plot_stats['n_pairs']}, "
-        f"nonfinite_excluded={comparison_plot_stats['excluded_pairs_for_norm_log']}, "
-        f"std(logproj_rel)={comparison_plot_stats['std_projection_log_rel']}, "
-        f"std(logbeh_rel)={comparison_plot_stats['std_behavior_log_rel']}, "
-        f"mean_diff={comparison_plot_stats['mean_diff_proj_minus_beh']}, "
-        f"decision={comparison_plot_stats['decision_label']}"
-    )
-    print(
-        "CV subplot 3 paired t-test (raw CV projection vs behavior): "
-        f"n={cv_hypothesis_stats['n_pairs']}, "
-        f"p(two-sided)={cv_hypothesis_stats['ttest_p_two_sided']}, "
-        f"t={cv_hypothesis_stats['ttest_stat']}"
-    )
-    print("\nPer run/session summary:")
-    summary_cols = [
-        "sub_tag",
-        "ses",
-        "run",
-        "n_trials_kept",
-        "variance_projection",
-        "n_trials_behavior_kept",
-        "variance_behavior_col2",
-        "variance_projection_scaled",
-        "variance_behavior_scaled",
-        "subject_median_variance_projection",
-        "subject_median_variance_behavior_col2",
-        "variance_projection_rel_subject_median",
-        "variance_behavior_rel_subject_median",
-        "log_variance_projection_rel_subject_median",
-        "log_variance_behavior_rel_subject_median",
-        "log_rel_diff_proj_minus_beh",
-    ]
-    print(comparison_df.loc[:, summary_cols].to_string(index=False))
-    print("\nPer sub/session/run CV summary:")
-    run_cv_summary_cols = [
-        "sub_tag",
-        "ses",
-        "run",
-        "n_trials_paired_finite",
-        "cv_projection",
-        "cv_behavior_col2",
-    ]
-    print(run_cv_df.loc[:, run_cv_summary_cols].to_string(index=False))
-    print(f"\nSaved run/session CSV: {run_csv_path}")
-    print(f"Saved behavior CSV:    {behavior_csv_path}")
-    print(f"Saved compare CSV:     {compare_csv_path}")
-    print(f"Saved mixedlm CSV:     {mixedlm_stats_csv_path}")
-    print(f"Saved sub/ses/run CV CSV:  {run_cv_csv_path}")
-    if unit_matched_df is not None:
-        print(f"Saved unit-matched CSV:{unit_matched_csv_path}")
-    print(f"Saved density plot:    {dist_plot_path}")
-    print(f"Saved compare plot:    {compare_plot_path}")
-    print(f"Saved sub/ses/run CV plot: {run_cv_plot_path}")
+    print(f"Saved outputs to: {out_dir}")
 
 
 if __name__ == "__main__":

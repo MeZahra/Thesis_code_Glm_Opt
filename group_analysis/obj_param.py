@@ -1784,7 +1784,7 @@ def save_projection_outputs(pca_weights, bold_pca_components, trial_length, file
 # # %%
 ridge_penalty = 1e-3
 solver_name = "MOSEK"
-penalty_sweep = [(0.8, 0.8, 0.5, 0.6, 1.0)]
+penalty_sweep = [(0.8, 0.8, 0.5, 0.2, 1.0)]
 # penalty_sweep = [(0.8, 1.5, 0.8, 2, 1.0)] #for sub10  gamma = 1.5
 # penalty_sweep = [(1, 2, 1, 3, 1.0)] #for sub10  gamma = 2
 # penalty_sweep = [(0.8, 1.5, 0.8, 2, 1.0), (0, 1.5, 0.8, 2, 1.0), (0.8, 0, 0.8, 2, 1.0), (0.8, 1.5, 0, 2, 1.0), 
