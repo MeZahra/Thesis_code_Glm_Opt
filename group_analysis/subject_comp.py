@@ -117,6 +117,12 @@ def _plot_metric_by_ses_run(df, value_col, x_label, title, out_path, color):
     finite_all = df[value_col].to_numpy(dtype=np.float64)
     finite_all = finite_all[np.isfinite(finite_all)]
     use_sci = bool(finite_all.size and np.nanmax(np.abs(finite_all)) < 1e-3)
+    if finite_all.size:
+        shared_x = _density_grid(finite_all, grid_points=512, fallback_pad=1e-6)
+        shared_xlim = (float(shared_x[0]), float(shared_x[-1]))
+    else:
+        shared_x = None
+        shared_xlim = None
 
     for ax, (ses, run) in zip(axes.ravel(), combos):
         subset = df[(df["ses"] == ses) & (df["run"] == run)].copy()
@@ -130,10 +136,12 @@ def _plot_metric_by_ses_run(df, value_col, x_label, title, out_path, color):
             ax.set_title(f"Session {ses} - Run {run}")
             ax.set_xlabel(x_label)
             ax.set_ylabel("Probability density")
+            if shared_xlim is not None:
+                ax.set_xlim(shared_xlim)
             continue
 
         y = subset[value_col].to_numpy(dtype=np.float64)
-        x = _density_grid(y, grid_points=512, fallback_pad=1e-6)
+        x = shared_x if shared_x is not None else _density_grid(y, grid_points=512, fallback_pad=1e-6)
         density = _evaluate_density(y, x)
 
         ax.plot(x, density, color=color, linewidth=2.0)
@@ -141,6 +149,8 @@ def _plot_metric_by_ses_run(df, value_col, x_label, title, out_path, color):
         ax.set_title(f"Session {ses} - Run {run} (n={len(subset)})")
         ax.set_xlabel(x_label)
         ax.set_ylabel("Probability density")
+        if shared_xlim is not None:
+            ax.set_xlim(shared_xlim)
         if use_sci:
             ax.ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
 
@@ -223,8 +233,8 @@ def main():
     _plot_metric_by_ses_run(
         run_variance_df,
         value_col="variance_projection",
-        x_label=f"Projection variability (variance x{VARIANCE_SCALE:.0e})",
-        title=f"Projection variability (x{VARIANCE_SCALE:.0e}) by subject (session/run panels)",
+        x_label=f"Projection variability",
+        title=f"Projection variability",
         out_path=variance_plot_path,
         color="tab:blue",
     )
@@ -232,7 +242,7 @@ def main():
         run_std_rms_df,
         value_col="std_over_rms_projection",
         x_label="Projection std/rms",
-        title="Projection std/rms by subject (session/run panels)",
+        title="Projection std/rms",
         out_path=std_rms_plot_path,
         color="tab:green",
     )
