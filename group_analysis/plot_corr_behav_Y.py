@@ -1,3 +1,4 @@
+import colorsys
 import re
 from pathlib import Path
 
@@ -178,6 +179,36 @@ def integer_hist_bins(values):
     if vmin == vmax:
         return np.array([vmin - 0.5, vmax + 0.5], dtype=np.float64)
     return np.arange(vmin - 0.5, vmax + 1.5, 1.0, dtype=np.float64)
+
+
+def light_subject_colors(n_subjects, saturation=0.25, value=0.95):
+    if int(n_subjects) <= 0:
+        return []
+    hues = np.linspace(0.0, 1.0, int(n_subjects), endpoint=False, dtype=np.float64)
+    return [colorsys.hsv_to_rgb(float(h), float(saturation), float(value)) for h in hues]
+
+
+def plot_subject_projection_over_trials(manifest_df, projection_values, output_path):
+    subject_tags = sorted(manifest_df["sub_tag"].astype(str).unique())
+    colors = light_subject_colors(len(subject_tags))
+    fig, ax = plt.subplots(figsize=(16, 6), constrained_layout=True)
+
+    for color, sub_tag in zip(colors, subject_tags):
+        sub_rows = manifest_df[manifest_df["sub_tag"] == sub_tag].sort_values("offset_start")
+        for _, row in sub_rows.iterrows():
+            start = int(row.offset_start)
+            end = int(row.offset_end)
+            trial_idx = np.arange(start, end, dtype=int)
+            proj_segment = np.asarray(projection_values[start:end], dtype=np.float64)
+            finite_mask = np.isfinite(proj_segment)
+            if np.any(finite_mask):
+                ax.plot(trial_idx[finite_mask], proj_segment[finite_mask], color=color, lw=1.0, alpha=0.8)
+
+    ax.set_title(f"Projected signal over all kept trials ({len(subject_tags)} subjects)")
+    ax.set_xlabel("Global kept-trial index")
+    ax.set_ylabel("Projected signal")
+    ax.grid(alpha=0.25)
+    fig.savefig(output_path, dpi=300)
 
 
 analysis_records = []
@@ -429,5 +460,11 @@ if not all_summary_df.empty:
 
     fig_abs.suptitle("Absolute-correlation distributions for selected lags")
     fig_abs.savefig("projection_behavior_crosscorr_all_subjects_abs_corr_hist.png", dpi=300)
+
+plot_subject_projection_over_trials(
+    manifest_df=manifest,
+    projection_values=projection,
+    output_path="projection_all_trials_all_subjects.png",
+)
 
 plt.show()

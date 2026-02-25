@@ -6,10 +6,10 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
-import statsmodels.formula.api as smf
-from scipy.stats import gaussian_kde, ttest_1samp, ttest_rel, wilcoxon
+from scipy.stats import gaussian_kde, ttest_rel, wilcoxon
 
 DEFAULT_MANIFEST_PATH = "/Data/zahra/results_beta_preprocessed/group_concat/concat_manifest_group.tsv"
 DEFAULT_TRIAL_KEEP_ROOT = "/Data/zahra/results_glm"
@@ -238,52 +238,49 @@ def compute_run_behavior_tables(run_segments, behavior_root, behavior_column):
     cv_rows = []
 
     for segment in run_segments:
-        proj_values = np.asarray(segment["values"], dtype=np.float64)
-        proj_finite = proj_values[np.isfinite(proj_values)]
-        if proj_finite.size == 0:
+        kept_projection, kept_behavior, behavior_path = _load_run_kept_projection_behavior(
+            segment, behavior_root, behavior_column
+        )
+        finite_mask = np.isfinite(kept_projection) & np.isfinite(kept_behavior)
+        projection_values = np.asarray(kept_projection[finite_mask], dtype=np.float64)
+        behavior_values = np.asarray(kept_behavior[finite_mask], dtype=np.float64)
+
+        if projection_values.size == 0:
             proj_mean = np.nan
             proj_var = np.nan
         else:
-            proj_mean = float(np.mean(proj_finite))
-            proj_var = float(np.var(proj_finite))
+            proj_mean = float(np.mean(projection_values))
+            proj_var = float(np.var(projection_values))
         run_rows.append(
             {
                 "sub_tag": str(segment["sub_tag"]),
                 "ses": int(segment["ses"]),
                 "run": int(segment["run"]),
                 "n_trials_source": int(segment["n_trials_source"]),
-                "n_trials_kept": int(proj_finite.size),
+                "n_trials_kept": int(projection_values.size),
                 "mean_projection": proj_mean,
                 "variance_projection": proj_var,
             }
         )
 
-        kept_projection, kept_behavior, behavior_path = _load_run_kept_projection_behavior(
-            segment, behavior_root, behavior_column
-        )
-        beh_finite = kept_behavior[np.isfinite(kept_behavior)]
-        if beh_finite.size == 0:
+        if behavior_values.size == 0:
             beh_mean = np.nan
             beh_var = np.nan
         else:
-            beh_mean = float(np.mean(beh_finite))
-            beh_var = float(np.var(beh_finite))
+            beh_mean = float(np.mean(behavior_values))
+            beh_var = float(np.var(behavior_values))
         behavior_rows.append(
             {
                 "sub_tag": str(segment["sub_tag"]),
                 "ses": int(segment["ses"]),
                 "run": int(segment["run"]),
                 "n_trials_behavior_source": int(segment["n_trials_source"]),
-                "n_trials_behavior_kept": int(beh_finite.size),
+                "n_trials_behavior_kept": int(behavior_values.size),
                 "mean_behavior_col2": beh_mean,
                 "variance_behavior_col2": beh_var,
                 "behavior_path": behavior_path,
             }
         )
-
-        finite_mask = np.isfinite(kept_projection) & np.isfinite(kept_behavior)
-        projection_values = kept_projection[finite_mask]
-        behavior_values = kept_behavior[finite_mask]
 
         proj_mean, proj_std, proj_cv = _coefficient_of_variation(projection_values)
         beh_mean, beh_std, beh_cv = _coefficient_of_variation(behavior_values)
@@ -416,157 +413,308 @@ def _one_sided_p_less_from_two_sided(two_sided_p, estimate):
     return float(1.0 - (two_sided_p / 2.0))
 
 
-def _fallback_subject_aggregate_log_ratio(
-    fit_df, alpha=0.05, fit_error_chain=None, n_rows_total=None
-):
-    subject_df = (
-        fit_df.groupby("sub_tag", as_index=False)["log_rel_diff_proj_minus_beh"].mean()
-    )
-    diff = subject_df["log_rel_diff_proj_minus_beh"].to_numpy(dtype=np.float64)
-    diff = diff[np.isfinite(diff)]
+def _iqr_outlier_mask(values, iqr_multiplier=3.0):
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return np.zeros(0, dtype=bool)
 
-    result = {
-        "analysis_method": "subject_aggregate_fallback",
-        "model_formula": "subject_mean(log_rel_diff_proj_minus_beh) ~ 1",
-        "optimizer_used": "fallback",
-        "converged": False,
-        "mixedlm_error_chain": str(fit_error_chain or ""),
-        "n_rows_total": int(len(fit_df) if n_rows_total is None else n_rows_total),
-        "n_rows_used": int(len(fit_df)),
-        "n_subjects_used": int(subject_df["sub_tag"].nunique()),
-        "n_rows": int(len(fit_df)),
-        "n_subjects": int(subject_df["sub_tag"].nunique()),
-        "alpha": float(alpha),
-        "intercept_estimate": np.nan,
-        "intercept_p_two_sided": np.nan,
-        "intercept_p_one_sided_less": np.nan,
-        "random_intercept_var": np.nan,
-        "subject_mean_diff": np.nan,
-        "fallback_wilcoxon_stat": np.nan,
-        "fallback_wilcoxon_p_less": np.nan,
-        "fallback_ttest_stat": np.nan,
-        "fallback_ttest_p_less": np.nan,
-        "supports_hypothesis": False,
-        "decision_label": "insufficient_data_fallback",
+    q1, q3 = np.percentile(values, [25.0, 75.0])
+    iqr = float(q3 - q1)
+    if not np.isfinite(iqr) or iqr <= 0.0:
+        return np.zeros(values.shape, dtype=bool)
+
+    lower = float(q1 - (float(iqr_multiplier) * iqr))
+    upper = float(q3 + (float(iqr_multiplier) * iqr))
+    return (values < lower) | (values > upper)
+
+
+def _build_pair_labels(metric_df):
+    if {"sub_tag", "ses", "run"}.issubset(metric_df.columns):
+        ses_values = pd.to_numeric(metric_df["ses"], errors="coerce").to_numpy(dtype=np.float64)
+        run_values = pd.to_numeric(metric_df["run"], errors="coerce").to_numpy(dtype=np.float64)
+        sub_values = metric_df["sub_tag"].astype(str).to_numpy()
+        labels = []
+        for sub_tag, ses_num, run_num in zip(sub_values, ses_values, run_values):
+            if np.isfinite(ses_num) and np.isfinite(run_num):
+                labels.append(f"{str(sub_tag)}_ses{int(ses_num)}_run{int(run_num)}")
+            else:
+                labels.append(f"{str(sub_tag)}_ses{ses_num}_run{run_num}")
+        return np.asarray(labels, dtype=str)
+
+    if "sub_tag" in metric_df.columns:
+        return metric_df["sub_tag"].astype(str).to_numpy()
+
+    return np.arange(len(metric_df)).astype(str)
+
+
+def _paired_outlier_filtered(values_a, values_b, labels=None, iqr_multiplier=3.0):
+    values_a = np.asarray(values_a, dtype=np.float64)
+    values_b = np.asarray(values_b, dtype=np.float64)
+    if values_a.shape != values_b.shape:
+        raise ValueError(
+            f"Paired arrays shape mismatch: {values_a.shape} vs {values_b.shape}."
+        )
+
+    if labels is None:
+        labels = np.arange(values_a.size).astype(str)
+    else:
+        labels = np.asarray(labels).astype(str)
+        if labels.shape != values_a.shape:
+            raise ValueError(
+                f"Paired labels shape mismatch: {labels.shape} vs {values_a.shape}."
+            )
+
+    paired_mask = np.isfinite(values_a) & np.isfinite(values_b)
+    paired_a = values_a[paired_mask]
+    paired_b = values_b[paired_mask]
+    paired_labels = labels[paired_mask]
+
+    if iqr_multiplier is None:
+        out_any = np.zeros(paired_a.shape, dtype=bool)
+    else:
+        out_a = _iqr_outlier_mask(paired_a, iqr_multiplier=iqr_multiplier)
+        out_b = _iqr_outlier_mask(paired_b, iqr_multiplier=iqr_multiplier)
+        out_any = out_a | out_b
+    keep_mask = ~out_any
+
+    return {
+        "input_paired_mask": paired_mask,
+        "paired_outlier_mask": out_any,
+        "paired_a_all": paired_a,
+        "paired_b_all": paired_b,
+        "paired_labels_all": paired_labels,
+        "paired_a_kept": paired_a[keep_mask],
+        "paired_b_kept": paired_b[keep_mask],
+        "paired_labels_kept": paired_labels[keep_mask],
+        "paired_labels_removed": paired_labels[out_any],
+        "n_pairs_total": int(paired_a.size),
+        "n_pairs_removed": int(np.count_nonzero(out_any)),
+        "n_pairs_kept": int(np.count_nonzero(keep_mask)),
     }
 
-    if diff.size < 2:
-        return result
 
-    result["subject_mean_diff"] = float(np.mean(diff))
-
-    try:
-        w_stat, w_p = wilcoxon(diff, alternative="less")
-        result["fallback_wilcoxon_stat"] = float(w_stat)
-        result["fallback_wilcoxon_p_less"] = float(w_p)
-    except ValueError:
-        pass
-
-    try:
-        t_res = ttest_1samp(diff, popmean=0.0, nan_policy="omit")
-        result["fallback_ttest_stat"] = float(t_res.statistic)
-        result["fallback_ttest_p_less"] = _one_sided_p_less_from_two_sided(
-            float(t_res.pvalue), float(t_res.statistic)
-        )
-    except TypeError:
-        t_res = ttest_1samp(diff, popmean=0.0)
-        result["fallback_ttest_stat"] = float(t_res.statistic)
-        result["fallback_ttest_p_less"] = _one_sided_p_less_from_two_sided(
-            float(t_res.pvalue), float(t_res.statistic)
+def _paired_tests_two_sided(values_a, values_b):
+    values_a = np.asarray(values_a, dtype=np.float64)
+    values_b = np.asarray(values_b, dtype=np.float64)
+    if values_a.shape != values_b.shape:
+        raise ValueError(
+            f"Paired arrays shape mismatch: {values_a.shape} vs {values_b.shape}."
         )
 
-    primary_p = result["fallback_wilcoxon_p_less"]
-    if not np.isfinite(primary_p):
-        primary_p = result["fallback_ttest_p_less"]
-    supports = bool(np.isfinite(primary_p) and primary_p < float(alpha))
-    result["supports_hypothesis"] = supports
-    result["decision_label"] = (
-        "support_H1_projection_less_subject_aggregate"
-        if supports
-        else "reject_H1_projection_less_subject_aggregate"
-    )
-    return result
+    row = {
+        "n_pairs": int(values_a.size),
+        "mean_diff_a_minus_b": np.nan,
+        "median_diff_a_minus_b": np.nan,
+        "ttest_stat": np.nan,
+        "ttest_p_two_sided": np.nan,
+        "wilcoxon_stat": np.nan,
+        "wilcoxon_p_two_sided": np.nan,
+    }
+    if values_a.size == 0:
+        return row
 
+    diff = values_a - values_b
+    row["mean_diff_a_minus_b"] = float(np.mean(diff))
+    row["median_diff_a_minus_b"] = float(np.median(diff))
 
-def fit_subject_median_log_ratio_mixedlm(comparison_df, alpha=0.05):
-    formula = "log_rel_diff_proj_minus_beh ~ C(ses) + C(run)"
-    fit_df = comparison_df[
-        ["sub_tag", "ses", "run", "log_rel_diff_proj_minus_beh"]
-    ].copy()
-    fit_df["sub_tag"] = fit_df["sub_tag"].astype(str)
-    fit_df["ses"] = pd.to_numeric(fit_df["ses"], errors="coerce")
-    fit_df["run"] = pd.to_numeric(fit_df["run"], errors="coerce")
-    fit_df["log_rel_diff_proj_minus_beh"] = pd.to_numeric(
-        fit_df["log_rel_diff_proj_minus_beh"], errors="coerce"
-    )
-
-    finite_mask = (
-        np.isfinite(fit_df["ses"].to_numpy(dtype=np.float64))
-        & np.isfinite(fit_df["run"].to_numpy(dtype=np.float64))
-        & np.isfinite(fit_df["log_rel_diff_proj_minus_beh"].to_numpy(dtype=np.float64))
-    )
-    fit_df = fit_df.loc[finite_mask].copy()
-
-    if fit_df.empty or fit_df["sub_tag"].nunique() < 2:
-        return _fallback_subject_aggregate_log_ratio(
-            fit_df,
-            alpha=alpha,
-            fit_error_chain="insufficient rows or subjects for mixed model",
-            n_rows_total=len(comparison_df),
-        )
-
-    optimizer_order = ["lbfgs", "powell", "cg", "nm"]
-    fit_errors = []
-    for optimizer in optimizer_order:
+    if values_a.size >= 2:
         try:
-            model = smf.mixedlm(formula, data=fit_df, groups=fit_df["sub_tag"])
-            fit_result = model.fit(reml=False, method=optimizer, disp=False)
-            intercept = float(fit_result.params.get("Intercept", np.nan))
-            p_two_sided = float(fit_result.pvalues.get("Intercept", np.nan))
-            p_less = _one_sided_p_less_from_two_sided(p_two_sided, intercept)
-            supports = bool(np.isfinite(p_less) and intercept < 0.0 and p_less < float(alpha))
+            t_res = ttest_rel(values_a, values_b, nan_policy="omit")
+        except TypeError:
+            t_res = ttest_rel(values_a, values_b)
+        row["ttest_stat"] = float(t_res.statistic)
+        row["ttest_p_two_sided"] = float(t_res.pvalue)
 
-            random_var = np.nan
-            if getattr(fit_result, "cov_re", None) is not None and fit_result.cov_re.size:
-                random_var = float(np.asarray(fit_result.cov_re)[0, 0])
+    if np.allclose(diff, 0.0):
+        row["wilcoxon_stat"] = 0.0
+        row["wilcoxon_p_two_sided"] = 1.0
+    else:
+        try:
+            w_res = wilcoxon(values_a, values_b, alternative="two-sided")
+            row["wilcoxon_stat"] = float(w_res.statistic)
+            row["wilcoxon_p_two_sided"] = float(w_res.pvalue)
+        except ValueError:
+            pass
+    return row
 
-            return {
-                "analysis_method": "mixedlm",
-                "model_formula": formula,
-                "optimizer_used": optimizer,
-                "converged": bool(getattr(fit_result, "converged", False)),
-                "mixedlm_error_chain": "",
-                "n_rows_total": int(len(comparison_df)),
-                "n_rows_used": int(len(fit_df)),
-                "n_subjects_used": int(fit_df["sub_tag"].nunique()),
-                "n_rows": int(len(fit_df)),
-                "n_subjects": int(fit_df["sub_tag"].nunique()),
-                "alpha": float(alpha),
-                "intercept_estimate": intercept,
-                "intercept_p_two_sided": p_two_sided,
-                "intercept_p_one_sided_less": p_less,
-                "random_intercept_var": random_var,
-                "subject_mean_diff": np.nan,
-                "fallback_wilcoxon_stat": np.nan,
-                "fallback_wilcoxon_p_less": np.nan,
-                "fallback_ttest_stat": np.nan,
-                "fallback_ttest_p_less": np.nan,
-                "supports_hypothesis": supports,
-                "decision_label": (
-                    "support_H1_projection_less_mixedlm"
-                    if supports
-                    else "reject_H1_projection_less_mixedlm"
+
+def _bootstrap_ci(values, statistic="mean", n_bootstrap=10000, ci_percent=95.0, random_seed=0):
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return np.nan, np.nan
+
+    ci_percent = float(ci_percent)
+    if not (0.0 < ci_percent < 100.0):
+        raise ValueError(f"ci_percent must be in (0, 100), got {ci_percent}.")
+
+    n_bootstrap = int(n_bootstrap)
+    if n_bootstrap <= 0:
+        raise ValueError(f"n_bootstrap must be > 0, got {n_bootstrap}.")
+
+    rng = np.random.default_rng(int(random_seed))
+    sample_idx = rng.integers(0, values.size, size=(n_bootstrap, values.size))
+    sampled = values[sample_idx]
+
+    statistic = str(statistic).lower()
+    if statistic == "mean":
+        boot_stats = np.mean(sampled, axis=1)
+    elif statistic == "median":
+        boot_stats = np.median(sampled, axis=1)
+    else:
+        raise ValueError(f"Unsupported bootstrap statistic '{statistic}'.")
+
+    alpha = 100.0 - ci_percent
+    lower_q = alpha / 2.0
+    upper_q = 100.0 - lower_q
+    return (
+        float(np.percentile(boot_stats, lower_q)),
+        float(np.percentile(boot_stats, upper_q)),
+    )
+
+
+def _paired_sign_flip_permutation_test(diff_values, n_permutations=20000, random_seed=0):
+    diff_values = np.asarray(diff_values, dtype=np.float64)
+    diff_values = diff_values[np.isfinite(diff_values)]
+    if diff_values.size == 0:
+        return np.nan, np.nan
+
+    observed = float(np.mean(diff_values))
+    n_permutations = int(n_permutations)
+    if n_permutations <= 0:
+        raise ValueError(f"n_permutations must be > 0, got {n_permutations}.")
+
+    rng = np.random.default_rng(int(random_seed))
+    signs = rng.choice(np.array([-1.0, 1.0]), size=(n_permutations, diff_values.size))
+    permuted_means = np.mean(signs * diff_values[None, :], axis=1)
+    p_two_sided = (
+        np.count_nonzero(np.abs(permuted_means) >= abs(observed)) + 1.0
+    ) / (n_permutations + 1.0)
+    return observed, float(p_two_sided)
+
+
+def compute_subject_projection_behavior_metrics(
+    run_segments,
+    behavior_root,
+    behavior_column,
+    excluded_run_keys=None,
+):
+    excluded_keys = set(excluded_run_keys or [])
+    rows = []
+    subject_keys = sorted(
+        {(str(segment["sub_tag"])) for segment in run_segments},
+        key=lambda sub: int(_extract_subject_digits(sub)),
+    )
+
+    for sub_tag in subject_keys:
+        subject_segments = [
+            segment for segment in run_segments if str(segment["sub_tag"]) == str(sub_tag)
+        ]
+        projection_chunks = []
+        behavior_chunks = []
+        n_runs = 0
+        n_trials_paired = 0
+        for segment in subject_segments:
+            run_key = (
+                str(segment["sub_tag"]),
+                int(segment["ses"]),
+                int(segment["run"]),
+            )
+            if run_key in excluded_keys:
+                continue
+
+            kept_projection, kept_behavior, _ = _load_run_kept_projection_behavior(
+                segment, behavior_root, behavior_column
+            )
+            finite_mask = np.isfinite(kept_projection) & np.isfinite(kept_behavior)
+            projection_values = kept_projection[finite_mask]
+            behavior_values = kept_behavior[finite_mask]
+            if projection_values.size == 0:
+                continue
+            projection_chunks.append(np.asarray(projection_values, dtype=np.float64))
+            behavior_chunks.append(np.asarray(behavior_values, dtype=np.float64))
+            n_trials_paired += int(projection_values.size)
+            n_runs += 1
+
+        if n_trials_paired == 0:
+            proj_values = np.asarray([], dtype=np.float64)
+            beh_values = np.asarray([], dtype=np.float64)
+        else:
+            proj_values = np.concatenate(projection_chunks, axis=0)
+            beh_values = np.concatenate(behavior_chunks, axis=0)
+
+        if proj_values.size == 0:
+            proj_mean = np.nan
+            proj_var = np.nan
+        else:
+            proj_mean = float(np.mean(proj_values))
+            proj_var = float(np.var(proj_values))
+        if beh_values.size == 0:
+            beh_mean = np.nan
+            beh_var = np.nan
+        else:
+            beh_mean = float(np.mean(beh_values))
+            beh_var = float(np.var(beh_values))
+
+        proj_mean_cv, proj_std, proj_cv = _coefficient_of_variation(proj_values)
+        beh_mean_cv, beh_std, beh_cv = _coefficient_of_variation(beh_values)
+
+        rows.append(
+            {
+                "sub_tag": str(sub_tag),
+                "n_runs_with_paired_trials": int(n_runs),
+                "n_trials_paired_finite": int(n_trials_paired),
+                "mean_projection": proj_mean,
+                "variance_projection": proj_var,
+                "std_projection": proj_std,
+                "cv_projection": proj_cv,
+                "mean_behavior_col2": beh_mean,
+                "variance_behavior_col2": beh_var,
+                "std_behavior_col2": beh_std,
+                "cv_behavior_col2": beh_cv,
+                "d_var_projection_minus_behavior": (
+                    float(proj_var - beh_var)
+                    if np.isfinite(proj_var) and np.isfinite(beh_var)
+                    else np.nan
+                ),
+                "d_cv_projection_minus_behavior": (
+                    float(proj_cv - beh_cv)
+                    if np.isfinite(proj_cv) and np.isfinite(beh_cv)
+                    else np.nan
                 ),
             }
-        except Exception as exc:  # noqa: BLE001
-            fit_errors.append(f"{optimizer}:{exc.__class__.__name__}:{exc}")
+        )
+    return pd.DataFrame(rows)
 
-    return _fallback_subject_aggregate_log_ratio(
-        fit_df,
-        alpha=alpha,
-        fit_error_chain=" | ".join(fit_errors),
-        n_rows_total=len(comparison_df),
+
+def identify_run_outliers(metric_df, projection_col, behavior_col, outlier_iqr_multiplier=3.0):
+    required_cols = {"sub_tag", "ses", "run", projection_col, behavior_col}
+    missing_cols = required_cols.difference(metric_df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns for run outlier identification: {sorted(missing_cols)}"
+        )
+
+    labels = _build_pair_labels(metric_df)
+    paired = _paired_outlier_filtered(
+        metric_df[projection_col].to_numpy(dtype=np.float64),
+        metric_df[behavior_col].to_numpy(dtype=np.float64),
+        labels=labels,
+        iqr_multiplier=outlier_iqr_multiplier,
     )
+
+    paired_rows = metric_df.loc[paired["input_paired_mask"], ["sub_tag", "ses", "run"]].copy()
+    paired_rows[projection_col] = paired["paired_a_all"]
+    paired_rows[behavior_col] = paired["paired_b_all"]
+    paired_rows["pair_label"] = paired["paired_labels_all"]
+    paired_rows["removed_outlier"] = paired["paired_outlier_mask"]
+
+    outlier_rows = paired_rows.loc[paired_rows["removed_outlier"]].copy()
+    outlier_keys = {
+        (str(row.sub_tag), int(row.ses), int(row.run))
+        for row in outlier_rows.itertuples(index=False)
+    }
+    return outlier_keys, paired_rows
 
 
 def _evaluate_density(values, x):
@@ -648,189 +796,367 @@ def plot_run_variance_density(run_df, out_path, grid_points=512):
     plt.close()
 
 
-def plot_scaled_variance_comparison_density(
-    comparison_df,
-    out_path,
-    grid_points=512,
-    tail_annotate_threshold=80.0,
-    mixedlm_stats=None,
-):
-    projection_raw = comparison_df["variance_projection"].to_numpy(dtype=np.float64)
-    behavior_raw = comparison_df["variance_behavior_col2"].to_numpy(dtype=np.float64)
-    tail_text = None
-    x_tail = None
-    y_tail = None
-    if tail_annotate_threshold is not None:
-        tail_threshold = float(tail_annotate_threshold)
-        outlier_mask = np.isfinite(behavior_raw) & (behavior_raw > tail_threshold)
-        if np.any(outlier_mask):
-            outlier_rows = comparison_df.loc[
-                outlier_mask, ["sub_tag", "ses", "run", "variance_behavior_col2"]
-            ].sort_values("variance_behavior_col2", ascending=False)
-            shown_rows = outlier_rows.head(3)
-            labels = []
-            for row in shown_rows.itertuples(index=False):
-                labels.append(
-                    f"{row.sub_tag} s{int(row.ses)} r{int(row.run)} beh={float(row.variance_behavior_col2):.6f}"
-                )
-            tail_text = "\n".join(labels)
-            if len(outlier_rows) > len(shown_rows):
-                tail_text += "\n..."
-            x_tail = float(np.max(behavior_raw[outlier_mask]))
+def _category_sort_key(value, category_name):
+    if str(category_name) == "sub_tag":
+        try:
+            return (0, int(_extract_subject_digits(value)))
+        except ValueError:
+            return (1, str(value))
+    try:
+        return (0, float(value))
+    except (TypeError, ValueError):
+        return (1, str(value))
 
-    projection_scale_factor = 1e7
-    projection_raw_scaled = projection_raw * projection_scale_factor
-    x_proj = _density_grid(projection_raw_scaled, grid_points=grid_points, fallback_pad=1e-6)
-    proj_raw_density = _evaluate_density(projection_raw_scaled, x_proj)
 
-    x_beh = _density_grid(behavior_raw, grid_points=grid_points, fallback_pad=1e-6)
-    beh_raw_density = _evaluate_density(behavior_raw, x_beh)
+def _build_category_color_map(values, category_name):
+    unique_values = sorted(
+        {value for value in values},
+        key=lambda value: _category_sort_key(value, category_name),
+    )
+    n_values = len(unique_values)
+    if n_values == 0:
+        return {}, []
 
-    fig, axes = plt.subplots(1, 3, figsize=(17, 4.8))
-    ax0, ax1, ax2 = axes
+    if str(category_name) == "ses":
+        session_colors = [
+            "tab:blue",
+            "tab:orange",
+            "tab:green",
+            "tab:red",
+            "tab:purple",
+            "tab:brown",
+        ]
+        color_map = {
+            value: session_colors[idx % len(session_colors)]
+            for idx, value in enumerate(unique_values)
+        }
+        return color_map, unique_values
 
-    ax0.plot(x_proj, proj_raw_density, color="tab:blue", linewidth=2.0)
-    ax0.fill_between(x_proj, proj_raw_density, alpha=0.2, color="tab:blue")
-    ax0.set_xlabel("Projection variance")
-    ax0.set_ylabel("Probability density")
-    ax0.set_title("1) Projection var")
+    if n_values <= 10:
+        cmap = plt.get_cmap("tab10", n_values)
+    elif n_values <= 20:
+        cmap = plt.get_cmap("tab20", n_values)
+    else:
+        cmap = plt.get_cmap("gist_ncar", n_values)
 
-    ax1.plot(x_beh, beh_raw_density, color="tab:orange", linewidth=2.0)
-    ax1.fill_between(x_beh, beh_raw_density, alpha=0.2, color="tab:orange")
-    ax1.set_xlabel("Behavior variance")
-    ax1.set_ylabel("Probability density")
-    ax1.set_title("2) Behavior var")
+    color_map = {value: cmap(idx) for idx, value in enumerate(unique_values)}
+    return color_map, unique_values
 
-    if tail_text is not None and x_tail is not None:
-        y_tail = float(np.interp(x_tail, x_beh, beh_raw_density))
-        ax1.annotate(
-            tail_text,
-            xy=(x_tail, y_tail),
-            xytext=(0, 22),
-            textcoords="offset points",
-            va="bottom",
-            ha="center",
-            fontsize=8,
-            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.9, "edgecolor": "0.6"},
-            arrowprops={"arrowstyle": "->", "lw": 0.8, "color": "0.35"},
+
+def _build_paired_metric_zscore_df(metric_df, projection_col, behavior_col):
+    required_cols = {"sub_tag", "ses", "run", projection_col, behavior_col}
+    missing_cols = required_cols.difference(metric_df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns for paired z-score plot: {sorted(missing_cols)}"
         )
 
-    paired_projection_log = comparison_df[
-        "log_variance_projection_rel_subject_median"
-    ].to_numpy(dtype=np.float64)
-    paired_behavior_log = comparison_df[
-        "log_variance_behavior_rel_subject_median"
-    ].to_numpy(dtype=np.float64)
-    paired_mask = np.isfinite(paired_projection_log) & np.isfinite(paired_behavior_log)
-    paired_projection_log = paired_projection_log[paired_mask]
-    paired_behavior_log = paired_behavior_log[paired_mask]
-    if paired_projection_log.size == 0:
+    projection_z = _scale_values(
+        metric_df[projection_col].to_numpy(dtype=np.float64),
+        method="zscore",
+    )
+    behavior_z = _scale_values(
+        metric_df[behavior_col].to_numpy(dtype=np.float64),
+        method="zscore",
+    )
+    paired_mask = np.isfinite(projection_z) & np.isfinite(behavior_z)
+    if not np.any(paired_mask):
         raise RuntimeError(
-            "No finite subject-median normalized log-variance pairs available for subplot 3."
+            f"No paired finite values for {projection_col} and {behavior_col}."
         )
 
-    log_all = np.concatenate([paired_projection_log, paired_behavior_log])
-    x_log = _density_grid(log_all, grid_points=grid_points, fallback_pad=1e-6)
-    proj_log_density = _evaluate_density(paired_projection_log, x_log)
-    beh_log_density = _evaluate_density(paired_behavior_log, x_log)
+    paired_df = metric_df.loc[paired_mask, ["sub_tag", "ses", "run"]].copy()
+    paired_df = paired_df.reset_index(drop=True)
+    paired_df["projection_z"] = projection_z[paired_mask]
+    paired_df["behavior_z"] = behavior_z[paired_mask]
+    return paired_df
 
-    ax2.plot(
-        x_log,
-        proj_log_density,
-        color="tab:blue",
-        linewidth=2.0,
+
+def _plot_paired_box_with_connections(
+    ax,
+    paired_df,
+    group_col,
+    color_map,
+    jitter_seed=0,
+):
+    behavior_values = paired_df["behavior_z"].to_numpy(dtype=np.float64)
+    projection_values = paired_df["projection_z"].to_numpy(dtype=np.float64)
+    group_values = paired_df[group_col].tolist()
+
+    box_parts = ax.boxplot(
+        [behavior_values, projection_values],
+        positions=[0.0, 1.0],
+        widths=0.52,
+        patch_artist=True,
+        showfliers=False,
+        zorder=1,
     )
-    ax2.fill_between(x_log, proj_log_density, alpha=0.18, color="tab:blue")
-    ax2.plot(
-        x_log,
-        beh_log_density,
-        color="tab:orange",
-        linewidth=2.0,
-        linestyle="--",
+    for box_patch in box_parts["boxes"]:
+        box_patch.set(facecolor="0.94", edgecolor="0.35", linewidth=1.1)
+    for whisker in box_parts["whiskers"]:
+        whisker.set(color="0.4", linewidth=1.0)
+    for cap in box_parts["caps"]:
+        cap.set(color="0.4", linewidth=1.0)
+    for median in box_parts["medians"]:
+        median.set(color="0.1", linewidth=1.5)
+
+    rng = np.random.default_rng(int(jitter_seed))
+    jitter = rng.uniform(-0.06, 0.06, size=behavior_values.size)
+    x_behavior = jitter
+    x_projection = 1.0 + jitter
+
+    for x0, x1, y0, y1, group_value in zip(
+        x_behavior,
+        x_projection,
+        behavior_values,
+        projection_values,
+        group_values,
+    ):
+        color = color_map[group_value]
+        ax.plot(
+            [x0, x1],
+            [y0, y1],
+            color=color,
+            linewidth=1.0,
+            alpha=0.45,
+            zorder=2,
+        )
+        ax.scatter(
+            [x0, x1],
+            [y0, y1],
+            s=26,
+            color=color,
+            alpha=0.9,
+            edgecolors="white",
+            linewidths=0.35,
+            zorder=3,
+        )
+
+    ax.set_xlim(-0.45, 1.45)
+    ax.set_xticks([0.0, 1.0])
+    ax.set_xticklabels(["Behavior variability", "BOLD variability"])
+    ax.grid(axis="y", linestyle=":", linewidth=0.8, alpha=0.5)
+
+
+def _add_category_legend(ax, color_map, category_values, title):
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="",
+            markerfacecolor=color_map[value],
+            markeredgecolor="0.25",
+            markersize=5.5,
+            label=str(value),
+        )
+        for value in category_values
+    ]
+    if not handles:
+        return
+
+    ncol = 1
+    if len(handles) > 14:
+        ncol = 2
+    if len(handles) > 28:
+        ncol = 3
+
+    legend = ax.legend(
+        handles=handles,
+        title=str(title),
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.0),
+        fontsize=7.5,
+        title_fontsize=8.5,
+        frameon=True,
+        ncol=ncol,
+        borderaxespad=0.0,
     )
-    ax2.fill_between(x_log, beh_log_density, alpha=0.18, color="tab:orange")
-    ax2.set_xlabel("log(variance / subject median)")
-    ax2.set_ylabel("Probability density")
-    ax2.set_title("3) Subject-median log-rel comparison")
+    legend.get_frame().set_alpha(0.95)
 
-    stat_line = ""
-    if mixedlm_stats is not None and mixedlm_stats.get("analysis_method") == "mixedlm":
-        pval = float(mixedlm_stats.get("intercept_p_one_sided_less", np.nan))
-        p_text = f"{pval:.3g}" if np.isfinite(pval) else "nan"
-        stat_line = f"p(one-sided,<0)={p_text}"
 
-    ax2.text(
-        0.98,
-        0.98,
-        stat_line,
-        transform=ax2.transAxes,
-        va="top",
-        ha="right",
-        fontsize=8,
-        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.7"},
+def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
+    required_cols = {
+        "sub_tag",
+        "ses",
+        "run",
+        "variance_projection",
+        "variance_behavior_col2",
+        "cv_projection",
+        "cv_behavior_col2",
+    }
+    missing_cols = required_cols.difference(metric_df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns for 3x2 variance/CV plot: {sorted(missing_cols)}"
+        )
+
+    variance_df = _build_paired_metric_zscore_df(
+        metric_df=metric_df,
+        projection_col="variance_projection",
+        behavior_col="variance_behavior_col2",
+    )
+    cv_df = _build_paired_metric_zscore_df(
+        metric_df=metric_df,
+        projection_col="cv_projection",
+        behavior_col="cv_behavior_col2",
     )
 
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=200)
+    column_defs = [
+        ("Z-scored variance", variance_df),
+        ("Z-scored CV", cv_df),
+    ]
+    row_defs = [
+        ("sub_tag", "Subject colors", "Subject"),
+        ("ses", "Session colors", "Session"),
+        ("run", "Run colors", "Run"),
+    ]
+
+    column_limits = []
+    for _, metric_col_df in column_defs:
+        column_values = np.concatenate(
+            [
+                metric_col_df["behavior_z"].to_numpy(dtype=np.float64),
+                metric_col_df["projection_z"].to_numpy(dtype=np.float64),
+            ]
+        )
+        finite_values = column_values[np.isfinite(column_values)]
+        if finite_values.size == 0:
+            column_limits.append((-1.0, 1.0))
+            continue
+        col_min = float(np.min(finite_values))
+        col_max = float(np.max(finite_values))
+        col_span = col_max - col_min
+        pad = 0.08 * col_span if col_span > 0 else 0.5
+        column_limits.append((col_min - pad, col_max + pad))
+
+    fig, axes = plt.subplots(3, 2, figsize=(16.0, 13.2))
+    for row_idx, (group_col, row_title, legend_title) in enumerate(row_defs):
+        for col_idx, (column_title, metric_col_df) in enumerate(column_defs):
+            ax = axes[row_idx, col_idx]
+            color_map, category_values = _build_category_color_map(
+                metric_col_df[group_col].tolist(),
+                category_name=group_col,
+            )
+            _plot_paired_box_with_connections(
+                ax=ax,
+                paired_df=metric_col_df,
+                group_col=group_col,
+                color_map=color_map,
+                jitter_seed=111 + 17 * row_idx + 29 * col_idx,
+            )
+            ax.set_ylim(column_limits[col_idx])
+            ax.set_title(f"{row_title} | {column_title}", fontsize=11.0)
+            if col_idx == 0:
+                ax.set_ylabel("Z-score")
+            if col_idx == 1:
+                _add_category_legend(
+                    ax=ax,
+                    color_map=color_map,
+                    category_values=category_values,
+                    title=legend_title,
+                )
+
+    fig.suptitle(
+        "Behavior vs BOLD variability across all sub/ses/run pairs (outliers included)",
+        fontsize=13.0,
+    )
+    fig.tight_layout(rect=(0.0, 0.0, 0.82, 0.965))
+    fig.savefig(out_path, dpi=220)
     plt.close(fig)
 
 
-def plot_sub_ses_run_cv_comparison(run_cv_df, out_path, grid_points=512):
-    projection_cv = run_cv_df["cv_projection"].to_numpy(dtype=np.float64)
-    behavior_cv = run_cv_df["cv_behavior_col2"].to_numpy(dtype=np.float64)
+def _plot_subject_metric_comparison(
+    subject_metrics_df,
+    projection_col,
+    behavior_col,
+    metric_label,
+    out_path,
+    outlier_iqr_multiplier=3.0,
+    projection_plot_scale=1.0,
+    grid_points=512,
+    use_2x2_layout=False,
+    z_text_projection_col=None,
+    z_text_behavior_col=None,
+):
+    projection_values = subject_metrics_df[projection_col].to_numpy(dtype=np.float64)
+    behavior_values = subject_metrics_df[behavior_col].to_numpy(dtype=np.float64)
+    subject_labels = _build_pair_labels(subject_metrics_df)
 
-    finite_proj = projection_cv[np.isfinite(projection_cv)]
-    finite_beh = behavior_cv[np.isfinite(behavior_cv)]
-    paired_mask_raw = np.isfinite(projection_cv) & np.isfinite(behavior_cv)
-    paired_proj_raw = projection_cv[paired_mask_raw]
-    paired_beh_raw = behavior_cv[paired_mask_raw]
-
+    finite_proj = projection_values[np.isfinite(projection_values)]
+    finite_beh = behavior_values[np.isfinite(behavior_values)]
     if finite_proj.size == 0:
-        raise RuntimeError("No finite sub/ses/run projection CV values available to plot.")
+        raise RuntimeError(f"No finite subject-level projection {metric_label} values.")
     if finite_beh.size == 0:
-        raise RuntimeError("No finite sub/ses/run behavior CV values available to plot.")
-    if paired_proj_raw.size == 0:
-        raise RuntimeError("No finite paired sub/ses/run raw CV values available to plot.")
+        raise RuntimeError(f"No finite subject-level behavior {metric_label} values.")
 
-    x_proj = _density_grid(finite_proj, grid_points=grid_points, fallback_pad=1e-6)
-    proj_density = _evaluate_density(finite_proj, x_proj)
+    paired = _paired_outlier_filtered(
+        projection_values,
+        behavior_values,
+        labels=subject_labels,
+        iqr_multiplier=outlier_iqr_multiplier,
+    )
+    if paired["n_pairs_kept"] == 0:
+        raise RuntimeError(
+            f"No paired subject-level {metric_label} values after outlier filtering."
+        )
+
+    tests = _paired_tests_two_sided(paired["paired_a_kept"], paired["paired_b_kept"])
+
+    base_cols = [col for col in ("sub_tag", "ses", "run") if col in subject_metrics_df.columns]
+    if base_cols:
+        paired_table = subject_metrics_df.loc[paired["input_paired_mask"], base_cols].copy()
+        paired_table = paired_table.reset_index(drop=True)
+    else:
+        paired_table = pd.DataFrame(index=np.arange(paired["paired_a_all"].size))
+    paired_table["pair_label"] = paired["paired_labels_all"]
+    paired_table[projection_col] = paired["paired_a_all"]
+    paired_table[behavior_col] = paired["paired_b_all"]
+    paired_table["removed_outlier"] = paired["paired_outlier_mask"]
+
+    projection_plot_values = finite_proj * float(projection_plot_scale)
+    x_proj = _density_grid(projection_plot_values, grid_points=grid_points, fallback_pad=1e-6)
+    proj_density = _evaluate_density(projection_plot_values, x_proj)
+
     x_beh = _density_grid(finite_beh, grid_points=grid_points, fallback_pad=1e-6)
     beh_density = _evaluate_density(finite_beh, x_beh)
 
-    fig, axes = plt.subplots(2, 2, figsize=(13.5, 10.5))
-    ax0, ax1 = axes[0]
-    ax2, ax3 = axes[1]
+    proj_z = _scale_values(paired["paired_a_kept"], method="zscore")
+    beh_z = _scale_values(paired["paired_b_kept"], method="zscore")
+    z_all = np.concatenate([proj_z, beh_z])
+    x_z = _density_grid(z_all, grid_points=grid_points, fallback_pad=1e-6)
+    proj_z_density = _evaluate_density(proj_z, x_z)
+    beh_z_density = _evaluate_density(beh_z, x_z)
+
+    if bool(use_2x2_layout):
+        fig, axes = plt.subplots(2, 2, figsize=(13.5, 9.2))
+        ax0, ax1, ax2, ax3 = axes.ravel()
+    else:
+        fig, axes = plt.subplots(1, 3, figsize=(16.5, 4.8))
+        ax0, ax1, ax2 = axes
+        ax3 = None
 
     ax0.plot(x_proj, proj_density, color="tab:blue", linewidth=2.0)
     ax0.fill_between(x_proj, proj_density, alpha=0.2, color="tab:blue")
-    ax0.set_xlabel("CV projection")
+    proj_xlabel = f"Projection {metric_label}"
+    if not np.isclose(projection_plot_scale, 1.0):
+        proj_xlabel += f" (x{projection_plot_scale:.0e})"
+    ax0.set_xlabel(proj_xlabel)
     ax0.set_ylabel("Probability density")
-    ax0.set_title("CV projection")
+    ax0.set_title(f"1) Projection {metric_label}")
 
     ax1.plot(x_beh, beh_density, color="tab:orange", linewidth=2.0)
     ax1.fill_between(x_beh, beh_density, alpha=0.2, color="tab:orange")
-    ax1.set_xlabel("CV behavior")
+    ax1.set_xlabel(f"Behavior {metric_label}")
     ax1.set_ylabel("Probability density")
-    ax1.set_title("CV behaviour")
+    ax1.set_title(f"2) Behavior {metric_label}")
 
-    paired_proj_z = _scale_values(paired_proj_raw, method="zscore")
-    paired_beh_z = _scale_values(paired_beh_raw, method="zscore")
-    paired_z_mask = np.isfinite(paired_proj_z) & np.isfinite(paired_beh_z)
-    paired_proj_z = paired_proj_z[paired_z_mask]
-    paired_beh_z = paired_beh_z[paired_z_mask]
-    if paired_proj_z.size == 0:
-        raise RuntimeError("No finite paired z-scored CV values available to plot.")
-
-    z_combined = np.concatenate([paired_proj_z, paired_beh_z])
-    x_z = _density_grid(z_combined, grid_points=grid_points, fallback_pad=1e-6)
-    proj_z_density = _evaluate_density(paired_proj_z, x_z)
-    beh_z_density = _evaluate_density(paired_beh_z, x_z)
     ax2.plot(
         x_z,
         proj_z_density,
         color="tab:blue",
         linewidth=2.0,
-        label="CV projection (z-score)",
+        label=f"Projection {metric_label} (z)",
     )
     ax2.fill_between(x_z, proj_z_density, alpha=0.15, color="tab:blue")
     ax2.plot(
@@ -839,114 +1165,317 @@ def plot_sub_ses_run_cv_comparison(run_cv_df, out_path, grid_points=512):
         color="tab:orange",
         linewidth=2.0,
         linestyle="--",
-        label="CV behavior (z-score)",
+        label=f"Behavior {metric_label} (z)",
     )
     ax2.fill_between(x_z, beh_z_density, alpha=0.15, color="tab:orange")
     ax2.axvline(0.0, color="0.35", linewidth=1.0, linestyle=":")
-    ax2.set_xlabel("Z-scored CV (within each metric)")
+    ax2.set_xlabel(f"Z-scored {metric_label} (within metric)")
     ax2.set_ylabel("Probability density")
-    ax2.set_title("3) Z-scored CV comparsion")
+    ax2.set_title(f"3) Z-scored {metric_label} + paired tests")
     ax2.legend(fontsize=8, loc="upper right")
 
-    w_stat = np.nan
-    w_p_less = np.nan
-    try:
-        w_res = wilcoxon(paired_proj_z, paired_beh_z, alternative="less")
-        w_stat = float(w_res.statistic)
-        w_p_less = float(w_res.pvalue)
-    except ValueError:
-        pass
-
-    t_stat = np.nan
-    t_p_less = np.nan
-    try:
-        t_res = ttest_rel(paired_proj_z, paired_beh_z, nan_policy="omit")
-        t_stat = float(t_res.statistic)
-        t_p_less = _one_sided_p_less_from_two_sided(float(t_res.pvalue), t_stat)
-    except TypeError:
-        # SciPy fallback without nan_policy in very old versions
-        t_res = ttest_rel(paired_proj_z, paired_beh_z)
-        t_stat = float(t_res.statistic)
-        t_p_less = _one_sided_p_less_from_two_sided(float(t_res.pvalue), t_stat)
+    removed_labels = paired_table.loc[paired_table["removed_outlier"], "pair_label"].astype(str).tolist()
 
     stats_text = (
-        f"Wilcoxon p(<0)={w_p_less:.3g}, W={w_stat:.3g}\n"
-        f"paired t-test p(<0)={t_p_less:.3g}, t={t_stat:.3g}"
+        f"paired t p(two-sided)={tests['ttest_p_two_sided']:.3g}, t={tests['ttest_stat']:.3g}\n"
+        f"Wilcoxon p(two-sided)={tests['wilcoxon_p_two_sided']:.3g}, W={tests['wilcoxon_stat']:.3g}"
     )
     ax2.text(
         0.98,
-        0.50,
+        0.52,
         stats_text,
         transform=ax2.transAxes,
         va="center",
         ha="right",
         fontsize=8,
-        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.7"},
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88, "edgecolor": "0.7"},
     )
 
-    ax3.scatter(
-        paired_beh_raw,
-        paired_proj_raw,
-        s=30,
-        alpha=0.8,
+    if ax3 is not None:
+        ax3.scatter(
+            beh_z,
+            proj_z,
+            s=36,
+            alpha=0.85,
+            color="tab:green",
+            edgecolors="none",
+        )
+        z_min = float(np.min(np.concatenate([beh_z, proj_z])))
+        z_max = float(np.max(np.concatenate([beh_z, proj_z])))
+        z_span = z_max - z_min
+        z_pad = 0.06 * z_span if z_span > 0 else 0.05
+        line_min = z_min - z_pad
+        line_max = z_max + z_pad
+        ax3.plot(
+            [line_min, line_max],
+            [line_min, line_max],
+            color="0.25",
+            linestyle="--",
+            linewidth=1.2,
+        )
+        ax3.set_xlim(line_min, line_max)
+        ax3.set_ylim(line_min, line_max)
+        ax3.set_xlabel(f"Z-scored behavior {metric_label}")
+        ax3.set_ylabel(f"Z-scored projection {metric_label}")
+        ax3.set_title(f"4) Z-scored {metric_label} scatter")
+
+        text_projection_col = z_text_projection_col or projection_col
+        text_behavior_col = z_text_behavior_col or behavior_col
+        text_diff_mean = np.nan
+        text_diff_median = np.nan
+        if (
+            text_projection_col in subject_metrics_df.columns
+            and text_behavior_col in subject_metrics_df.columns
+        ):
+            text_paired = _paired_outlier_filtered(
+                subject_metrics_df[text_projection_col].to_numpy(dtype=np.float64),
+                subject_metrics_df[text_behavior_col].to_numpy(dtype=np.float64),
+                labels=subject_labels,
+                iqr_multiplier=outlier_iqr_multiplier,
+            )
+            if text_paired["n_pairs_kept"] > 0:
+                text_diff = text_paired["paired_a_kept"] - text_paired["paired_b_kept"]
+                text_diff_mean = float(np.mean(text_diff))
+                text_diff_median = float(np.median(text_diff))
+
+        if np.isfinite(text_diff_mean):
+            z_diff_text = (
+                f"mean({text_projection_col}-\n{text_behavior_col}) = {text_diff_mean:.3g}\n"
+                f"median = {text_diff_median:.3g}"
+            )
+        else:
+            z_diff_text = (
+                f"mean({text_projection_col}-\n{text_behavior_col}) = NaN"
+            )
+        ax3.text(
+            0.98,
+            0.06,
+            z_diff_text,
+            transform=ax3.transAxes,
+            va="bottom",
+            ha="right",
+            fontsize=8,
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88, "edgecolor": "0.7"},
+        )
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+    summary_row = {
+        "metric": str(metric_label),
+        "n_pairs_total": int(paired["n_pairs_total"]),
+        "n_pairs_removed_outlier": int(paired["n_pairs_removed"]),
+        "n_pairs_used": int(paired["n_pairs_kept"]),
+        "removed_subjects": ";".join(removed_labels),
+        "mean_diff_projection_minus_behavior": float(tests["mean_diff_a_minus_b"]),
+        "median_diff_projection_minus_behavior": float(tests["median_diff_a_minus_b"]),
+        "ttest_stat": float(tests["ttest_stat"]),
+        "ttest_p_two_sided": float(tests["ttest_p_two_sided"]),
+        "wilcoxon_stat": float(tests["wilcoxon_stat"]),
+        "wilcoxon_p_two_sided": float(tests["wilcoxon_p_two_sided"]),
+    }
+    return summary_row, paired_table
+
+
+def plot_scaled_variance_comparison_density(
+    subject_metrics_df,
+    out_path,
+    grid_points=512,
+    outlier_iqr_multiplier=3.0,
+):
+    return _plot_subject_metric_comparison(
+        subject_metrics_df=subject_metrics_df,
+        projection_col="variance_projection",
+        behavior_col="variance_behavior_col2",
+        metric_label="variance",
+        out_path=out_path,
+        outlier_iqr_multiplier=outlier_iqr_multiplier,
+        projection_plot_scale=1e7,
+        grid_points=grid_points,
+        use_2x2_layout=True,
+        z_text_projection_col="cv_projection",
+        z_text_behavior_col="cv_behavior_col2",
+    )
+
+
+def plot_sub_ses_run_cv_comparison(
+    subject_metrics_df,
+    out_path,
+    grid_points=512,
+    outlier_iqr_multiplier=3.0,
+):
+    return _plot_subject_metric_comparison(
+        subject_metrics_df=subject_metrics_df,
+        projection_col="cv_projection",
+        behavior_col="cv_behavior_col2",
+        metric_label="CV",
+        out_path=out_path,
+        outlier_iqr_multiplier=outlier_iqr_multiplier,
+        projection_plot_scale=1.0,
+        grid_points=grid_points,
+        use_2x2_layout=True,
+    )
+
+
+def analyze_subject_cv_difference(
+    metric_df,
+    out_path,
+    outlier_iqr_multiplier=3.0,
+    n_permutations=20000,
+    n_bootstrap=10000,
+    bootstrap_ci_percent=95.0,
+    random_seed=0,
+    grid_points=512,
+):
+    cv_projection = metric_df["cv_projection"].to_numpy(dtype=np.float64)
+    cv_behavior = metric_df["cv_behavior_col2"].to_numpy(dtype=np.float64)
+    subject_labels = _build_pair_labels(metric_df)
+
+    paired = _paired_outlier_filtered(
+        cv_projection,
+        cv_behavior,
+        labels=subject_labels,
+        iqr_multiplier=outlier_iqr_multiplier,
+    )
+    if paired["n_pairs_kept"] == 0:
+        raise RuntimeError("No paired subject CV values after outlier filtering.")
+
+    d_s = paired["paired_a_kept"] - paired["paired_b_kept"]
+    d_mean = float(np.mean(d_s))
+    d_median = float(np.median(d_s))
+
+    perm_observed_mean, perm_p_two_sided = _paired_sign_flip_permutation_test(
+        d_s,
+        n_permutations=n_permutations,
+        random_seed=random_seed,
+    )
+    mean_ci_low, mean_ci_high = _bootstrap_ci(
+        d_s,
+        statistic="mean",
+        n_bootstrap=n_bootstrap,
+        ci_percent=bootstrap_ci_percent,
+        random_seed=random_seed,
+    )
+    median_ci_low, median_ci_high = _bootstrap_ci(
+        d_s,
+        statistic="median",
+        n_bootstrap=n_bootstrap,
+        ci_percent=bootstrap_ci_percent,
+        random_seed=int(random_seed) + 1,
+    )
+
+    paired_cv_df = pd.DataFrame(
+        index=np.arange(paired["paired_a_all"].size)
+    )
+    base_cols = [col for col in ("sub_tag", "ses", "run") if col in metric_df.columns]
+    if base_cols:
+        paired_cv_df = metric_df.loc[paired["input_paired_mask"], base_cols].copy()
+        paired_cv_df = paired_cv_df.reset_index(drop=True)
+    paired_cv_df["pair_label"] = paired["paired_labels_all"]
+    paired_cv_df["cv_projection"] = paired["paired_a_all"]
+    paired_cv_df["cv_behavior_col2"] = paired["paired_b_all"]
+    paired_cv_df["removed_outlier"] = paired["paired_outlier_mask"]
+    paired_cv_df["d_s_projection_minus_behavior"] = (
+        paired_cv_df["cv_projection"] - paired_cv_df["cv_behavior_col2"]
+    )
+    paired_cv_df.loc[paired_cv_df["removed_outlier"], "d_s_projection_minus_behavior"] = np.nan
+
+    fig, axes = plt.subplots(1, 2, figsize=(12.0, 5.0))
+    ax1, ax2 = axes
+
+    proj_cv_kept = paired["paired_a_kept"]
+    beh_cv_kept = paired["paired_b_kept"]
+    if proj_cv_kept.size == 0 or beh_cv_kept.size == 0:
+        raise RuntimeError("No finite paired CV values after outlier filtering.")
+
+    x_ds = _density_grid(d_s, grid_points=grid_points, fallback_pad=1e-6)
+    ds_density = _evaluate_density(d_s, x_ds)
+    ax1.plot(x_ds, ds_density, color="tab:green", linewidth=2.0)
+    ax1.fill_between(x_ds, ds_density, alpha=0.2, color="tab:green")
+    ax1.axvline(0.0, color="0.35", linewidth=1.0, linestyle=":")
+    ax1.axvline(d_mean, color="black", linewidth=1.2, linestyle="-", label="mean")
+    ax1.axvline(d_median, color="black", linewidth=1.2, linestyle="--", label="median")
+    ax1.set_xlabel("d_s = CV projection - CV behavior")
+    ax1.set_ylabel("Probability density")
+    ax1.set_title("1) d_s distribution")
+    ax1.legend(fontsize=8, loc="upper right")
+
+    ax2.scatter(
+        beh_cv_kept,
+        proj_cv_kept,
+        s=36,
+        alpha=0.85,
         color="tab:blue",
         edgecolors="none",
     )
-    ax3.set_xlabel("CV behavior")
-    ax3.set_ylabel("CV projection")
-    ax3.set_title("4) Sub/ses/run CV scatter")
+    scatter_x_kept = beh_cv_kept
+    scatter_y_kept = proj_cv_kept
+    xy_min = float(np.min(np.concatenate([scatter_x_kept, scatter_y_kept])))
+    xy_max = float(np.max(np.concatenate([scatter_x_kept, scatter_y_kept])))
+    xy_span = xy_max - xy_min
+    pad = 0.06 * xy_span if xy_span > 0 else 0.05
+    line_min = xy_min - pad
+    line_max = xy_max + pad
+    ax2.plot(
+        [line_min, line_max],
+        [line_min, line_max],
+        color="0.25",
+        linestyle="--",
+        linewidth=1.2,
+    )
+    ax2.set_xlim(line_min, line_max)
+    ax2.set_ylim(line_min, line_max)
+    ax2.set_xlabel("CV behavior")
+    ax2.set_ylabel("CV projection")
+    ax2.set_title("2) Paired scatter (raw CV)")
 
-    r2 = np.nan
-    if paired_proj_raw.size >= 2:
-        corr = float(np.corrcoef(paired_beh_raw, paired_proj_raw)[0, 1])
-        if np.unique(paired_beh_raw).size >= 2:
-            slope, intercept = np.polyfit(paired_beh_raw, paired_proj_raw, 1)
-            x_line = np.linspace(
-                float(np.min(paired_beh_raw)),
-                float(np.max(paired_beh_raw)),
-                100,
-            )
-            y_line = (slope * x_line) + intercept
-            ax3.plot(
-                x_line,
-                y_line,
-                color="crimson",
-                linewidth=1.6,
-                linestyle="--",
-            )
-            fitted = (slope * paired_beh_raw) + intercept
-            ss_res = float(np.sum((paired_proj_raw - fitted) ** 2))
-            ss_tot = float(np.sum((paired_proj_raw - np.mean(paired_proj_raw)) ** 2))
-            if ss_tot > 0:
-                r2 = 1.0 - (ss_res / ss_tot)
-        if not np.isfinite(r2) and np.isfinite(corr):
-            r2 = float(corr**2)
-    else:
-        corr = np.nan
-
-    stats_items = [f"n={paired_proj_raw.size}"]
-    stats_items.append(f"r={corr:.3f}" if np.isfinite(corr) else "r=nan")
-    stats_items.append(f"R^2={r2:.3f}" if np.isfinite(r2) else "R^2=nan")
-    corr_text = ", ".join(stats_items)
-    ax3.text(
+    removed_labels = paired_cv_df.loc[paired_cv_df["removed_outlier"], "pair_label"].astype(str).tolist()
+    stats_text = (
+        f"mean(d_s)={d_mean:.3g}, median(d_s)={d_median:.3g}\n"
+        f"Sign-flip permutation p(two-sided)={perm_p_two_sided:.3g}\n"
+        f"{bootstrap_ci_percent:.0f}% CI mean=[{mean_ci_low:.3g}, {mean_ci_high:.3g}]\n"
+        f"{bootstrap_ci_percent:.0f}% CI median=[{median_ci_low:.3g}, {median_ci_high:.3g}]"
+    )
+    ax1.text(
         0.98,
-        0.98,
-        corr_text,
-        transform=ax3.transAxes,
-        va="top",
+        0.50,
+        stats_text,
+        transform=ax1.transAxes,
+        va="center",
         ha="right",
         fontsize=8,
-        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.7"},
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.9, "edgecolor": "0.7"},
     )
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
 
+    stats_row = {
+        "n_pairs_total": int(paired["n_pairs_total"]),
+        "n_pairs_removed_outlier": int(paired["n_pairs_removed"]),
+        "n_pairs_used": int(paired["n_pairs_kept"]),
+        "removed_subjects": ";".join(removed_labels),
+        "mean_d_s_projection_minus_behavior": d_mean,
+        "median_d_s_projection_minus_behavior": d_median,
+        "perm_observed_mean": float(perm_observed_mean),
+        "perm_p_two_sided": float(perm_p_two_sided),
+        "bootstrap_ci_percent": float(bootstrap_ci_percent),
+        "bootstrap_mean_ci_low": float(mean_ci_low),
+        "bootstrap_mean_ci_high": float(mean_ci_high),
+        "bootstrap_median_ci_low": float(median_ci_low),
+        "bootstrap_median_ci_high": float(median_ci_high),
+        "n_permutations": int(n_permutations),
+        "n_bootstrap": int(n_bootstrap),
+        "random_seed": int(random_seed),
+    }
+    return stats_row, paired_cv_df
+
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--projection-path", default="/home/zkavian/Thesis_code_Glm_Opt/results/projection_voxel_foldavg_sub9_ses1_task0.8_bold0.8_beta0.5_smooth0.6_gamma1.npy",
+    parser.add_argument("--projection-path", default="results/behave_vs_bold/projection_voxel_foldavg_sub9_ses1_task0.8_bold0.8_beta0.5_smooth0.2_gamma1_bold_thr90.npy",
         help="Path to projection vector (.npy).")
     parser.add_argument("--manifest-path", default=DEFAULT_MANIFEST_PATH,
         help="Path to concat manifest TSV (default: group manifest).")
@@ -963,16 +1492,34 @@ def main():
         help="Scaling method used to compare projection and behavior variances.",
     )
     parser.add_argument(
-        "--alpha",
+        "--outlier-iqr-multiplier",
         type=float,
-        default=0.05,
-        help="Significance threshold for H1: projection variance < behavior variance.",
+        default=3.0,
+        help="IQR multiplier used to remove paired outlier rows (sub/ses/run) before paired tests.",
     )
     parser.add_argument(
-        "--tail-annotate-threshold",
+        "--permutation-iterations",
+        type=int,
+        default=20000,
+        help="Number of sign-flip permutations used for d_s permutation test.",
+    )
+    parser.add_argument(
+        "--bootstrap-iterations",
+        type=int,
+        default=10000,
+        help="Number of bootstrap resamples for d_s CI estimation.",
+    )
+    parser.add_argument(
+        "--bootstrap-ci-percent",
         type=float,
-        default=80.0,
-        help="Annotate behavior-variance tail in subplot 2 for runs with variance > threshold.",
+        default=95.0,
+        help="Bootstrap CI level in percent (e.g., 95).",
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=0,
+        help="Random seed for permutation and bootstrap procedures.",
     )
     parser.add_argument("--out-dir", default=None, help="Output directory.")
     args = parser.parse_args()
@@ -991,8 +1538,35 @@ def main():
         behavior_root=behavior_root,
         behavior_column=int(args.behavior_column),
     )
+    cv_run_outlier_keys, cv_run_pair_outlier_df = identify_run_outliers(
+        run_cv_df,
+        projection_col="cv_projection",
+        behavior_col="cv_behavior_col2",
+        outlier_iqr_multiplier=float(args.outlier_iqr_multiplier),
+    )
+    subject_metrics_df = compute_subject_projection_behavior_metrics(
+        run_segments,
+        behavior_root=behavior_root,
+        behavior_column=int(args.behavior_column),
+        excluded_run_keys=cv_run_outlier_keys,
+    )
     comparison_df = build_projection_behavior_comparison(
         run_df, behavior_df, scale_method=args.scale_method
+    )
+    comparison_df = comparison_df.merge(
+        run_cv_df[
+            [
+                "sub_tag",
+                "ses",
+                "run",
+                "cv_projection",
+                "cv_behavior_col2",
+                "n_trials_paired_finite",
+            ]
+        ],
+        on=["sub_tag", "ses", "run"],
+        how="left",
+        validate="one_to_one",
     )
     comparison_df = add_subject_median_normalized_variance_features(comparison_df)
 
@@ -1009,6 +1583,9 @@ def main():
         "compare_csv": os.path.join(
             out_dir, f"{stem}_sub_ses_run_projection_behavior_variance.csv"
         ),
+        "subject_metrics_csv": os.path.join(
+            out_dir, f"{stem}_subject_projection_behavior_metrics.csv"
+        ),
         "run_density_plot": os.path.join(out_dir, f"{stem}_sub_ses_run_variance_density.png"),
         "compare_density_plot": os.path.join(
             out_dir, f"{stem}_projection_behavior_variance_scaled_density.png"
@@ -1019,29 +1596,70 @@ def main():
         "run_cv_plot": os.path.join(
             out_dir, f"{stem}_sub_ses_run_projection_behavior_cv_density.png"
         ),
-        "mixedlm_csv": os.path.join(
-            out_dir, f"{stem}_projection_behavior_mixedlm_stats.csv"
+        "variance_cv_3x2_plot": os.path.join(
+            out_dir, f"{stem}_projection_behavior_variance_cv_zscore_3x2.png"
+        ),
+        "paired_stats_csv": os.path.join(
+            out_dir, f"{stem}_subject_projection_behavior_paired_stats.csv"
+        ),
+        "variance_pairs_csv": os.path.join(
+            out_dir, f"{stem}_subject_projection_behavior_variance_pairs.csv"
+        ),
+        "cv_pairs_csv": os.path.join(
+            out_dir, f"{stem}_subject_projection_behavior_cv_pairs.csv"
+        ),
+        "cv_ds_plot": os.path.join(
+            out_dir, f"{stem}_projection_behavior_cv_ds_analysis.png"
+        ),
+        "cv_ds_pairs_csv": os.path.join(
+            out_dir, f"{stem}_sub_ses_run_projection_behavior_cv_ds_pairs.csv"
+        ),
+        "cv_ds_stats_csv": os.path.join(
+            out_dir, f"{stem}_sub_ses_run_projection_behavior_cv_ds_stats.csv"
+        ),
+        "cv_run_pairs_outlier_csv": os.path.join(
+            out_dir, f"{stem}_sub_ses_run_cv_pairs_outlier_flags.csv"
         ),
     }
-
-    mixedlm_stats = fit_subject_median_log_ratio_mixedlm(
-        comparison_df, alpha=float(args.alpha)
-    )
 
     run_df.to_csv(output_paths["run_csv"], index=False)
     behavior_df.to_csv(output_paths["behavior_csv"], index=False)
     comparison_df.to_csv(output_paths["compare_csv"], index=False)
     run_cv_df.to_csv(output_paths["run_cv_csv"], index=False)
-    pd.DataFrame([mixedlm_stats]).to_csv(output_paths["mixedlm_csv"], index=False)
+    subject_metrics_df.to_csv(output_paths["subject_metrics_csv"], index=False)
+    cv_run_pair_outlier_df.to_csv(output_paths["cv_run_pairs_outlier_csv"], index=False)
 
+    plot_variance_cv_subject_session_run_3x2(
+        comparison_df,
+        output_paths["variance_cv_3x2_plot"],
+    )
     plot_run_variance_density(run_df, output_paths["run_density_plot"])
-    plot_scaled_variance_comparison_density(
+    variance_stats_row, variance_pairs_df = plot_scaled_variance_comparison_density(
         comparison_df,
         output_paths["compare_density_plot"],
-        tail_annotate_threshold=float(args.tail_annotate_threshold),
-        mixedlm_stats=mixedlm_stats,
+        outlier_iqr_multiplier=float(args.outlier_iqr_multiplier),
     )
-    plot_sub_ses_run_cv_comparison(run_cv_df, output_paths["run_cv_plot"])
+    cv_stats_row, cv_pairs_df = plot_sub_ses_run_cv_comparison(
+        run_cv_df,
+        output_paths["run_cv_plot"],
+        outlier_iqr_multiplier=float(args.outlier_iqr_multiplier),
+    )
+    cv_ds_stats_row, cv_ds_pairs_df = analyze_subject_cv_difference(
+        run_cv_df,
+        output_paths["cv_ds_plot"],
+        outlier_iqr_multiplier=float(args.outlier_iqr_multiplier),
+        n_permutations=int(args.permutation_iterations),
+        n_bootstrap=int(args.bootstrap_iterations),
+        bootstrap_ci_percent=float(args.bootstrap_ci_percent),
+        random_seed=int(args.random_seed),
+    )
+
+    paired_stats_df = pd.DataFrame([variance_stats_row, cv_stats_row])
+    variance_pairs_df.to_csv(output_paths["variance_pairs_csv"], index=False)
+    cv_pairs_df.to_csv(output_paths["cv_pairs_csv"], index=False)
+    cv_ds_pairs_df.to_csv(output_paths["cv_ds_pairs_csv"], index=False)
+    paired_stats_df.to_csv(output_paths["paired_stats_csv"], index=False)
+    pd.DataFrame([cv_ds_stats_row]).to_csv(output_paths["cv_ds_stats_csv"], index=False)
 
     print(f"Saved outputs to: {out_dir}")
 
