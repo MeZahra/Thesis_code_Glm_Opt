@@ -817,20 +817,53 @@ def _build_category_color_map(values, category_name):
     if n_values == 0:
         return {}, []
 
+    if str(category_name) == "run":
+        run_colors = [
+            "#1f77b4",  # blue
+            "#d62728",  # red
+            "#2ca02c",  # green
+            "#ff7f0e",  # orange
+            "#9467bd",  # purple
+            "#17becf",  # cyan
+        ]
+        color_map = {
+            value: run_colors[idx % len(run_colors)]
+            for idx, value in enumerate(unique_values)
+        }
+        return color_map, unique_values
+
     if str(category_name) == "ses":
         session_colors = [
-            "tab:blue",
-            "tab:orange",
-            "tab:green",
-            "tab:red",
-            "tab:purple",
-            "tab:brown",
+            "#1f77b4",  # blue
+            "#ff7f0e",  # orange
+            "#2ca02c",  # green
+            "#d62728",  # red
+            "#9467bd",  # purple
+            "#8c564b",  # brown
         ]
         color_map = {
             value: session_colors[idx % len(session_colors)]
             for idx, value in enumerate(unique_values)
         }
         return color_map, unique_values
+
+    if str(category_name) == "sub_tag":
+        # Build a larger qualitative palette to minimize subject-color collisions.
+        tab20 = list(plt.get_cmap("tab20").colors)
+        tab20b = list(plt.get_cmap("tab20b").colors)
+        tab20c = list(plt.get_cmap("tab20c").colors)
+        subject_palette = tab20 + tab20b + tab20c
+        if n_values <= len(subject_palette):
+            step = 11  # coprime with 60, spreads adjacent picks across the palette
+            spread_palette = [
+                subject_palette[(idx * step) % len(subject_palette)]
+                for idx in range(len(subject_palette))
+            ]
+            color_map = {
+                value: spread_palette[idx]
+                for idx, value in enumerate(unique_values)
+            }
+            return color_map, unique_values
 
     if n_values <= 10:
         cmap = plt.get_cmap("tab10", n_values)
@@ -878,6 +911,7 @@ def _plot_paired_box_with_connections(
     group_col,
     color_map,
     jitter_seed=0,
+    y_limits=None,
 ):
     behavior_values = paired_df["behavior_z"].to_numpy(dtype=np.float64)
     projection_values = paired_df["projection_z"].to_numpy(dtype=np.float64)
@@ -886,24 +920,39 @@ def _plot_paired_box_with_connections(
     box_parts = ax.boxplot(
         [behavior_values, projection_values],
         positions=[0.0, 1.0],
-        widths=0.52,
+        widths=0.5,
         patch_artist=True,
         showfliers=False,
+        showmeans=True,
+        meanprops={
+            "marker": "D",
+            "markerfacecolor": "black",
+            "markeredgecolor": "black",
+            "markersize": 4.0,
+        },
         zorder=1,
     )
     for box_patch in box_parts["boxes"]:
-        box_patch.set(facecolor="0.94", edgecolor="0.35", linewidth=1.1)
+        box_patch.set(facecolor="0.94", edgecolor="0.35", linewidth=1.15)
     for whisker in box_parts["whiskers"]:
         whisker.set(color="0.4", linewidth=1.0)
     for cap in box_parts["caps"]:
         cap.set(color="0.4", linewidth=1.0)
     for median in box_parts["medians"]:
-        median.set(color="0.1", linewidth=1.5)
+        median.set(color="0.1", linewidth=1.6)
 
     rng = np.random.default_rng(int(jitter_seed))
-    jitter = rng.uniform(-0.06, 0.06, size=behavior_values.size)
-    x_behavior = jitter
-    x_projection = 1.0 + jitter
+    jitter_base = rng.uniform(-0.12, 0.12, size=behavior_values.size)
+    x_behavior = jitter_base + rng.uniform(-0.03, 0.03, size=behavior_values.size)
+    x_projection = 1.0 + jitter_base + rng.uniform(-0.03, 0.03, size=behavior_values.size)
+
+    clipped_count = 0
+    if y_limits is None:
+        y_min = None
+        y_max = None
+    else:
+        y_min = float(y_limits[0])
+        y_max = float(y_limits[1])
 
     for x0, x1, y0, y1, group_value in zip(
         x_behavior,
@@ -913,29 +962,68 @@ def _plot_paired_box_with_connections(
         group_values,
     ):
         color = color_map[group_value]
+        if y_min is None or y_max is None:
+            y0_plot = y0
+            y1_plot = y1
+            marker0 = "o"
+            marker1 = "o"
+        else:
+            y0_plot = float(np.clip(y0, y_min, y_max))
+            y1_plot = float(np.clip(y1, y_min, y_max))
+            if y0 > y_max:
+                marker0 = "^"
+                clipped_count += 1
+            elif y0 < y_min:
+                marker0 = "v"
+                clipped_count += 1
+            else:
+                marker0 = "o"
+            if y1 > y_max:
+                marker1 = "^"
+                clipped_count += 1
+            elif y1 < y_min:
+                marker1 = "v"
+                clipped_count += 1
+            else:
+                marker1 = "o"
+
         ax.plot(
             [x0, x1],
-            [y0, y1],
+            [y0_plot, y1_plot],
             color=color,
-            linewidth=1.0,
-            alpha=0.45,
+            linewidth=0.85,
+            alpha=0.28,
             zorder=2,
         )
         ax.scatter(
-            [x0, x1],
-            [y0, y1],
-            s=26,
+            [x0],
+            [y0_plot],
+            s=34 if marker0 != "o" else 30,
             color=color,
             alpha=0.9,
-            edgecolors="white",
-            linewidths=0.35,
+            edgecolors="0.15",
+            linewidths=0.3,
+            marker=marker0,
+            zorder=3,
+        )
+        ax.scatter(
+            [x1],
+            [y1_plot],
+            s=34 if marker1 != "o" else 30,
+            color=color,
+            alpha=0.9,
+            edgecolors="0.15",
+            linewidths=0.3,
+            marker=marker1,
             zorder=3,
         )
 
     ax.set_xlim(-0.45, 1.45)
+    ax.axhline(0.0, color="0.55", linestyle=":", linewidth=0.9, zorder=0)
     ax.set_xticks([0.0, 1.0])
     ax.set_xticklabels(["Behavior variability", "BOLD variability"])
     ax.grid(axis="y", linestyle=":", linewidth=0.8, alpha=0.5)
+    return int(clipped_count)
 
 
 def _add_category_legend(ax, color_map, category_values, title):
@@ -956,21 +1044,21 @@ def _add_category_legend(ax, color_map, category_values, title):
         return
 
     ncol = 1
-    if len(handles) > 14:
+    if len(handles) > 16:
         ncol = 2
-    if len(handles) > 28:
-        ncol = 3
 
     legend = ax.legend(
         handles=handles,
         title=str(title),
-        loc="upper left",
-        bbox_to_anchor=(1.01, 1.0),
+        loc="upper right",
         fontsize=7.5,
         title_fontsize=8.5,
         frameon=True,
         ncol=ncol,
-        borderaxespad=0.0,
+        borderaxespad=0.4,
+        handletextpad=0.35,
+        columnspacing=0.8,
+        labelspacing=0.25,
     )
     legend.get_frame().set_alpha(0.95)
 
@@ -1024,13 +1112,16 @@ def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
         if finite_values.size == 0:
             column_limits.append((-1.0, 1.0))
             continue
-        col_min = float(np.min(finite_values))
-        col_max = float(np.max(finite_values))
-        col_span = col_max - col_min
-        pad = 0.08 * col_span if col_span > 0 else 0.5
-        column_limits.append((col_min - pad, col_max + pad))
+        q_low = float(np.percentile(finite_values, 2.0))
+        q_high = float(np.percentile(finite_values, 98.0))
+        q_span = q_high - q_low
+        pad = 0.18 * q_span if q_span > 0 else 0.55
+        y_low = min(q_low - pad, -2.8)
+        y_high = max(q_high + pad, 2.8)
+        column_limits.append((y_low, y_high))
 
-    fig, axes = plt.subplots(3, 2, figsize=(16.0, 13.2))
+    fig, axes = plt.subplots(3, 2, figsize=(17.8, 14.2))
+    total_clipped = 0
     for row_idx, (group_col, row_title, legend_title) in enumerate(row_defs):
         for col_idx, (column_title, metric_col_df) in enumerate(column_defs):
             ax = axes[row_idx, col_idx]
@@ -1038,17 +1129,19 @@ def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
                 metric_col_df[group_col].tolist(),
                 category_name=group_col,
             )
-            _plot_paired_box_with_connections(
+            clipped_here = _plot_paired_box_with_connections(
                 ax=ax,
                 paired_df=metric_col_df,
                 group_col=group_col,
                 color_map=color_map,
                 jitter_seed=111 + 17 * row_idx + 29 * col_idx,
+                y_limits=column_limits[col_idx],
             )
+            total_clipped += int(clipped_here)
             ax.set_ylim(column_limits[col_idx])
             ax.set_title(f"{row_title} | {column_title}", fontsize=11.0)
             if col_idx == 0:
-                ax.set_ylabel("Z-score")
+                ax.set_ylabel("Variability")
             if col_idx == 1:
                 _add_category_legend(
                     ax=ax,
@@ -1058,10 +1151,21 @@ def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
                 )
 
     fig.suptitle(
-        "Behavior vs BOLD variability across all sub/ses/run pairs (outliers included)",
+        "Behavior vs BOLD variability",
         fontsize=13.0,
     )
-    fig.tight_layout(rect=(0.0, 0.0, 0.82, 0.965))
+    tight_bottom = 0.0
+    # if total_clipped > 0:
+    #     fig.text(
+    #         0.5,
+    #         0.006,
+    #         "Triangle markers denote values clipped by y-axis limits for readability.",
+    #         ha="center",
+    #         va="bottom",
+    #         fontsize=9.0,
+    #     )
+        # tight_bottom = 0.02
+    fig.tight_layout(rect=(0.0, tight_bottom, 0.995, 0.965))
     fig.savefig(out_path, dpi=220)
     plt.close(fig)
 
