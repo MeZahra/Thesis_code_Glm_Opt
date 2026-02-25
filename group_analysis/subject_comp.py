@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.stats import gaussian_kde
+from scipy.stats import ttest_rel, wilcoxon
 
 from motor_brain_com import (
     DEFAULT_MANIFEST_PATH,
@@ -31,6 +32,119 @@ from motor_brain_com import (
 )
 
 VARIANCE_SCALE = 1e7
+PAIRWISE_ALPHA = 0.05
+
+
+def build_projection_variability_stats_table(
+    run_variance_df,
+    value_col="variance_projection",
+    alpha=PAIRWISE_ALPHA,
+):
+    comparisons = [
+        ("session1_run1_vs_run2", (1, 1), (1, 2)),
+        ("session2_run1_vs_run2", (2, 1), (2, 2)),
+        ("run1_session1_vs_session2", (1, 1), (2, 1)),
+        ("run2_session1_vs_session2", (1, 2), (2, 2)),
+    ]
+
+    df = run_variance_df[["sub_tag", "ses", "run", value_col]].copy()
+    df["sub_tag"] = df["sub_tag"].astype(str)
+    df["ses"] = pd.to_numeric(df["ses"], errors="coerce")
+    df["run"] = pd.to_numeric(df["run"], errors="coerce")
+    df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+    finite_mask = (
+        np.isfinite(df["ses"].to_numpy(dtype=np.float64))
+        & np.isfinite(df["run"].to_numpy(dtype=np.float64))
+    )
+    df = df.loc[finite_mask].copy()
+    df["ses"] = df["ses"].astype(int)
+    df["run"] = df["run"].astype(int)
+
+    pivot = df.pivot_table(
+        index="sub_tag",
+        columns=["ses", "run"],
+        values=value_col,
+        aggfunc="mean",
+    )
+
+    rows = []
+    for comparison_name, key_a, key_b in comparisons:
+        row = {
+            "comparison": comparison_name,
+            "group_a": f"ses{key_a[0]}_run{key_a[1]}",
+            "group_b": f"ses{key_b[0]}_run{key_b[1]}",
+            "n_subjects_paired": 0,
+            "mean_group_a": np.nan,
+            "mean_group_b": np.nan,
+            "mean_diff_group_a_minus_b": np.nan,
+            "median_diff_group_a_minus_b": np.nan,
+            "ttest_stat": np.nan,
+            "ttest_p_two_sided": np.nan,
+            "wilcoxon_stat": np.nan,
+            "wilcoxon_p_two_sided": np.nan,
+        }
+
+        if key_a not in pivot.columns or key_b not in pivot.columns:
+            rows.append(row)
+            continue
+
+        paired = pivot.loc[:, [key_a, key_b]].dropna()
+        n_pairs = int(len(paired))
+        row["n_subjects_paired"] = n_pairs
+        if n_pairs == 0:
+            rows.append(row)
+            continue
+
+        values_a = paired.iloc[:, 0].to_numpy(dtype=np.float64)
+        values_b = paired.iloc[:, 1].to_numpy(dtype=np.float64)
+        diff = values_a - values_b
+
+        row["mean_group_a"] = float(np.mean(values_a))
+        row["mean_group_b"] = float(np.mean(values_b))
+        row["mean_diff_group_a_minus_b"] = float(np.mean(diff))
+        row["median_diff_group_a_minus_b"] = float(np.median(diff))
+
+        if n_pairs >= 2:
+            try:
+                t_result = ttest_rel(values_a, values_b, nan_policy="omit")
+            except TypeError:
+                t_result = ttest_rel(values_a, values_b)
+            row["ttest_stat"] = float(t_result.statistic)
+            row["ttest_p_two_sided"] = float(t_result.pvalue)
+
+        if np.allclose(diff, 0.0):
+            row["wilcoxon_stat"] = 0.0
+            row["wilcoxon_p_two_sided"] = 1.0
+        else:
+            try:
+                w_result = wilcoxon(values_a, values_b, alternative="two-sided")
+                row["wilcoxon_stat"] = float(w_result.statistic)
+                row["wilcoxon_p_two_sided"] = float(w_result.pvalue)
+            except ValueError:
+                pass
+
+        rows.append(row)
+
+    stats_df = pd.DataFrame(rows)
+    if stats_df.empty:
+        return stats_df
+
+    for prefix in ("ttest", "wilcoxon"):
+        p_col = f"{prefix}_p_two_sided"
+        p_values = stats_df[p_col].to_numpy(dtype=np.float64)
+        corrected = np.full(p_values.shape, np.nan, dtype=np.float64)
+        finite = np.isfinite(p_values)
+        n_tests = int(np.count_nonzero(finite))
+        if n_tests > 0:
+            corrected[finite] = np.minimum(p_values[finite] * float(n_tests), 1.0)
+        stats_df[f"{prefix}_p_bonferroni"] = corrected
+
+        sig_col = f"{prefix}_significant_bonferroni_alpha_{float(alpha):g}"
+        stats_df[sig_col] = pd.Series(pd.NA, index=stats_df.index, dtype="boolean")
+        valid = np.isfinite(corrected)
+        stats_df.loc[valid, sig_col] = corrected[valid] < float(alpha)
+
+    return stats_df
 
 
 def _std_over_rms(values):
@@ -220,6 +334,9 @@ def main():
     stem = os.path.splitext(os.path.basename(projection_path))[0]
     variance_csv_path = os.path.join(out_dir, f"{stem}_sub_ses_run_projection_variability.csv")
     std_rms_csv_path = os.path.join(out_dir, f"{stem}_sub_ses_run_projection_std_over_rms.csv")
+    stats_csv_path = os.path.join(
+        out_dir, f"{stem}_sub_ses_run_projection_variability_pairwise_stats.csv"
+    )
     variance_plot_path = os.path.join(
         out_dir, f"{stem}_sub_ses_run_projection_variability_subject_comp.png"
     )
@@ -227,8 +344,11 @@ def main():
         out_dir, f"{stem}_sub_ses_run_projection_std_over_rms_subject_comp.png"
     )
 
+    pairwise_stats_df = build_projection_variability_stats_table(run_variance_df)
+
     run_variance_df.to_csv(variance_csv_path, index=False)
     run_std_rms_df.to_csv(std_rms_csv_path, index=False)
+    pairwise_stats_df.to_csv(stats_csv_path, index=False)
 
     _plot_metric_by_ses_run(
         run_variance_df,
@@ -253,8 +373,11 @@ def main():
     print(f"Rows (std/rms): {len(run_std_rms_df)}")
     print(f"Saved variance CSV: {variance_csv_path}")
     print(f"Saved std/rms CSV:  {std_rms_csv_path}")
+    print(f"Saved stats CSV:    {stats_csv_path}")
     print(f"Saved variability figure: {variance_plot_path}")
     print(f"Saved std/rms figure:    {std_rms_plot_path}")
+    print("\nProjection variability pairwise statistics:")
+    print(pairwise_stats_df.to_string(index=False))
 
 
 if __name__ == "__main__":

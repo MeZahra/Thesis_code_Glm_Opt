@@ -206,6 +206,32 @@ def _coefficient_of_variation(values):
     return mean_value, std_value, cv_value
 
 
+def compute_run_variances(run_segments):
+    """Compatibility helper for scripts that only need projection run variances."""
+    rows = []
+    for segment in run_segments:
+        proj_values = np.asarray(segment["values"], dtype=np.float64)
+        proj_finite = proj_values[np.isfinite(proj_values)]
+        if proj_finite.size == 0:
+            proj_mean = np.nan
+            proj_var = np.nan
+        else:
+            proj_mean = float(np.mean(proj_finite))
+            proj_var = float(np.var(proj_finite))
+        rows.append(
+            {
+                "sub_tag": str(segment["sub_tag"]),
+                "ses": int(segment["ses"]),
+                "run": int(segment["run"]),
+                "n_trials_source": int(segment["n_trials_source"]),
+                "n_trials_kept": int(proj_finite.size),
+                "mean_projection": proj_mean,
+                "variance_projection": proj_var,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def compute_run_behavior_tables(run_segments, behavior_root, behavior_column):
     run_rows = []
     behavior_rows = []
@@ -787,47 +813,65 @@ def plot_sub_ses_run_cv_comparison(run_cv_df, out_path, grid_points=512):
     ax1.set_ylabel("Probability density")
     ax1.set_title("CV behaviour")
 
-    combined = np.concatenate([finite_proj, finite_beh])
-    x_combined = _density_grid(combined, grid_points=grid_points, fallback_pad=1e-6)
-    proj_density_combined = _evaluate_density(finite_proj, x_combined)
-    beh_density_combined = _evaluate_density(finite_beh, x_combined)
+    paired_proj_z = _scale_values(paired_proj_raw, method="zscore")
+    paired_beh_z = _scale_values(paired_beh_raw, method="zscore")
+    paired_z_mask = np.isfinite(paired_proj_z) & np.isfinite(paired_beh_z)
+    paired_proj_z = paired_proj_z[paired_z_mask]
+    paired_beh_z = paired_beh_z[paired_z_mask]
+    if paired_proj_z.size == 0:
+        raise RuntimeError("No finite paired z-scored CV values available to plot.")
+
+    z_combined = np.concatenate([paired_proj_z, paired_beh_z])
+    x_z = _density_grid(z_combined, grid_points=grid_points, fallback_pad=1e-6)
+    proj_z_density = _evaluate_density(paired_proj_z, x_z)
+    beh_z_density = _evaluate_density(paired_beh_z, x_z)
     ax2.plot(
-        x_combined,
-        proj_density_combined,
+        x_z,
+        proj_z_density,
         color="tab:blue",
         linewidth=2.0,
-        label="CV projection",
+        label="CV projection (z-score)",
     )
-    ax2.fill_between(x_combined, proj_density_combined, alpha=0.15, color="tab:blue")
+    ax2.fill_between(x_z, proj_z_density, alpha=0.15, color="tab:blue")
     ax2.plot(
-        x_combined,
-        beh_density_combined,
+        x_z,
+        beh_z_density,
         color="tab:orange",
         linewidth=2.0,
         linestyle="--",
-        label="CV behavior",
+        label="CV behavior (z-score)",
     )
-    ax2.fill_between(x_combined, beh_density_combined, alpha=0.15, color="tab:orange")
-    ax2.set_xlabel("CV")
+    ax2.fill_between(x_z, beh_z_density, alpha=0.15, color="tab:orange")
+    ax2.axvline(0.0, color="0.35", linewidth=1.0, linestyle=":")
+    ax2.set_xlabel("Z-scored CV (within each metric)")
     ax2.set_ylabel("Probability density")
-    ax2.set_title("CV comparsion")
+    ax2.set_title("3) Z-scored CV comparsion")
     ax2.legend(fontsize=8, loc="upper right")
 
-    t_stat = np.nan
-    t_p = np.nan
+    w_stat = np.nan
+    w_p_less = np.nan
     try:
-        t_res = ttest_rel(paired_proj_raw, paired_beh_raw, nan_policy="omit")
+        w_res = wilcoxon(paired_proj_z, paired_beh_z, alternative="less")
+        w_stat = float(w_res.statistic)
+        w_p_less = float(w_res.pvalue)
+    except ValueError:
+        pass
+
+    t_stat = np.nan
+    t_p_less = np.nan
+    try:
+        t_res = ttest_rel(paired_proj_z, paired_beh_z, nan_policy="omit")
         t_stat = float(t_res.statistic)
-        t_p = float(t_res.pvalue)
+        t_p_less = _one_sided_p_less_from_two_sided(float(t_res.pvalue), t_stat)
     except TypeError:
         # SciPy fallback without nan_policy in very old versions
-        t_res = ttest_rel(paired_proj_raw, paired_beh_raw)
+        t_res = ttest_rel(paired_proj_z, paired_beh_z)
         t_stat = float(t_res.statistic)
-        t_p = float(t_res.pvalue)
+        t_p_less = _one_sided_p_less_from_two_sided(float(t_res.pvalue), t_stat)
+
     stats_text = (
-        f"paired t p(two-sided)={t_p:.3g}, t={t_stat:.3g}"
-        if np.isfinite(t_p)
-        else "paired t-test unavailable"
+        f"Wilcoxon p(<0)={w_p_less:.3g}, W={w_stat:.3g}\n"
+        f"paired t-test p(<0)={t_p_less:.3g}, t={t_stat:.3g}"
     )
     ax2.text(
         0.98,
@@ -902,32 +946,16 @@ def plot_sub_ses_run_cv_comparison(run_cv_df, out_path, grid_points=512):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--projection-path",
-        default="/home/zkavian/Thesis_code_Glm_Opt/results/projection_voxel_foldavg_sub9_ses1_task0.8_bold0.8_beta0.5_smooth0.6_gamma1.npy",
-        help="Path to projection vector (.npy).",
-    )
-    parser.add_argument(
-        "--manifest-path",
-        default=DEFAULT_MANIFEST_PATH,
-        help="Path to concat manifest TSV (default: group manifest).",
-    )
-    parser.add_argument(
-        "--trial-keep-root",
-        default=DEFAULT_TRIAL_KEEP_ROOT,
-        help="Root containing trial_keep_run*.npy files.",
-    )
-    parser.add_argument(
-        "--behavior-root",
-        default=DEFAULT_BEHAVIOR_ROOT,
-        help="Root containing PSPD*_ses_*_run_*.npy behavior files.",
-    )
-    parser.add_argument(
-        "--behavior-column",
-        type=int,
-        default=1,
-        help="Behavior column index (0-based). Use 1 for the second column.",
-    )
+    parser.add_argument("--projection-path", default="/home/zkavian/Thesis_code_Glm_Opt/results/projection_voxel_foldavg_sub9_ses1_task0.8_bold0.8_beta0.5_smooth0.6_gamma1.npy",
+        help="Path to projection vector (.npy).")
+    parser.add_argument("--manifest-path", default=DEFAULT_MANIFEST_PATH,
+        help="Path to concat manifest TSV (default: group manifest).")
+    parser.add_argument("--trial-keep-root", default=DEFAULT_TRIAL_KEEP_ROOT,
+        help="Root containing trial_keep_run*.npy files.")
+    parser.add_argument("--behavior-root", default=DEFAULT_BEHAVIOR_ROOT,
+        help="Root containing PSPD*_ses_*_run_*.npy behavior files.")
+    parser.add_argument("--behavior-column", type=int, default=1,
+        help="Behavior column index (0-based). Use 1 for the second column.")
     parser.add_argument(
         "--scale-method",
         default="zscore",
