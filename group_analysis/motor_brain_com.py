@@ -1170,6 +1170,442 @@ def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
     plt.close(fig)
 
 
+def _validate_3x2_metric_df(metric_df):
+    required_cols = {
+        "sub_tag",
+        "ses",
+        "run",
+        "variance_projection",
+        "variance_behavior_col2",
+        "cv_projection",
+        "cv_behavior_col2",
+    }
+    missing_cols = required_cols.difference(metric_df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns for 3x2 variability plots: {sorted(missing_cols)}"
+        )
+
+
+def _build_3x2_column_metric_dfs(metric_df):
+    _validate_3x2_metric_df(metric_df)
+    variance_df = _build_paired_metric_zscore_df(
+        metric_df=metric_df,
+        projection_col="variance_projection",
+        behavior_col="variance_behavior_col2",
+    )
+    cv_df = _build_paired_metric_zscore_df(
+        metric_df=metric_df,
+        projection_col="cv_projection",
+        behavior_col="cv_behavior_col2",
+    )
+    return [
+        ("Z-scored variance", variance_df),
+        ("Z-scored CV", cv_df),
+    ]
+
+
+def _sort_count_category_cell(cell_df, row_title, primary_subject_sort_col=None):
+    cell_df = cell_df.copy()
+    if cell_df.empty:
+        return cell_df
+
+    if (
+        str(row_title) == "Subject colors"
+        and primary_subject_sort_col is not None
+        and primary_subject_sort_col in cell_df.columns
+    ):
+        subject_order = []
+        for value in cell_df["category"].astype(str):
+            try:
+                subject_order.append(int(_extract_subject_digits(value)))
+            except ValueError:
+                subject_order.append(int(1e9))
+        cell_df["_subject_order"] = subject_order
+        cell_df = cell_df.sort_values(
+            [primary_subject_sort_col, "_subject_order", "category"],
+            ascending=[False, True, True],
+        )
+        return cell_df.drop(columns=["_subject_order"])
+
+    cat_num = pd.to_numeric(cell_df["category"], errors="coerce")
+    if np.all(np.isfinite(cat_num.to_numpy(dtype=np.float64))):
+        cell_df["_cat_num"] = cat_num.to_numpy(dtype=np.float64)
+        cell_df = cell_df.sort_values(["_cat_num", "category"], ascending=[True, True])
+        return cell_df.drop(columns=["_cat_num"])
+
+    return cell_df.sort_values("category")
+
+
+def compute_outside_box_counts_behavior_vs_bold_3x2(metric_df):
+    row_defs = [
+        ("sub_tag", "Subject colors"),
+        ("ses", "Session colors"),
+        ("run", "Run colors"),
+    ]
+    column_defs = _build_3x2_column_metric_dfs(metric_df)
+
+    rows = []
+    for column_title, metric_col_df in column_defs:
+        behavior_values = metric_col_df["behavior_z"].to_numpy(dtype=np.float64)
+        projection_values = metric_col_df["projection_z"].to_numpy(dtype=np.float64)
+
+        bq1, bq3 = np.percentile(behavior_values, [25.0, 75.0])
+        pq1, pq3 = np.percentile(projection_values, [25.0, 75.0])
+        behavior_out = (behavior_values < bq1) | (behavior_values > bq3)
+        projection_out = (projection_values < pq1) | (projection_values > pq3)
+
+        for group_col, row_title in row_defs:
+            group_values = metric_col_df[group_col].astype(str).to_numpy()
+            categories = sorted(
+                {value for value in group_values},
+                key=lambda value: _category_sort_key(value, group_col),
+            )
+            for category in categories:
+                category_mask = group_values == str(category)
+                rows.append(
+                    {
+                        "row": row_title,
+                        "column": column_title,
+                        "category": str(category),
+                        "behavior_outside_box_count": int(
+                            np.count_nonzero(behavior_out & category_mask)
+                        ),
+                        "bold_outside_box_count": int(
+                            np.count_nonzero(projection_out & category_mask)
+                        ),
+                    }
+                )
+
+    return pd.DataFrame(rows)
+
+
+def plot_outside_box_counts_behavior_vs_bold_3x2(
+    metric_df,
+    out_path,
+    out_csv_path=None,
+    sort_subject_by_behavior=True,
+):
+    counts_df = compute_outside_box_counts_behavior_vs_bold_3x2(metric_df)
+    if out_csv_path is not None:
+        counts_df.to_csv(out_csv_path, index=False)
+
+    row_order = ["Subject colors", "Session colors", "Run colors"]
+    column_order = ["Z-scored variance", "Z-scored CV"]
+
+    fig, axes = plt.subplots(3, 2, figsize=(19.0, 14.0), sharey=False)
+    for row_idx, row_title in enumerate(row_order):
+        for col_idx, column_title in enumerate(column_order):
+            ax = axes[row_idx, col_idx]
+            cell = counts_df.loc[
+                (counts_df["row"] == row_title) & (counts_df["column"] == column_title)
+            ].copy()
+            if cell.empty:
+                ax.set_axis_off()
+                continue
+
+            sort_col = "behavior_outside_box_count" if bool(sort_subject_by_behavior) else None
+            cell = _sort_count_category_cell(
+                cell,
+                row_title=row_title,
+                primary_subject_sort_col=sort_col,
+            )
+
+            categories = cell["category"].astype(str).tolist()
+            x = np.arange(len(categories), dtype=np.float64)
+            width = 0.42
+            behavior_counts = cell["behavior_outside_box_count"].to_numpy(dtype=np.float64)
+            bold_counts = cell["bold_outside_box_count"].to_numpy(dtype=np.float64)
+
+            ax.bar(
+                x - (width / 2.0),
+                behavior_counts,
+                width=width,
+                color="#1f77b4",
+                label="Behavior",
+            )
+            ax.bar(
+                x + (width / 2.0),
+                bold_counts,
+                width=width,
+                color="#d62728",
+                label="BOLD",
+            )
+
+            ax.set_title(f"{row_title} | {column_title}", fontsize=11.5)
+            ax.set_ylabel("Outside-box count")
+            ax.grid(axis="y", linestyle=":", linewidth=0.8, alpha=0.55)
+            ax.set_xticks(x)
+            if row_title == "Subject colors":
+                ax.set_xticklabels(categories, rotation=45, ha="right", fontsize=8.0)
+            else:
+                ax.set_xticklabels(categories, fontsize=9.5)
+
+            ymax = float(np.max(np.concatenate([behavior_counts, bold_counts])))
+            ax.set_ylim(0.0, max(3.0, ymax + 1.0))
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=2,
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.995),
+    )
+    fig.suptitle("Outside-box counts (Q1-Q3): Behavior vs BOLD", fontsize=14.0, y=1.01)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.975))
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return counts_df
+
+
+def _classify_whisker_position(values, near_fraction=0.10):
+    values = np.asarray(values, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        raise RuntimeError("No finite values available for whisker classification.")
+
+    q1, q3 = np.percentile(finite_values, [25.0, 75.0])
+    iqr = float(q3 - q1)
+    low_fence = float(q1 - (1.5 * iqr))
+    high_fence = float(q3 + (1.5 * iqr))
+    near_band = float(max(float(near_fraction) * iqr, 1e-12))
+
+    below = values < low_fence
+    above = values > high_fence
+    near_low = (values >= low_fence) & (values <= (low_fence + near_band))
+    near_high = (values <= high_fence) & (values >= (high_fence - near_band))
+    near = (~below) & (~above) & (near_low | near_high)
+    total = below | near | above
+
+    return {
+        "q1": float(q1),
+        "q3": float(q3),
+        "iqr": iqr,
+        "low_fence": low_fence,
+        "high_fence": high_fence,
+        "near_band": near_band,
+        "below": np.asarray(below, dtype=bool),
+        "near": np.asarray(near, dtype=bool),
+        "above": np.asarray(above, dtype=bool),
+        "total": np.asarray(total, dtype=bool),
+    }
+
+
+def compute_whisker_outlier_counts_behavior_vs_bold_3x2(metric_df, near_fraction=0.10):
+    near_fraction = float(near_fraction)
+    if near_fraction < 0:
+        raise ValueError(f"near_fraction must be >= 0, got {near_fraction}.")
+
+    row_defs = [
+        ("sub_tag", "Subject colors"),
+        ("ses", "Session colors"),
+        ("run", "Run colors"),
+    ]
+    column_defs = _build_3x2_column_metric_dfs(metric_df)
+
+    rows = []
+    thresholds = []
+    for column_title, metric_col_df in column_defs:
+        behavior_values = metric_col_df["behavior_z"].to_numpy(dtype=np.float64)
+        projection_values = metric_col_df["projection_z"].to_numpy(dtype=np.float64)
+        behavior_cls = _classify_whisker_position(behavior_values, near_fraction=near_fraction)
+        projection_cls = _classify_whisker_position(
+            projection_values, near_fraction=near_fraction
+        )
+
+        thresholds.extend(
+            [
+                {
+                    "column": column_title,
+                    "signal": "Behavior",
+                    "q1": behavior_cls["q1"],
+                    "q3": behavior_cls["q3"],
+                    "iqr": behavior_cls["iqr"],
+                    "low_fence": behavior_cls["low_fence"],
+                    "high_fence": behavior_cls["high_fence"],
+                    "near_band": behavior_cls["near_band"],
+                },
+                {
+                    "column": column_title,
+                    "signal": "BOLD",
+                    "q1": projection_cls["q1"],
+                    "q3": projection_cls["q3"],
+                    "iqr": projection_cls["iqr"],
+                    "low_fence": projection_cls["low_fence"],
+                    "high_fence": projection_cls["high_fence"],
+                    "near_band": projection_cls["near_band"],
+                },
+            ]
+        )
+
+        for group_col, row_title in row_defs:
+            group_values = metric_col_df[group_col].astype(str).to_numpy()
+            categories = sorted(
+                {value for value in group_values},
+                key=lambda value: _category_sort_key(value, group_col),
+            )
+            for category in categories:
+                category_mask = group_values == str(category)
+                behavior_below = int(np.count_nonzero(behavior_cls["below"] & category_mask))
+                behavior_near = int(np.count_nonzero(behavior_cls["near"] & category_mask))
+                behavior_above = int(np.count_nonzero(behavior_cls["above"] & category_mask))
+
+                bold_below = int(np.count_nonzero(projection_cls["below"] & category_mask))
+                bold_near = int(np.count_nonzero(projection_cls["near"] & category_mask))
+                bold_above = int(np.count_nonzero(projection_cls["above"] & category_mask))
+
+                rows.append(
+                    {
+                        "row": row_title,
+                        "column": column_title,
+                        "category": str(category),
+                        "behavior_below_whisker_count": behavior_below,
+                        "behavior_near_whisker_count": behavior_near,
+                        "behavior_above_whisker_count": behavior_above,
+                        "behavior_outlier_total": int(behavior_below + behavior_near + behavior_above),
+                        "bold_below_whisker_count": bold_below,
+                        "bold_near_whisker_count": bold_near,
+                        "bold_above_whisker_count": bold_above,
+                        "bold_outlier_total": int(bold_below + bold_near + bold_above),
+                    }
+                )
+
+    return pd.DataFrame(rows), pd.DataFrame(thresholds)
+
+
+def plot_whisker_outlier_counts_behavior_vs_bold_3x2(
+    metric_df,
+    out_path,
+    out_csv_path=None,
+    thresholds_csv_path=None,
+    near_fraction=0.10,
+    sort_subject_by_behavior=True,
+):
+    counts_df, thresholds_df = compute_whisker_outlier_counts_behavior_vs_bold_3x2(
+        metric_df=metric_df,
+        near_fraction=near_fraction,
+    )
+    if out_csv_path is not None:
+        counts_df.to_csv(out_csv_path, index=False)
+    if thresholds_csv_path is not None:
+        thresholds_df.to_csv(thresholds_csv_path, index=False)
+
+    row_order = ["Subject colors", "Session colors", "Run colors"]
+    column_order = ["Z-scored variance", "Z-scored CV"]
+
+    fig, axes = plt.subplots(3, 2, figsize=(20.0, 14.0), sharey=False)
+    for row_idx, row_title in enumerate(row_order):
+        for col_idx, column_title in enumerate(column_order):
+            ax = axes[row_idx, col_idx]
+            cell = counts_df.loc[
+                (counts_df["row"] == row_title) & (counts_df["column"] == column_title)
+            ].copy()
+            if cell.empty:
+                ax.set_axis_off()
+                continue
+
+            sort_col = "behavior_outlier_total" if bool(sort_subject_by_behavior) else None
+            cell = _sort_count_category_cell(
+                cell,
+                row_title=row_title,
+                primary_subject_sort_col=sort_col,
+            )
+
+            categories = cell["category"].astype(str).tolist()
+            x = np.arange(len(categories), dtype=np.float64)
+            width = 0.38
+
+            behavior_below = cell["behavior_below_whisker_count"].to_numpy(dtype=np.float64)
+            behavior_near = cell["behavior_near_whisker_count"].to_numpy(dtype=np.float64)
+            behavior_above = cell["behavior_above_whisker_count"].to_numpy(dtype=np.float64)
+            bold_below = cell["bold_below_whisker_count"].to_numpy(dtype=np.float64)
+            bold_near = cell["bold_near_whisker_count"].to_numpy(dtype=np.float64)
+            bold_above = cell["bold_above_whisker_count"].to_numpy(dtype=np.float64)
+
+            ax.bar(
+                x - (width / 2.0),
+                behavior_below,
+                width=width,
+                color="#6baed6",
+                label="Behavior below" if (row_idx, col_idx) == (0, 0) else None,
+            )
+            ax.bar(
+                x - (width / 2.0),
+                behavior_near,
+                width=width,
+                bottom=behavior_below,
+                color="#3182bd",
+                label="Behavior near" if (row_idx, col_idx) == (0, 0) else None,
+            )
+            ax.bar(
+                x - (width / 2.0),
+                behavior_above,
+                width=width,
+                bottom=(behavior_below + behavior_near),
+                color="#08519c",
+                label="Behavior above" if (row_idx, col_idx) == (0, 0) else None,
+            )
+
+            ax.bar(
+                x + (width / 2.0),
+                bold_below,
+                width=width,
+                color="#fcae91",
+                label="BOLD below" if (row_idx, col_idx) == (0, 0) else None,
+            )
+            ax.bar(
+                x + (width / 2.0),
+                bold_near,
+                width=width,
+                bottom=bold_below,
+                color="#fb6a4a",
+                label="BOLD near" if (row_idx, col_idx) == (0, 0) else None,
+            )
+            ax.bar(
+                x + (width / 2.0),
+                bold_above,
+                width=width,
+                bottom=(bold_below + bold_near),
+                color="#cb181d",
+                label="BOLD above" if (row_idx, col_idx) == (0, 0) else None,
+            )
+
+            ax.set_title(f"{row_title} | {column_title}", fontsize=11.5)
+            ax.set_ylabel("Whisker-based outlier count")
+            ax.grid(axis="y", linestyle=":", linewidth=0.8, alpha=0.55)
+            ax.set_xticks(x)
+            if row_title == "Subject colors":
+                ax.set_xticklabels(categories, rotation=45, ha="right", fontsize=8.0)
+            else:
+                ax.set_xticklabels(categories, fontsize=9.5)
+
+            behavior_total = behavior_below + behavior_near + behavior_above
+            bold_total = bold_below + bold_near + bold_above
+            ymax = float(np.max(np.concatenate([behavior_total, bold_total])))
+            ax.set_ylim(0.0, max(2.0, ymax + 1.0))
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=3,
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.995),
+    )
+    fig.suptitle(
+        "Whisker outlier counts (below / near / above): Behavior vs BOLD",
+        fontsize=14.0,
+        y=1.01,
+    )
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.975))
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return counts_df, thresholds_df
+
+
 def _plot_subject_metric_comparison(
     subject_metrics_df,
     projection_col,
@@ -1625,6 +2061,12 @@ def main():
         default=0,
         help="Random seed for permutation and bootstrap procedures.",
     )
+    parser.add_argument(
+        "--whisker-near-fraction",
+        type=float,
+        default=0.10,
+        help="Near-whisker band as a fraction of IQR for whisker outlier summary plots.",
+    )
     parser.add_argument("--out-dir", default=None, help="Output directory.")
     args = parser.parse_args()
 
@@ -1703,6 +2145,32 @@ def main():
         "variance_cv_3x2_plot": os.path.join(
             out_dir, f"{stem}_projection_behavior_variance_cv_zscore_3x2.png"
         ),
+        "outside_box_counts_csv": os.path.join(
+            out_dir,
+            f"{stem}_3x2_outside_box_counts_behavior_vs_bold_all_categories.csv",
+        ),
+        "outside_box_counts_plot": os.path.join(
+            out_dir,
+            (
+                f"{stem}_3x2_outside_box_counts_behavior_vs_bold_all_categories_"
+                "subject_row_sorted_by_behavior.png"
+            ),
+        ),
+        "whisker_outlier_counts_csv": os.path.join(
+            out_dir,
+            f"{stem}_3x2_whisker_outlier_counts_behavior_vs_bold_all_categories.csv",
+        ),
+        "whisker_outlier_thresholds_csv": os.path.join(
+            out_dir,
+            f"{stem}_3x2_whisker_outlier_thresholds.csv",
+        ),
+        "whisker_outlier_counts_plot": os.path.join(
+            out_dir,
+            (
+                f"{stem}_3x2_whisker_outlier_counts_behavior_vs_bold_all_categories_"
+                "subject_row_sorted_by_behavior.png"
+            ),
+        ),
         "paired_stats_csv": os.path.join(
             out_dir, f"{stem}_subject_projection_behavior_paired_stats.csv"
         ),
@@ -1736,6 +2204,20 @@ def main():
     plot_variance_cv_subject_session_run_3x2(
         comparison_df,
         output_paths["variance_cv_3x2_plot"],
+    )
+    plot_outside_box_counts_behavior_vs_bold_3x2(
+        comparison_df,
+        output_paths["outside_box_counts_plot"],
+        out_csv_path=output_paths["outside_box_counts_csv"],
+        sort_subject_by_behavior=True,
+    )
+    plot_whisker_outlier_counts_behavior_vs_bold_3x2(
+        comparison_df,
+        output_paths["whisker_outlier_counts_plot"],
+        out_csv_path=output_paths["whisker_outlier_counts_csv"],
+        thresholds_csv_path=output_paths["whisker_outlier_thresholds_csv"],
+        near_fraction=float(args.whisker_near_fraction),
+        sort_subject_by_behavior=True,
     )
     plot_run_variance_density(run_df, output_paths["run_density_plot"])
     variance_stats_row, variance_pairs_df = plot_scaled_variance_comparison_density(

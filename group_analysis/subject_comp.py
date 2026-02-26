@@ -11,7 +11,10 @@ Outputs:
 4) std/rms figure (2x2): ses1-run1, ses1-run2, ses2-run1, ses2-run2.
 5) Per-subject KS stats CSV (session 1 vs 2, runs 1+2 pooled within session).
 6) Group-level KS inference CSV.
-7) KS summary figure.
+7) KS summary figure (3x1): KS statistic, IQR diff, MAD diff.
+8) Per-subject pooled-trial CV CSV (session 1 vs 2, runs 1+2 pooled).
+9) Group-level pooled-trial CV session comparison stats CSV.
+10) Pooled-trial CV overlay figure with KS/IQR/MAD summary text.
 """
 
 import argparse
@@ -166,6 +169,22 @@ def _std_over_rms(values):
     return rms_value, std_value, ratio_value
 
 
+def _coefficient_of_variation(values):
+    values = np.asarray(values, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        return np.nan, np.nan, np.nan
+
+    mean_value = float(np.mean(finite_values))
+    std_value = float(np.std(finite_values))
+    mean_abs = abs(mean_value)
+    if not np.isfinite(mean_abs) or np.isclose(mean_abs, 0.0):
+        cv_value = np.nan
+    else:
+        cv_value = float(std_value / mean_abs)
+    return mean_value, std_value, cv_value
+
+
 def compute_run_projection_std_over_rms(run_segments):
     rows = []
     for segment in run_segments:
@@ -207,6 +226,171 @@ def _benjamini_hochberg(p_values):
     adjusted_finite[order] = adjusted_sorted
     corrected[finite_idx] = adjusted_finite
     return corrected
+
+
+def compute_subject_session_pooled_cv(
+    run_segments,
+    session_a=1,
+    session_b=2,
+    runs=(1, 2),
+):
+    session_a = int(session_a)
+    session_b = int(session_b)
+    run_set = {int(run) for run in runs}
+
+    pooled = {}
+    run_counts = {}
+
+    for segment in run_segments:
+        sub_tag = str(segment["sub_tag"])
+        ses = int(segment["ses"])
+        run = int(segment["run"])
+        if ses not in {session_a, session_b} or run not in run_set:
+            continue
+
+        values = np.asarray(segment["values"], dtype=np.float64)
+        finite_values = values[np.isfinite(values)]
+        pooled.setdefault((sub_tag, ses), []).append(finite_values)
+        run_counts[(sub_tag, ses)] = run_counts.get((sub_tag, ses), 0) + 1
+
+    subjects = sorted(
+        {sub for sub, _ in run_counts.keys()},
+        key=lambda sub: (_subject_order(sub), str(sub)),
+    )
+
+    rows = []
+    for sub_tag in subjects:
+        chunks_a = pooled.get((sub_tag, session_a), [])
+        chunks_b = pooled.get((sub_tag, session_b), [])
+        values_a = (
+            np.concatenate(chunks_a).astype(np.float64, copy=False)
+            if chunks_a
+            else np.array([], dtype=np.float64)
+        )
+        values_b = (
+            np.concatenate(chunks_b).astype(np.float64, copy=False)
+            if chunks_b
+            else np.array([], dtype=np.float64)
+        )
+
+        mean_a, std_a, cv_a = _coefficient_of_variation(values_a)
+        mean_b, std_b, cv_b = _coefficient_of_variation(values_b)
+
+        row = {
+            "sub_tag": str(sub_tag),
+            "session_a": session_a,
+            "session_b": session_b,
+            "runs_pooled": ",".join(str(run) for run in sorted(run_set)),
+            "n_runs_session_a": int(run_counts.get((sub_tag, session_a), 0)),
+            "n_runs_session_b": int(run_counts.get((sub_tag, session_b), 0)),
+            "n_trials_session_a": int(values_a.size),
+            "n_trials_session_b": int(values_b.size),
+            "session_a_mean_projection": mean_a,
+            "session_a_std_projection": std_a,
+            "session_a_cv_projection": cv_a,
+            "session_b_mean_projection": mean_b,
+            "session_b_std_projection": std_b,
+            "session_b_cv_projection": cv_b,
+            "cv_diff_session_b_minus_a": np.nan,
+            "higher_cv_session": pd.NA,
+        }
+
+        if np.isfinite(cv_a) and np.isfinite(cv_b):
+            cv_diff = float(cv_b - cv_a)
+            row["cv_diff_session_b_minus_a"] = cv_diff
+            if np.isclose(cv_diff, 0.0):
+                row["higher_cv_session"] = "tie"
+            elif cv_diff > 0:
+                row["higher_cv_session"] = f"session_{session_b}"
+            else:
+                row["higher_cv_session"] = f"session_{session_a}"
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def _iqr(values):
+    values = np.asarray(values, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        return np.nan
+
+    q1, q3 = np.percentile(finite_values, [25.0, 75.0])
+    return float(q3 - q1)
+
+
+def _mad(values):
+    values = np.asarray(values, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        return np.nan
+
+    median_value = float(np.median(finite_values))
+    return float(np.median(np.abs(finite_values - median_value)))
+
+
+def build_group_level_session_cv_stats(subject_cv_df, session_a=1, session_b=2):
+    row = {
+        "session_a": int(session_a),
+        "session_b": int(session_b),
+        "runs_pooled": "1,2",
+        "n_subjects_total": 0,
+        "n_subjects_paired_finite_cv": 0,
+        "mean_session_a_cv": np.nan,
+        "mean_session_b_cv": np.nan,
+        "median_session_a_cv": np.nan,
+        "median_session_b_cv": np.nan,
+        "ks_statistic": np.nan,
+        "ks_p_two_sided": np.nan,
+        "iqr_session_a_cv": np.nan,
+        "iqr_session_b_cv": np.nan,
+        "iqr_diff_session_b_minus_a": np.nan,
+        "mad_session_a_cv": np.nan,
+        "mad_session_b_cv": np.nan,
+        "mad_diff_session_b_minus_a": np.nan,
+    }
+
+    if subject_cv_df is None or subject_cv_df.empty:
+        return pd.DataFrame([row])
+
+    df = subject_cv_df.copy()
+    row["n_subjects_total"] = int(len(df))
+
+    cv_a = pd.to_numeric(df["session_a_cv_projection"], errors="coerce").to_numpy(dtype=np.float64)
+    cv_b = pd.to_numeric(df["session_b_cv_projection"], errors="coerce").to_numpy(dtype=np.float64)
+    paired = np.isfinite(cv_a) & np.isfinite(cv_b)
+    row["n_subjects_paired_finite_cv"] = int(np.count_nonzero(paired))
+
+    if not np.any(paired):
+        return pd.DataFrame([row])
+
+    values_a = cv_a[paired]
+    values_b = cv_b[paired]
+
+    row["mean_session_a_cv"] = float(np.mean(values_a))
+    row["mean_session_b_cv"] = float(np.mean(values_b))
+    row["median_session_a_cv"] = float(np.median(values_a))
+    row["median_session_b_cv"] = float(np.median(values_b))
+
+    ks_result = ks_2samp(values_a, values_b, alternative="two-sided", method="auto")
+    row["ks_statistic"] = float(ks_result.statistic)
+    row["ks_p_two_sided"] = float(ks_result.pvalue)
+
+    iqr_a = _iqr(values_a)
+    iqr_b = _iqr(values_b)
+    mad_a = _mad(values_a)
+    mad_b = _mad(values_b)
+    row["iqr_session_a_cv"] = iqr_a
+    row["iqr_session_b_cv"] = iqr_b
+    row["mad_session_a_cv"] = mad_a
+    row["mad_session_b_cv"] = mad_b
+    if np.isfinite(iqr_a) and np.isfinite(iqr_b):
+        row["iqr_diff_session_b_minus_a"] = float(iqr_b - iqr_a)
+    if np.isfinite(mad_a) and np.isfinite(mad_b):
+        row["mad_diff_session_b_minus_a"] = float(mad_b - mad_a)
+
+    return pd.DataFrame([row])
 
 
 def compute_subject_session_ks(
@@ -274,6 +458,14 @@ def compute_subject_session_ks(
             "session_b_std_projection": float(np.std(values_b)) if values_b.size else np.nan,
             "variability_std_diff_session_b_minus_a": np.nan,
             "higher_variability_session": pd.NA,
+            "session_a_iqr_projection": _iqr(values_a),
+            "session_b_iqr_projection": _iqr(values_b),
+            "variability_iqr_diff_session_b_minus_a": np.nan,
+            "higher_iqr_session": pd.NA,
+            "session_a_mad_projection": _mad(values_a),
+            "session_b_mad_projection": _mad(values_b),
+            "variability_mad_diff_session_b_minus_a": np.nan,
+            "higher_mad_session": pd.NA,
             "ks_statistic": np.nan,
             "ks_p_two_sided": np.nan,
         }
@@ -289,6 +481,30 @@ def compute_subject_session_ks(
                 row["higher_variability_session"] = f"session_{session_b}"
             else:
                 row["higher_variability_session"] = f"session_{session_a}"
+
+        iqr_a = row["session_a_iqr_projection"]
+        iqr_b = row["session_b_iqr_projection"]
+        if np.isfinite(iqr_a) and np.isfinite(iqr_b):
+            iqr_diff = float(iqr_b - iqr_a)
+            row["variability_iqr_diff_session_b_minus_a"] = iqr_diff
+            if np.isclose(iqr_diff, 0.0):
+                row["higher_iqr_session"] = "tie"
+            elif iqr_diff > 0:
+                row["higher_iqr_session"] = f"session_{session_b}"
+            else:
+                row["higher_iqr_session"] = f"session_{session_a}"
+
+        mad_a = row["session_a_mad_projection"]
+        mad_b = row["session_b_mad_projection"]
+        if np.isfinite(mad_a) and np.isfinite(mad_b):
+            mad_diff = float(mad_b - mad_a)
+            row["variability_mad_diff_session_b_minus_a"] = mad_diff
+            if np.isclose(mad_diff, 0.0):
+                row["higher_mad_session"] = "tie"
+            elif mad_diff > 0:
+                row["higher_mad_session"] = f"session_{session_b}"
+            else:
+                row["higher_mad_session"] = f"session_{session_a}"
 
         if values_a.size > 0 and values_b.size > 0:
             ks_result = ks_2samp(values_a, values_b, alternative="two-sided", method="auto")
@@ -416,7 +632,7 @@ def _format_p_for_label(p_value):
 
 
 def _plot_subject_session_ks_summary(ks_df, group_ks_df, out_path, alpha=KS_ALPHA):
-    fig, axes = plt.subplots(2, 1, figsize=(14, 8.2), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(14, 11.2), sharex=True)
 
     if ks_df is None or ks_df.empty:
         for ax in axes:
@@ -427,7 +643,8 @@ def _plot_subject_session_ks_summary(ks_df, group_ks_df, out_path, alpha=KS_ALPH
         return
 
     ax = axes[0]
-    ax_var = axes[1]
+    ax_iqr = axes[1]
+    ax_mad = axes[2]
 
     df = ks_df.copy()
     df["sub_tag"] = df["sub_tag"].astype(str)
@@ -492,73 +709,164 @@ def _plot_subject_session_ks_summary(ks_df, group_ks_df, out_path, alpha=KS_ALPH
     ax.set_ylabel("KS statistic (D)")
     ax.grid(axis="y", alpha=0.2)
 
-    std_a = pd.to_numeric(df["session_a_std_projection"], errors="coerce").to_numpy(dtype=np.float64)
-    std_b = pd.to_numeric(df["session_b_std_projection"], errors="coerce").to_numpy(dtype=np.float64)
-    std_diff = std_b - std_a
-    finite_std = np.isfinite(std_diff)
-    if np.any(finite_std):
-        colors = np.where(std_diff[finite_std] >= 0.0, "tab:red", "tab:blue")
-        bars_var = ax_var.bar(
-            x[finite_std],
-            std_diff[finite_std],
-            width=0.8,
-            color=colors,
-            alpha=0.85,
-            edgecolor="black",
-            linewidth=0.3,
-        )
-        ax_var.axhline(0.0, color="black", linewidth=1.0)
-        finite_indices = np.flatnonzero(finite_std)
-        for bar, idx in zip(bars_var, finite_indices):
-            diff_val = float(std_diff[idx])
-            if np.isclose(diff_val, 0.0):
-                winner = "tie"
-            elif diff_val > 0:
-                winner = "s2"
-            else:
-                winner = "s1"
-            y_pad = max(1e-8, 0.04 * np.nanmax(np.abs(std_diff[finite_std])))
-            y_text = diff_val + (y_pad if diff_val >= 0 else -y_pad)
-            va = "bottom" if diff_val >= 0 else "top"
-            ax_var.text(
-                float(bar.get_x() + bar.get_width() / 2.0),
-                y_text,
-                winner,
-                ha="center",
-                va=va,
-                fontsize=6,
+    def _plot_variability_diff_row(ax_row, diff_values, ylabel):
+        finite_mask = np.isfinite(diff_values)
+        if np.any(finite_mask):
+            colors = np.where(diff_values[finite_mask] >= 0.0, "tab:red", "tab:blue")
+            bars_var = ax_row.bar(
+                x[finite_mask],
+                diff_values[finite_mask],
+                width=0.8,
+                color=colors,
+                alpha=0.85,
+                edgecolor="black",
+                linewidth=0.3,
             )
-        ax_var.text(
-            0.01,
-            0.98,
-            "red: session 2 more variable, blue: session 1 more variable",
-            transform=ax_var.transAxes,
-            ha="left",
-            va="top",
-            fontsize=8,
-        )
-    else:
-        ax_var.text(
-            0.5,
-            0.5,
-            "No finite variability data",
-            ha="center",
-            va="center",
-            transform=ax_var.transAxes,
-        )
+            ax_row.axhline(0.0, color="black", linewidth=1.0)
+            finite_indices = np.flatnonzero(finite_mask)
+            max_abs = float(np.nanmax(np.abs(diff_values[finite_mask])))
+            y_pad = max(1e-8, 0.04 * max_abs)
+            for bar, idx in zip(bars_var, finite_indices):
+                diff_val = float(diff_values[idx])
+                if np.isclose(diff_val, 0.0):
+                    winner = "tie"
+                elif diff_val > 0:
+                    winner = "s2"
+                else:
+                    winner = "s1"
+                y_text = diff_val + (y_pad if diff_val >= 0 else -y_pad)
+                va = "bottom" if diff_val >= 0 else "top"
+                ax_row.text(
+                    float(bar.get_x() + bar.get_width() / 2.0),
+                    y_text,
+                    winner,
+                    ha="center",
+                    va=va,
+                    fontsize=6,
+                )
+            ax_row.text(
+                0.01,
+                0.98,
+                "red: session 2 higher, blue: session 1 higher",
+                transform=ax_row.transAxes,
+                ha="left",
+                va="top",
+                fontsize=8,
+            )
+        else:
+            ax_row.text(
+                0.5,
+                0.5,
+                "No finite variability data",
+                ha="center",
+                va="center",
+                transform=ax_row.transAxes,
+            )
 
-    ax_var.set_ylabel("Std diff (session 2 - session 1)")
-    ax_var.set_xlabel("Subject")
-    ax_var.grid(axis="y", alpha=0.2)
+        ax_row.set_ylabel(ylabel)
+        ax_row.grid(axis="y", alpha=0.2)
+
+    iqr_a = pd.to_numeric(df["session_a_iqr_projection"], errors="coerce").to_numpy(dtype=np.float64)
+    iqr_b = pd.to_numeric(df["session_b_iqr_projection"], errors="coerce").to_numpy(dtype=np.float64)
+    iqr_diff = iqr_b - iqr_a
+    _plot_variability_diff_row(ax_iqr, iqr_diff, "IQR diff (session 2 - session 1)")
+
+    mad_a = pd.to_numeric(df["session_a_mad_projection"], errors="coerce").to_numpy(dtype=np.float64)
+    mad_b = pd.to_numeric(df["session_b_mad_projection"], errors="coerce").to_numpy(dtype=np.float64)
+    mad_diff = mad_b - mad_a
+    _plot_variability_diff_row(ax_mad, mad_diff, "MAD diff (session 2 - session 1)")
+
+    ax_mad.set_xlabel("Subject")
 
     ax.set_xticks(x)
-    ax_var.set_xticks(x)
-    ax_var.set_xticklabels(labels, rotation=45, ha="right")
+    ax_iqr.set_xticks(x)
+    ax_mad.set_xticks(x)
+    ax_mad.set_xticklabels(labels, rotation=45, ha="right")
 
     fig.suptitle(
         "KS test and variability direction per subject: session 1 vs session 2 (runs 1+2 pooled)"
     )
     fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+def _plot_session_cv_distribution_summary(subject_cv_df, group_cv_stats_df, out_path):
+    fig, ax = plt.subplots(1, 1, figsize=(10.5, 6.0))
+
+    if subject_cv_df is None or subject_cv_df.empty:
+        ax.text(0.5, 0.5, "No pooled CV data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
+
+    df = subject_cv_df.copy()
+    cv_a = pd.to_numeric(df["session_a_cv_projection"], errors="coerce").to_numpy(dtype=np.float64)
+    cv_b = pd.to_numeric(df["session_b_cv_projection"], errors="coerce").to_numpy(dtype=np.float64)
+    paired = np.isfinite(cv_a) & np.isfinite(cv_b)
+
+    if not np.any(paired):
+        ax.text(0.5, 0.5, "No finite pooled CV pairs", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
+
+    values_a = cv_a[paired]
+    values_b = cv_b[paired]
+    all_values = np.concatenate([values_a, values_b])
+    x = _density_grid(all_values, grid_points=512, fallback_pad=1e-6)
+    density_a = _evaluate_density(values_a, x)
+    density_b = _evaluate_density(values_b, x)
+
+    ax.plot(x, density_a, color="tab:blue", linewidth=2.0, label="Session 1 pooled CV")
+    ax.fill_between(x, density_a, color="tab:blue", alpha=0.2)
+    ax.plot(x, density_b, color="tab:red", linewidth=2.0, linestyle="--", label="Session 2 pooled CV")
+    ax.fill_between(x, density_b, color="tab:red", alpha=0.15)
+
+    median_a = float(np.median(values_a))
+    median_b = float(np.median(values_b))
+    ax.axvline(median_a, color="tab:blue", linestyle=":", linewidth=1.2)
+    ax.axvline(median_b, color="tab:red", linestyle=":", linewidth=1.2)
+
+    summary = {}
+    if group_cv_stats_df is not None and not group_cv_stats_df.empty:
+        summary = group_cv_stats_df.iloc[0].to_dict()
+
+    ks_d = float(summary.get("ks_statistic", np.nan))
+    ks_p = float(summary.get("ks_p_two_sided", np.nan))
+    iqr_a = float(summary.get("iqr_session_a_cv", np.nan))
+    iqr_b = float(summary.get("iqr_session_b_cv", np.nan))
+    iqr_diff = float(summary.get("iqr_diff_session_b_minus_a", np.nan))
+    mad_a = float(summary.get("mad_session_a_cv", np.nan))
+    mad_b = float(summary.get("mad_session_b_cv", np.nan))
+    mad_diff = float(summary.get("mad_diff_session_b_minus_a", np.nan))
+
+    stats_text = (
+        f"n paired subjects = {int(np.count_nonzero(paired))}\n"
+        f"KS: D={ks_d:.3g}, p={ks_p:.3g}\n"
+        f"IQR: s1={iqr_a:.3g}, s2={iqr_b:.3g}, s2-s1={iqr_diff:.3g}\n"
+        f"MAD: s1={mad_a:.3g}, s2={mad_b:.3g}, s2-s1={mad_diff:.3g}"
+    )
+    ax.text(
+        0.98,
+        0.98,
+        stats_text,
+        transform=ax.transAxes,
+        va="top",
+        ha="right",
+        fontsize=9,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.9, "edgecolor": "0.7"},
+    )
+
+    ax.set_xlabel("Pooled-trial CV projection (runs 1+2)")
+    ax.set_ylabel("Probability density")
+    ax.set_title("Session 1 vs Session 2 pooled-trial CV distribution")
+    ax.legend(loc="upper left", fontsize=8)
+    ax.grid(axis="y", alpha=0.2)
+
+    fig.tight_layout()
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
 
@@ -678,6 +986,8 @@ def main():
     )
     ks_subject_csv_path = os.path.join(out_dir, f"{stem}_sub_session12_ks_stats.csv")
     ks_group_csv_path = os.path.join(out_dir, f"{stem}_group_session12_ks_inference.csv")
+    pooled_cv_subject_csv_path = os.path.join(out_dir, f"{stem}_sub_session12_pooled_cv_stats.csv")
+    pooled_cv_group_csv_path = os.path.join(out_dir, f"{stem}_group_session12_pooled_cv_stats.csv")
     variance_plot_path = os.path.join(
         out_dir, f"{stem}_sub_ses_run_projection_variability_subject_comp.png"
     )
@@ -685,6 +995,7 @@ def main():
         out_dir, f"{stem}_sub_ses_run_projection_std_over_rms_subject_comp.png"
     )
     ks_plot_path = os.path.join(out_dir, f"{stem}_sub_session12_ks_summary.png")
+    pooled_cv_plot_path = os.path.join(out_dir, f"{stem}_sub_session12_pooled_cv_summary.png")
 
     pairwise_stats_df = build_projection_variability_stats_table(run_variance_df)
     subject_ks_df = compute_subject_session_ks(
@@ -695,12 +1006,25 @@ def main():
         alpha=KS_ALPHA,
     )
     group_ks_df = build_group_level_ks_inference(subject_ks_df, alpha=KS_ALPHA)
+    pooled_cv_subject_df = compute_subject_session_pooled_cv(
+        run_segments,
+        session_a=1,
+        session_b=2,
+        runs=(1, 2),
+    )
+    pooled_cv_group_df = build_group_level_session_cv_stats(
+        pooled_cv_subject_df,
+        session_a=1,
+        session_b=2,
+    )
 
     run_variance_df.to_csv(variance_csv_path, index=False)
     run_std_rms_df.to_csv(std_rms_csv_path, index=False)
     pairwise_stats_df.to_csv(stats_csv_path, index=False)
     subject_ks_df.to_csv(ks_subject_csv_path, index=False)
     group_ks_df.to_csv(ks_group_csv_path, index=False)
+    pooled_cv_subject_df.to_csv(pooled_cv_subject_csv_path, index=False)
+    pooled_cv_group_df.to_csv(pooled_cv_group_csv_path, index=False)
 
     _plot_metric_by_ses_run(
         run_variance_df,
@@ -724,26 +1048,39 @@ def main():
         out_path=ks_plot_path,
         alpha=KS_ALPHA,
     )
+    _plot_session_cv_distribution_summary(
+        pooled_cv_subject_df,
+        pooled_cv_group_df,
+        out_path=pooled_cv_plot_path,
+    )
 
     print(f"Projection length: {projection.size}")
     print(f"Projection layout: {layout}")
     print(f"Rows (variance): {len(run_variance_df)}")
     print(f"Rows (std/rms): {len(run_std_rms_df)}")
     print(f"Rows (subject KS): {len(subject_ks_df)}")
+    print(f"Rows (subject pooled CV): {len(pooled_cv_subject_df)}")
     print(f"Saved variance CSV: {variance_csv_path}")
     print(f"Saved std/rms CSV:  {std_rms_csv_path}")
     print(f"Saved stats CSV:    {stats_csv_path}")
     print(f"Saved subject KS CSV: {ks_subject_csv_path}")
     print(f"Saved group KS CSV:   {ks_group_csv_path}")
+    print(f"Saved subject pooled CV CSV: {pooled_cv_subject_csv_path}")
+    print(f"Saved group pooled CV CSV:   {pooled_cv_group_csv_path}")
     print(f"Saved variability figure: {variance_plot_path}")
     print(f"Saved std/rms figure:    {std_rms_plot_path}")
     print(f"Saved KS figure:         {ks_plot_path}")
+    print(f"Saved pooled CV figure:  {pooled_cv_plot_path}")
     print("\nProjection variability pairwise statistics:")
     print(pairwise_stats_df.to_string(index=False))
     print("\nSubject-level KS statistics (session 1 vs session 2, runs 1+2 pooled):")
     print(subject_ks_df.to_string(index=False))
     print("\nGroup-level KS inference:")
     print(group_ks_df.to_string(index=False))
+    print("\nSubject-level pooled CV statistics (session 1 vs session 2, runs 1+2 pooled):")
+    print(pooled_cv_subject_df.to_string(index=False))
+    print("\nGroup-level pooled CV session comparison:")
+    print(pooled_cv_group_df.to_string(index=False))
 
 
 if __name__ == "__main__":

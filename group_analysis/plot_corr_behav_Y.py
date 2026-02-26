@@ -188,26 +188,206 @@ def light_subject_colors(n_subjects, saturation=0.25, value=0.95):
     return [colorsys.hsv_to_rgb(float(h), float(saturation), float(value)) for h in hues]
 
 
-def plot_subject_projection_over_trials(manifest_df, projection_values, output_path):
-    subject_tags = sorted(manifest_df["sub_tag"].astype(str).unique())
+def build_projection_run_signal(row, projection_values, max_trials=90):
+    start = int(row.offset_start)
+    end = int(row.offset_end)
+    proj_segment = np.asarray(projection_values[start:end], dtype=np.float64)
+
+    trial_keep_path = Path(str(row.trial_keep_path))
+    keep_mask = np.asarray(np.load(trial_keep_path), dtype=bool)
+    kept_trial_indices = np.flatnonzero(keep_mask)
+    if proj_segment.size != kept_trial_indices.size:
+        raise ValueError(
+            f"Projection length ({proj_segment.size}) does not match number of kept trials "
+            f"({kept_trial_indices.size}) for {str(row.sub_tag)} ses-{int(row.ses)} run-{int(row.run)}."
+        )
+
+    run_signal = np.full(int(max_trials), np.nan, dtype=np.float64)
+    keep_in_axis = kept_trial_indices < int(max_trials)
+    if np.any(keep_in_axis):
+        run_signal[kept_trial_indices[keep_in_axis]] = proj_segment[keep_in_axis]
+    return run_signal
+
+
+def select_random_subjects(run_df, n_subjects=9, seed=42, excluded_subject_digits=(17,)):
+    all_subjects = np.array(sorted(run_df["sub_tag"].astype(str).unique()))
+    excluded_digits_set = {int(v) for v in np.atleast_1d(excluded_subject_digits)}
+    eligible_subjects = np.array(
+        [sub for sub in all_subjects if int(_subject_digits(sub)) not in excluded_digits_set]
+    )
+    if int(n_subjects) > eligible_subjects.size:
+        raise ValueError(
+            f"Requested {n_subjects} subjects, but only {eligible_subjects.size} available "
+            f"after excluding {sorted(excluded_digits_set)}."
+        )
+
+    rng = np.random.default_rng(seed)
+    selected_subjects = np.sort(rng.choice(eligible_subjects, size=int(n_subjects), replace=False))
+    return selected_subjects, eligible_subjects
+
+
+def plot_subject_projection_over_trials(manifest_df, projection_values, output_path, max_trials=90):
+    run_df = manifest_df.sort_values(["sub_tag", "ses", "run", "offset_start"]).reset_index(drop=True)
+    subject_tags = sorted(run_df["sub_tag"].astype(str).unique())
     colors = light_subject_colors(len(subject_tags))
-    fig, ax = plt.subplots(figsize=(16, 6), constrained_layout=True)
+    color_map = {sub_tag: colors[i] for i, sub_tag in enumerate(subject_tags)}
 
-    for color, sub_tag in zip(colors, subject_tags):
-        sub_rows = manifest_df[manifest_df["sub_tag"] == sub_tag].sort_values("offset_start")
-        for _, row in sub_rows.iterrows():
-            start = int(row.offset_start)
-            end = int(row.offset_end)
-            trial_idx = np.arange(start, end, dtype=int)
-            proj_segment = np.asarray(projection_values[start:end], dtype=np.float64)
-            finite_mask = np.isfinite(proj_segment)
-            if np.any(finite_mask):
-                ax.plot(trial_idx[finite_mask], proj_segment[finite_mask], color=color, lw=1.0, alpha=0.8)
+    trial_axis = np.arange(1, int(max_trials) + 1, dtype=int)
+    fig, ax = plt.subplots(figsize=(14, 7), constrained_layout=True)
 
-    ax.set_title(f"Projected signal over all kept trials ({len(subject_tags)} subjects)")
-    ax.set_xlabel("Global kept-trial index")
+    for _, row in run_df.iterrows():
+        sub_tag = str(row.sub_tag)
+        run_signal = build_projection_run_signal(row, projection_values, max_trials=trial_axis.size)
+        ax.plot(trial_axis, run_signal, color=color_map[sub_tag], lw=1.0, alpha=0.55)
+
+    ax.set_title(f"Projected signal over trials for all runs ({len(run_df)} runs)")
+    ax.set_xlabel("Trial number")
     ax.set_ylabel("Projected signal")
+    ax.set_xlim(1, trial_axis.size)
     ax.grid(alpha=0.25)
+    fig.savefig(output_path, dpi=300)
+
+
+def plot_random_subjects_projection_grid(
+    manifest_df,
+    projection_values,
+    output_path,
+    n_subjects=9,
+    max_trials=90,
+    seed=42,
+    excluded_subject_digits=(17,),
+):
+    run_df = manifest_df.sort_values(["sub_tag", "ses", "run", "offset_start"]).reset_index(drop=True)
+    selected_subjects, eligible_subjects = select_random_subjects(
+        run_df=run_df,
+        n_subjects=n_subjects,
+        seed=seed,
+        excluded_subject_digits=excluded_subject_digits,
+    )
+    ses_run_pairs = (
+        run_df[["ses", "run"]]
+        .drop_duplicates()
+        .sort_values(["ses", "run"])
+        .to_records(index=False)
+        .tolist()
+    )
+    run_colors = light_subject_colors(len(ses_run_pairs), saturation=0.35, value=0.95)
+    run_color_map = {pair: run_colors[i] for i, pair in enumerate(ses_run_pairs)}
+
+    trial_axis = np.arange(1, int(max_trials) + 1, dtype=int)
+    fig, axes = plt.subplots(3, 3, figsize=(16, 12), sharex=True, sharey=True, constrained_layout=True)
+    axes = np.asarray(axes).reshape(-1)
+
+    for idx, sub_tag in enumerate(selected_subjects):
+        ax = axes[idx]
+        sub_rows = run_df[run_df["sub_tag"].astype(str) == sub_tag].sort_values(["ses", "run", "offset_start"])
+        subplot_handles = []
+        subplot_labels = []
+        for _, row in sub_rows.iterrows():
+            ses_run = (int(row.ses), int(row.run))
+            run_signal = build_projection_run_signal(row, projection_values, max_trials=trial_axis.size)
+            line = ax.plot(
+                trial_axis,
+                run_signal,
+                color=run_color_map[ses_run],
+                lw=1.3,
+                alpha=0.9,
+            )[0]
+            label = f"ses-{ses_run[0]} run-{ses_run[1]}"
+            if label not in subplot_labels:
+                subplot_labels.append(label)
+                subplot_handles.append(line)
+
+        ax.set_title(str(sub_tag))
+        ax.set_xlim(1, trial_axis.size)
+        ax.grid(alpha=0.25)
+        if subplot_handles:
+            ax.legend(subplot_handles, subplot_labels, loc="upper right", fontsize=8, frameon=False)
+
+    for ax in axes[len(selected_subjects):]:
+        ax.axis("off")
+    fig.suptitle(
+        f"Y over trials for random subjects ({len(selected_subjects)} of {eligible_subjects.size}, excluding 17)",
+        y=1.02,
+    )
+    fig.supxlabel("Trial number")
+    fig.supylabel("Y (projected signal)")
+    fig.savefig(output_path, dpi=300)
+
+
+def plot_random_subjects_session_concat(
+    manifest_df,
+    projection_values,
+    output_path,
+    n_subjects=9,
+    max_trials_per_run=90,
+    runs=(1, 2),
+    seed=42,
+    excluded_subject_digits=(17,),
+):
+    run_df = manifest_df.sort_values(["sub_tag", "ses", "run", "offset_start"]).reset_index(drop=True)
+    selected_subjects, eligible_subjects = select_random_subjects(
+        run_df=run_df,
+        n_subjects=n_subjects,
+        seed=seed,
+        excluded_subject_digits=excluded_subject_digits,
+    )
+
+    sessions = np.array(sorted(run_df["ses"].astype(int).unique()))
+    if sessions.size < 2:
+        raise ValueError(f"Expected at least 2 sessions, found {sessions.size}.")
+    sessions = sessions[:2]
+
+    runs = tuple(int(r) for r in runs)
+    total_trials = int(max_trials_per_run) * len(runs)
+    trial_axis = np.arange(1, total_trials + 1, dtype=int)
+
+    subject_colors = light_subject_colors(len(selected_subjects), saturation=0.3, value=0.95)
+    subject_color_map = {sub: subject_colors[i] for i, sub in enumerate(selected_subjects)}
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), sharey=True, constrained_layout=True)
+    axes = np.asarray(axes).reshape(-1)
+
+    for ax_idx, ses in enumerate(sessions):
+        ax = axes[ax_idx]
+        for sub_tag in selected_subjects:
+            sub_ses_rows = run_df[
+                (run_df["sub_tag"].astype(str) == sub_tag) & (run_df["ses"].astype(int) == int(ses))
+            ].sort_values(["run", "offset_start"])
+
+            session_signal = np.full(total_trials, np.nan, dtype=np.float64)
+            for run_i, run_id in enumerate(runs):
+                row_for_run = sub_ses_rows[sub_ses_rows["run"].astype(int) == int(run_id)]
+                if row_for_run.empty:
+                    continue
+                run_signal = build_projection_run_signal(
+                    row_for_run.iloc[0],
+                    projection_values,
+                    max_trials=int(max_trials_per_run),
+                )
+                start_idx = run_i * int(max_trials_per_run)
+                end_idx = start_idx + int(max_trials_per_run)
+                session_signal[start_idx:end_idx] = run_signal
+
+            ax.plot(
+                trial_axis,
+                session_signal,
+                color=subject_color_map[sub_tag],
+                lw=1.3,
+                alpha=0.85,
+            )
+
+        ax.set_title(f"ses-{int(ses)}")
+        ax.set_xlim(1, total_trials)
+        ax.set_xlabel("Trial number (run-1 then run-2)")
+        ax.axvline(int(max_trials_per_run) + 0.5, color="0.35", ls="--", lw=1.0, alpha=0.7)
+        ax.grid(alpha=0.25)
+
+    axes[0].set_ylabel("Y (projected signal)")
+    fig.suptitle(
+        f"Y over {total_trials} trials for random subjects "
+        f"({len(selected_subjects)} of {eligible_subjects.size})"
+    )
     fig.savefig(output_path, dpi=300)
 
 
@@ -465,6 +645,23 @@ plot_subject_projection_over_trials(
     manifest_df=manifest,
     projection_values=projection,
     output_path="projection_all_trials_all_subjects.png",
+)
+plot_random_subjects_projection_grid(
+    manifest_df=manifest,
+    projection_values=projection,
+    output_path="projection_random9_subjects_grid.png",
+    n_subjects=9,
+    max_trials=90,
+    seed=RNG_SEED,
+)
+plot_random_subjects_session_concat(
+    manifest_df=manifest,
+    projection_values=projection,
+    output_path="projection_random9_subjects_session_concat_180.png",
+    n_subjects=9,
+    max_trials_per_run=90,
+    runs=(1, 2),
+    seed=RNG_SEED,
 )
 
 plt.show()
