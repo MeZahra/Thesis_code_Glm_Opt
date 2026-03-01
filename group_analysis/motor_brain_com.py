@@ -20,101 +20,44 @@ def _resolve_trial_keep_path(row, trial_keep_root):
     from_manifest = str(getattr(row, "trial_keep_path", "") or "").strip()
     if from_manifest and os.path.exists(from_manifest):
         return from_manifest
-
-    candidate = os.path.join(
-        trial_keep_root,
-        str(row.sub_tag),
-        f"ses-{int(row.ses)}",
-        "GLMOutputs-mni-std",
-        f"trial_keep_run{int(row.run)}.npy",
-    )
+    candidate = os.path.join(trial_keep_root, str(row.sub_tag), f"ses-{int(row.ses)}", "GLMOutputs-mni-std",
+        f"trial_keep_run{int(row.run)}.npy")
     if os.path.exists(candidate):
         return candidate
-
-    raise FileNotFoundError(
-        f"trial_keep file not found for {row.sub_tag}, ses-{row.ses}, run-{row.run}. "
-        f"Checked: '{from_manifest}' and '{candidate}'"
-    )
 
 
 def _load_keep_mask(path):
     keep = np.load(path)
     keep = np.asarray(keep, dtype=bool)
-    if keep.ndim != 1:
-        raise ValueError(f"Expected 1D keep mask in {path}, got shape {keep.shape}.")
     return keep
 
 
 def _extract_subject_digits(sub_tag):
     match = re.search(r"(\d+)$", str(sub_tag))
-    if not match:
-        raise ValueError(f"Could not parse subject digits from '{sub_tag}'.")
     return match.group(1)
 
 
 def _resolve_behavior_path(sub_tag, ses, run, behavior_root):
     subject_digits = _extract_subject_digits(sub_tag)
-    behavior_path = os.path.join(
-        behavior_root,
-        f"PSPD{subject_digits}_ses_{int(ses)}_run_{int(run)}.npy",
-    )
-    if not os.path.exists(behavior_path):
-        raise FileNotFoundError(
-            f"Missing behavior file for {sub_tag}, ses-{ses}, run-{run}: {behavior_path}"
-        )
+    behavior_path = os.path.join(behavior_root, f"PSPD{subject_digits}_ses_{int(ses)}_run_{int(run)}.npy")
     return behavior_path
 
 
 def _load_behavior_column(path, behavior_column):
     behavior = np.asarray(np.load(path), dtype=np.float64)
-    if behavior.ndim == 1:
-        if behavior_column != 0:
-            raise IndexError(
-                f"Behavior file {path} is 1D; requested column {behavior_column}."
-            )
-        return behavior
-    if behavior.ndim != 2:
-        raise ValueError(
-            f"Behavior file {path} must be 1D or 2D, got shape {behavior.shape}."
-        )
-    if not (0 <= int(behavior_column) < int(behavior.shape[1])):
-        raise IndexError(
-            f"Behavior column {behavior_column} is out of bounds for {path} "
-            f"(shape={behavior.shape})."
-        )
     return behavior[:, int(behavior_column)]
 
 
 def _load_run_kept_projection_behavior(segment, behavior_root, behavior_column):
-    behavior_path = _resolve_behavior_path(
-        segment["sub_tag"], segment["ses"], segment["run"], behavior_root
-    )
+    behavior_path = _resolve_behavior_path(segment["sub_tag"], segment["ses"], segment["run"], behavior_root)
     behavior_column_values = _load_behavior_column(behavior_path, behavior_column)
-
     n_trials_source = int(segment["n_trials_source"])
-    if behavior_column_values.size < n_trials_source:
-        raise ValueError(
-            f"Behavior file {behavior_path} has {behavior_column_values.size} trials, "
-            f"expected at least {n_trials_source}."
-        )
     if behavior_column_values.size > n_trials_source:
         behavior_column_values = behavior_column_values[:n_trials_source]
-
     keep_mask = np.asarray(segment["keep_mask"], dtype=bool)
-    if keep_mask.size != n_trials_source:
-        raise ValueError(
-            f"Keep mask length mismatch for {segment['sub_tag']} ses-{segment['ses']} "
-            f"run-{segment['run']} ({keep_mask.size} vs {n_trials_source})."
-        )
 
     kept_behavior = behavior_column_values[keep_mask]
-    kept_projection = np.asarray(segment["values"], dtype=np.float64)
-    if kept_projection.size != kept_behavior.size:
-        raise ValueError(
-            f"Kept projection/behavior length mismatch for {segment['sub_tag']} "
-            f"ses-{segment['ses']} run-{segment['run']} "
-            f"({kept_projection.size} vs {kept_behavior.size})."
-        )
+    kept_projection = np.asarray(segment["values"])
     return kept_projection, kept_behavior, behavior_path
 
 
@@ -124,17 +67,9 @@ def _prepare_run_entries(manifest_df, trial_keep_root):
     for row in rows:
         keep_path = _resolve_trial_keep_path(row, trial_keep_root)
         keep_mask = _load_keep_mask(keep_path)
-        run_entries.append(
-            {
-                "sub_tag": str(row.sub_tag),
-                "ses": int(row.ses),
-                "run": int(row.run),
-                "keep_path": keep_path,
-                "keep_mask": keep_mask,
-                "keep_count": int(np.count_nonzero(keep_mask)),
-                "source_count": int(keep_mask.size),
-            }
-        )
+        run_entries.append({"sub_tag": str(row.sub_tag), "ses": int(row.ses), "run": int(row.run),
+                            "keep_path": keep_path, "keep_mask": keep_mask,
+                            "keep_count": int(np.count_nonzero(keep_mask)), "source_count": int(keep_mask.size)})
     return run_entries
 
 
@@ -146,11 +81,6 @@ def _infer_projection_layout(projection_len, run_entries):
         return "kept_only"
     if projection_len == total_source:
         return "source_all"
-
-    raise ValueError(
-        "Projection length does not match keep-trial bookkeeping. "
-        f"projection_len={projection_len}, total_kept={total_kept}, total_source={total_source}."
-    )
 
 
 def split_projection_by_run(projection, manifest_df, trial_keep_root):
@@ -172,37 +102,19 @@ def split_projection_by_run(projection, manifest_df, trial_keep_root):
             run_values = run_chunk[keep_mask]
             cursor += seg_len
 
-        run_segments.append(
-            {
-                "sub_tag": entry["sub_tag"],
-                "ses": entry["ses"],
-                "run": entry["run"],
-                "n_trials_source": entry["source_count"],
-                "n_trials_kept": int(run_values.size),
-                "keep_mask": entry["keep_mask"].copy(),
-                "values": np.asarray(run_values, dtype=projection.dtype),
-            }
-        )
-
-    if cursor != projection.size:
-        raise RuntimeError(f"Consumed {cursor} elements but projection has {projection.size}.")
+        run_segments.append({"sub_tag": entry["sub_tag"], "ses": entry["ses"], "run": entry["run"],
+                             "n_trials_source": entry["source_count"], "n_trials_kept": int(run_values.size),
+                             "keep_mask": entry["keep_mask"].copy(), "values": run_values})
 
     return run_segments, layout
 
 
 def _coefficient_of_variation(values):
-    values = np.asarray(values, dtype=np.float64)
     finite_values = values[np.isfinite(values)]
-    if finite_values.size == 0:
-        return np.nan, np.nan, np.nan
-
-    mean_value = float(np.mean(finite_values))
-    std_value = float(np.std(finite_values))
+    mean_value = np.mean(finite_values)
+    std_value = np.std(finite_values)
     mean_abs = abs(mean_value)
-    if not np.isfinite(mean_abs) or np.isclose(mean_abs, 0.0):
-        cv_value = np.nan
-    else:
-        cv_value = float(std_value / mean_abs)
+    cv_value = float(std_value / mean_abs)
     return mean_value, std_value, cv_value
 
 
@@ -218,17 +130,9 @@ def compute_run_variances(run_segments):
         else:
             proj_mean = float(np.mean(proj_finite))
             proj_var = float(np.var(proj_finite))
-        rows.append(
-            {
-                "sub_tag": str(segment["sub_tag"]),
-                "ses": int(segment["ses"]),
-                "run": int(segment["run"]),
-                "n_trials_source": int(segment["n_trials_source"]),
-                "n_trials_kept": int(proj_finite.size),
-                "mean_projection": proj_mean,
-                "variance_projection": proj_var,
-            }
-        )
+        rows.append({"sub_tag": str(segment["sub_tag"]), "ses": int(segment["ses"]), "run": int(segment["run"]),
+                     "n_trials_source": int(segment["n_trials_source"]), "n_trials_kept": int(proj_finite.size),
+                     "mean_projection": proj_mean, "variance_projection": proj_var})
     return pd.DataFrame(rows)
 
 
@@ -238,9 +142,7 @@ def compute_run_behavior_tables(run_segments, behavior_root, behavior_column):
     cv_rows = []
 
     for segment in run_segments:
-        kept_projection, kept_behavior, behavior_path = _load_run_kept_projection_behavior(
-            segment, behavior_root, behavior_column
-        )
+        kept_projection, kept_behavior, behavior_path = _load_run_kept_projection_behavior(segment, behavior_root, behavior_column)
         finite_mask = np.isfinite(kept_projection) & np.isfinite(kept_behavior)
         projection_values = np.asarray(kept_projection[finite_mask], dtype=np.float64)
         behavior_values = np.asarray(kept_behavior[finite_mask], dtype=np.float64)
@@ -251,26 +153,22 @@ def compute_run_behavior_tables(run_segments, behavior_root, behavior_column):
         else:
             proj_mean = float(np.mean(projection_values))
             proj_var = float(np.var(projection_values))
-        run_rows.append(
-            {
+        run_rows.append({
                 "sub_tag": str(segment["sub_tag"]),
                 "ses": int(segment["ses"]),
                 "run": int(segment["run"]),
                 "n_trials_source": int(segment["n_trials_source"]),
                 "n_trials_kept": int(projection_values.size),
                 "mean_projection": proj_mean,
-                "variance_projection": proj_var,
-            }
-        )
+                "variance_projection": proj_var})
 
         if behavior_values.size == 0:
             beh_mean = np.nan
             beh_var = np.nan
         else:
-            beh_mean = float(np.mean(behavior_values))
-            beh_var = float(np.var(behavior_values))
-        behavior_rows.append(
-            {
+            beh_mean = np.mean(behavior_values)
+            beh_var = np.var(behavior_values)
+        behavior_rows.append({
                 "sub_tag": str(segment["sub_tag"]),
                 "ses": int(segment["ses"]),
                 "run": int(segment["run"]),
@@ -278,16 +176,12 @@ def compute_run_behavior_tables(run_segments, behavior_root, behavior_column):
                 "n_trials_behavior_kept": int(behavior_values.size),
                 "mean_behavior_col2": beh_mean,
                 "variance_behavior_col2": beh_var,
-                "behavior_path": behavior_path,
-            }
-        )
+                "behavior_path": behavior_path})
 
         proj_mean, proj_std, proj_cv = _coefficient_of_variation(projection_values)
         beh_mean, beh_std, beh_cv = _coefficient_of_variation(behavior_values)
 
-        cv_rows.append(
-            {
-                "sub_tag": str(segment["sub_tag"]),
+        cv_rows.append({"sub_tag": str(segment["sub_tag"]),
                 "ses": int(segment["ses"]),
                 "run": int(segment["run"]),
                 "n_trials_paired_finite": int(projection_values.size),
@@ -296,19 +190,12 @@ def compute_run_behavior_tables(run_segments, behavior_root, behavior_column):
                 "cv_projection": proj_cv,
                 "mean_behavior_col2": beh_mean,
                 "std_behavior_col2": beh_std,
-                "cv_behavior_col2": beh_cv,
-            }
-        )
+                "cv_behavior_col2": beh_cv})
 
-    return (
-        pd.DataFrame(run_rows),
-        pd.DataFrame(behavior_rows),
-        pd.DataFrame(cv_rows),
-    )
+    return (pd.DataFrame(run_rows), pd.DataFrame(behavior_rows), pd.DataFrame(cv_rows))
 
 
 def _scale_values(values, method):
-    values = np.asarray(values, dtype=np.float64)
     scaled = np.full(values.shape, np.nan, dtype=np.float64)
     finite_mask = np.isfinite(values)
     if not np.any(finite_mask):
@@ -333,24 +220,14 @@ def _scale_values(values, method):
         else:
             scaled[finite_mask] = (finite_values - lower) / spread
         return scaled
-    raise ValueError(f"Unsupported scaling method '{method}'.")
 
 
 def build_projection_behavior_comparison(run_df, behavior_df, scale_method):
-    comparison_df = run_df.merge(
-        behavior_df,
-        on=["sub_tag", "ses", "run"],
-        how="inner",
-        validate="one_to_one",
-    )
-    comparison_df["variance_projection_scaled"] = _scale_values(
-        comparison_df["variance_projection"].to_numpy(dtype=np.float64),
-        method=scale_method,
-    )
-    comparison_df["variance_behavior_scaled"] = _scale_values(
-        comparison_df["variance_behavior_col2"].to_numpy(dtype=np.float64),
-        method=scale_method,
-    )
+    comparison_df = run_df.merge(behavior_df, on=["sub_tag", "ses", "run"], how="inner", validate="one_to_one")
+    comparison_df["variance_projection_scaled"] = _scale_values(comparison_df["variance_projection"],
+                                                                method=scale_method)
+    comparison_df["variance_behavior_scaled"] = _scale_values(comparison_df["variance_behavior_col2"],
+                                                              method=scale_method)
     return comparison_df
 
 
@@ -366,34 +243,32 @@ def add_subject_median_normalized_variance_features(comparison_df):
     """Add subject-wise median baselines and log-relative variance features."""
     df = comparison_df.copy()
 
-    df["subject_median_variance_projection"] = df.groupby("sub_tag")[
-        "variance_projection"
-    ].transform(lambda s: _finite_median(s.to_numpy(dtype=np.float64)))
+    df["subject_median_variance_projection"] = df.groupby("sub_tag")["variance_projection"].transform(lambda s: _finite_median(s))
     df["subject_median_variance_behavior_col2"] = df.groupby("sub_tag")[
         "variance_behavior_col2"
-    ].transform(lambda s: _finite_median(s.to_numpy(dtype=np.float64)))
+    ].transform(lambda s: _finite_median(s))
 
-    proj = df["variance_projection"].to_numpy(dtype=np.float64)
-    beh = df["variance_behavior_col2"].to_numpy(dtype=np.float64)
-    proj_med = df["subject_median_variance_projection"].to_numpy(dtype=np.float64)
-    beh_med = df["subject_median_variance_behavior_col2"].to_numpy(dtype=np.float64)
+    proj = df["variance_projection"]
+    beh = df["variance_behavior_col2"]
+    proj_med = df["subject_median_variance_projection"]
+    beh_med = df["subject_median_variance_behavior_col2"]
 
-    proj_rel = np.full(proj.shape, np.nan, dtype=np.float64)
-    beh_rel = np.full(beh.shape, np.nan, dtype=np.float64)
+    proj_rel = np.full(proj.shape, np.nan)
+    beh_rel = np.full(beh.shape, np.nan)
 
     proj_rel_mask = np.isfinite(proj) & np.isfinite(proj_med) & (proj_med > 0.0)
     beh_rel_mask = np.isfinite(beh) & np.isfinite(beh_med) & (beh_med > 0.0)
     proj_rel[proj_rel_mask] = proj[proj_rel_mask] / proj_med[proj_rel_mask]
     beh_rel[beh_rel_mask] = beh[beh_rel_mask] / beh_med[beh_rel_mask]
 
-    proj_log_rel = np.full(proj.shape, np.nan, dtype=np.float64)
-    beh_log_rel = np.full(beh.shape, np.nan, dtype=np.float64)
+    proj_log_rel = np.full(proj.shape, np.nan)
+    beh_log_rel = np.full(beh.shape, np.nan)
     proj_log_mask = np.isfinite(proj_rel) & (proj_rel > 0.0)
     beh_log_mask = np.isfinite(beh_rel) & (beh_rel > 0.0)
     proj_log_rel[proj_log_mask] = np.log(proj_rel[proj_log_mask])
     beh_log_rel[beh_log_mask] = np.log(beh_rel[beh_log_mask])
 
-    log_rel_diff = np.full(proj.shape, np.nan, dtype=np.float64)
+    log_rel_diff = np.full(proj.shape, np.nan)
     paired_log_mask = np.isfinite(proj_log_rel) & np.isfinite(beh_log_rel)
     log_rel_diff[paired_log_mask] = proj_log_rel[paired_log_mask] - beh_log_rel[paired_log_mask]
 
@@ -405,24 +280,17 @@ def add_subject_median_normalized_variance_features(comparison_df):
     return df
 
 
-def _one_sided_p_less_from_two_sided(two_sided_p, estimate):
-    if not np.isfinite(two_sided_p) or not np.isfinite(estimate):
-        return np.nan
-    if estimate < 0:
-        return float(two_sided_p / 2.0)
-    return float(1.0 - (two_sided_p / 2.0))
+# def _one_sided_p_less_from_two_sided(two_sided_p, estimate):
+#     if not np.isfinite(two_sided_p) or not np.isfinite(estimate):
+#         return np.nan
+#     if estimate < 0:
+#         return float(two_sided_p / 2.0)
+#     return float(1.0 - (two_sided_p / 2.0))
 
 
 def _iqr_outlier_mask(values, iqr_multiplier=3.0):
-    values = np.asarray(values, dtype=np.float64)
-    if values.size == 0:
-        return np.zeros(0, dtype=bool)
-
     q1, q3 = np.percentile(values, [25.0, 75.0])
     iqr = float(q3 - q1)
-    if not np.isfinite(iqr) or iqr <= 0.0:
-        return np.zeros(values.shape, dtype=bool)
-
     lower = float(q1 - (float(iqr_multiplier) * iqr))
     upper = float(q3 + (float(iqr_multiplier) * iqr))
     return (values < lower) | (values > upper)
@@ -448,21 +316,10 @@ def _build_pair_labels(metric_df):
 
 
 def _paired_outlier_filtered(values_a, values_b, labels=None, iqr_multiplier=3.0):
-    values_a = np.asarray(values_a, dtype=np.float64)
-    values_b = np.asarray(values_b, dtype=np.float64)
-    if values_a.shape != values_b.shape:
-        raise ValueError(
-            f"Paired arrays shape mismatch: {values_a.shape} vs {values_b.shape}."
-        )
-
     if labels is None:
         labels = np.arange(values_a.size).astype(str)
     else:
         labels = np.asarray(labels).astype(str)
-        if labels.shape != values_a.shape:
-            raise ValueError(
-                f"Paired labels shape mismatch: {labels.shape} vs {values_a.shape}."
-            )
 
     paired_mask = np.isfinite(values_a) & np.isfinite(values_b)
     paired_a = values_a[paired_mask]
@@ -477,8 +334,7 @@ def _paired_outlier_filtered(values_a, values_b, labels=None, iqr_multiplier=3.0
         out_any = out_a | out_b
     keep_mask = ~out_any
 
-    return {
-        "input_paired_mask": paired_mask,
+    return {"input_paired_mask": paired_mask,
         "paired_outlier_mask": out_any,
         "paired_a_all": paired_a,
         "paired_b_all": paired_b,
@@ -489,39 +345,24 @@ def _paired_outlier_filtered(values_a, values_b, labels=None, iqr_multiplier=3.0
         "paired_labels_removed": paired_labels[out_any],
         "n_pairs_total": int(paired_a.size),
         "n_pairs_removed": int(np.count_nonzero(out_any)),
-        "n_pairs_kept": int(np.count_nonzero(keep_mask)),
-    }
+        "n_pairs_kept": int(np.count_nonzero(keep_mask))}
 
 
 def _paired_tests_two_sided(values_a, values_b):
-    values_a = np.asarray(values_a, dtype=np.float64)
-    values_b = np.asarray(values_b, dtype=np.float64)
-    if values_a.shape != values_b.shape:
-        raise ValueError(
-            f"Paired arrays shape mismatch: {values_a.shape} vs {values_b.shape}."
-        )
-
-    row = {
-        "n_pairs": int(values_a.size),
+    row = {"n_pairs": int(values_a.size),
         "mean_diff_a_minus_b": np.nan,
         "median_diff_a_minus_b": np.nan,
         "ttest_stat": np.nan,
         "ttest_p_two_sided": np.nan,
         "wilcoxon_stat": np.nan,
-        "wilcoxon_p_two_sided": np.nan,
-    }
-    if values_a.size == 0:
-        return row
+        "wilcoxon_p_two_sided": np.nan}
 
     diff = values_a - values_b
     row["mean_diff_a_minus_b"] = float(np.mean(diff))
     row["median_diff_a_minus_b"] = float(np.median(diff))
 
     if values_a.size >= 2:
-        try:
-            t_res = ttest_rel(values_a, values_b, nan_policy="omit")
-        except TypeError:
-            t_res = ttest_rel(values_a, values_b)
+        t_res = ttest_rel(values_a, values_b, nan_policy="omit")
         row["ttest_stat"] = float(t_res.statistic)
         row["ttest_p_two_sided"] = float(t_res.pvalue)
 
@@ -529,12 +370,9 @@ def _paired_tests_two_sided(values_a, values_b):
         row["wilcoxon_stat"] = 0.0
         row["wilcoxon_p_two_sided"] = 1.0
     else:
-        try:
-            w_res = wilcoxon(values_a, values_b, alternative="two-sided")
-            row["wilcoxon_stat"] = float(w_res.statistic)
-            row["wilcoxon_p_two_sided"] = float(w_res.pvalue)
-        except ValueError:
-            pass
+        w_res = wilcoxon(values_a, values_b, alternative="two-sided")
+        row["wilcoxon_stat"] = float(w_res.statistic)
+        row["wilcoxon_p_two_sided"] = float(w_res.pvalue)
     return row
 
 
@@ -545,12 +383,7 @@ def _bootstrap_ci(values, statistic="mean", n_bootstrap=10000, ci_percent=95.0, 
         return np.nan, np.nan
 
     ci_percent = float(ci_percent)
-    if not (0.0 < ci_percent < 100.0):
-        raise ValueError(f"ci_percent must be in (0, 100), got {ci_percent}.")
-
     n_bootstrap = int(n_bootstrap)
-    if n_bootstrap <= 0:
-        raise ValueError(f"n_bootstrap must be > 0, got {n_bootstrap}.")
 
     rng = np.random.default_rng(int(random_seed))
     sample_idx = rng.integers(0, values.size, size=(n_bootstrap, values.size))
@@ -561,16 +394,11 @@ def _bootstrap_ci(values, statistic="mean", n_bootstrap=10000, ci_percent=95.0, 
         boot_stats = np.mean(sampled, axis=1)
     elif statistic == "median":
         boot_stats = np.median(sampled, axis=1)
-    else:
-        raise ValueError(f"Unsupported bootstrap statistic '{statistic}'.")
 
     alpha = 100.0 - ci_percent
     lower_q = alpha / 2.0
     upper_q = 100.0 - lower_q
-    return (
-        float(np.percentile(boot_stats, lower_q)),
-        float(np.percentile(boot_stats, upper_q)),
-    )
+    return (np.percentile(boot_stats, lower_q), np.percentile(boot_stats, upper_q))
 
 
 def _paired_sign_flip_permutation_test(diff_values, n_permutations=20000, random_seed=0):
@@ -581,51 +409,32 @@ def _paired_sign_flip_permutation_test(diff_values, n_permutations=20000, random
 
     observed = float(np.mean(diff_values))
     n_permutations = int(n_permutations)
-    if n_permutations <= 0:
-        raise ValueError(f"n_permutations must be > 0, got {n_permutations}.")
 
     rng = np.random.default_rng(int(random_seed))
     signs = rng.choice(np.array([-1.0, 1.0]), size=(n_permutations, diff_values.size))
     permuted_means = np.mean(signs * diff_values[None, :], axis=1)
-    p_two_sided = (
-        np.count_nonzero(np.abs(permuted_means) >= abs(observed)) + 1.0
-    ) / (n_permutations + 1.0)
+    p_two_sided = (np.count_nonzero(np.abs(permuted_means) >= abs(observed)) + 1.0) / (n_permutations + 1.0)
     return observed, float(p_two_sided)
 
 
-def compute_subject_projection_behavior_metrics(
-    run_segments,
-    behavior_root,
-    behavior_column,
-    excluded_run_keys=None,
-):
+def compute_subject_projection_behavior_metrics(run_segments, behavior_root,behavior_column, excluded_run_keys=None):
     excluded_keys = set(excluded_run_keys or [])
     rows = []
-    subject_keys = sorted(
-        {(str(segment["sub_tag"])) for segment in run_segments},
-        key=lambda sub: int(_extract_subject_digits(sub)),
-    )
+    subject_keys = sorted({(str(segment["sub_tag"])) for segment in run_segments},
+        key=lambda sub: int(_extract_subject_digits(sub)))
 
     for sub_tag in subject_keys:
-        subject_segments = [
-            segment for segment in run_segments if str(segment["sub_tag"]) == str(sub_tag)
-        ]
+        subject_segments = [segment for segment in run_segments if str(segment["sub_tag"]) == str(sub_tag)]
         projection_chunks = []
         behavior_chunks = []
         n_runs = 0
         n_trials_paired = 0
         for segment in subject_segments:
-            run_key = (
-                str(segment["sub_tag"]),
-                int(segment["ses"]),
-                int(segment["run"]),
-            )
+            run_key = (str(segment["sub_tag"]), int(segment["ses"]), int(segment["run"]))
             if run_key in excluded_keys:
                 continue
 
-            kept_projection, kept_behavior, _ = _load_run_kept_projection_behavior(
-                segment, behavior_root, behavior_column
-            )
+            kept_projection, kept_behavior, _ = _load_run_kept_projection_behavior(segment, behavior_root, behavior_column)
             finite_mask = np.isfinite(kept_projection) & np.isfinite(kept_behavior)
             projection_values = kept_projection[finite_mask]
             behavior_values = kept_behavior[finite_mask]
@@ -660,8 +469,7 @@ def compute_subject_projection_behavior_metrics(
         beh_mean_cv, beh_std, beh_cv = _coefficient_of_variation(beh_values)
 
         rows.append(
-            {
-                "sub_tag": str(sub_tag),
+            {"sub_tag": str(sub_tag),
                 "n_runs_with_paired_trials": int(n_runs),
                 "n_trials_paired_finite": int(n_trials_paired),
                 "mean_projection": proj_mean,
@@ -672,36 +480,22 @@ def compute_subject_projection_behavior_metrics(
                 "variance_behavior_col2": beh_var,
                 "std_behavior_col2": beh_std,
                 "cv_behavior_col2": beh_cv,
-                "d_var_projection_minus_behavior": (
-                    float(proj_var - beh_var)
-                    if np.isfinite(proj_var) and np.isfinite(beh_var)
-                    else np.nan
-                ),
-                "d_cv_projection_minus_behavior": (
-                    float(proj_cv - beh_cv)
-                    if np.isfinite(proj_cv) and np.isfinite(beh_cv)
-                    else np.nan
-                ),
-            }
-        )
+                "d_var_projection_minus_behavior": (float(proj_var - beh_var)
+                                                    if np.isfinite(proj_var) and np.isfinite(beh_var)
+                                                    else np.nan),
+                "d_cv_projection_minus_behavior": (float(proj_cv - beh_cv)
+                                                   if np.isfinite(proj_cv) and np.isfinite(beh_cv)
+                                                   else np.nan)})
     return pd.DataFrame(rows)
 
 
 def identify_run_outliers(metric_df, projection_col, behavior_col, outlier_iqr_multiplier=3.0):
     required_cols = {"sub_tag", "ses", "run", projection_col, behavior_col}
     missing_cols = required_cols.difference(metric_df.columns)
-    if missing_cols:
-        raise ValueError(
-            f"Missing required columns for run outlier identification: {sorted(missing_cols)}"
-        )
 
     labels = _build_pair_labels(metric_df)
-    paired = _paired_outlier_filtered(
-        metric_df[projection_col].to_numpy(dtype=np.float64),
-        metric_df[behavior_col].to_numpy(dtype=np.float64),
-        labels=labels,
-        iqr_multiplier=outlier_iqr_multiplier,
-    )
+    paired = _paired_outlier_filtered(metric_df[projection_col],metric_df[behavior_col],
+                                      labels=labels, iqr_multiplier=outlier_iqr_multiplier)
 
     paired_rows = metric_df.loc[paired["input_paired_mask"], ["sub_tag", "ses", "run"]].copy()
     paired_rows[projection_col] = paired["paired_a_all"]
@@ -710,25 +504,16 @@ def identify_run_outliers(metric_df, projection_col, behavior_col, outlier_iqr_m
     paired_rows["removed_outlier"] = paired["paired_outlier_mask"]
 
     outlier_rows = paired_rows.loc[paired_rows["removed_outlier"]].copy()
-    outlier_keys = {
-        (str(row.sub_tag), int(row.ses), int(row.run))
-        for row in outlier_rows.itertuples(index=False)
-    }
+    outlier_keys = {(str(row.sub_tag), int(row.ses), int(row.run)) for row in outlier_rows.itertuples(index=False)}
     return outlier_keys, paired_rows
 
 
 def _evaluate_density(values, x):
-    values = np.asarray(values, dtype=np.float64)
     values = values[np.isfinite(values)]
-    if values.size == 0:
-        raise RuntimeError("No finite values available for density estimation.")
 
     if values.size < 2 or np.allclose(values, values[0]):
         width = max(np.std(values), max(abs(values[0]) * 0.05, 1e-6))
-        density = (
-            np.exp(-0.5 * ((x - values[0]) / width) ** 2)
-            / (width * np.sqrt(2.0 * np.pi))
-        )
+        density = (np.exp(-0.5 * ((x - values[0]) / width) ** 2)/ (width * np.sqrt(2.0 * np.pi)))
     else:
         density = gaussian_kde(values).evaluate(x)
 
@@ -739,11 +524,7 @@ def _evaluate_density(values, x):
 
 
 def _density_grid(values, grid_points=512, pad_fraction=0.1, fallback_pad=0.25):
-    values = np.asarray(values, dtype=np.float64)
     values = values[np.isfinite(values)]
-    if values.size == 0:
-        raise RuntimeError("No finite values available for density-grid construction.")
-
     vmin = float(np.min(values))
     vmax = float(np.max(values))
     vrange = vmax - vmin
@@ -756,9 +537,6 @@ def plot_run_variance_density(run_df, out_path, grid_points=512):
     scale_factor = 1e7
     values = run_df["variance_projection"].to_numpy(dtype=np.float64)
     values = values[np.isfinite(values)] * scale_factor
-    if values.size == 0:
-        raise RuntimeError("No finite run/session variances available to plot.")
-
     vmin = float(np.min(values))
     vmax = float(np.max(values))
     vrange = vmax - vmin
@@ -766,10 +544,7 @@ def plot_run_variance_density(run_df, out_path, grid_points=512):
     if values.size < 2 or np.allclose(values, values[0]):
         width = max(abs(vmin) * 0.05, 1e-12)
         x = np.linspace(max(0.0, vmin - 4.0 * width), vmax + 4.0 * width, int(grid_points))
-        density = (
-            np.exp(-0.5 * ((x - vmin) / width) ** 2)
-            / (width * np.sqrt(2.0 * np.pi))
-        )
+        density = (np.exp(-0.5 * ((x - vmin) / width) ** 2) / (width * np.sqrt(2.0 * np.pi)))
     else:
         pad = 0.1 * vrange if vrange > 0 else max(abs(vmin) * 0.1, 1e-12)
         x = np.linspace(max(0.0, vmin - pad), vmax + pad, int(grid_points))
@@ -798,38 +573,26 @@ def plot_run_variance_density(run_df, out_path, grid_points=512):
 
 def _category_sort_key(value, category_name):
     if str(category_name) == "sub_tag":
-        try:
-            return (0, int(_extract_subject_digits(value)))
-        except ValueError:
-            return (1, str(value))
-    try:
-        return (0, float(value))
-    except (TypeError, ValueError):
-        return (1, str(value))
+        return (0, int(_extract_subject_digits(value)))
+    return (0, float(value))
 
 
 def _build_category_color_map(values, category_name):
-    unique_values = sorted(
-        {value for value in values},
-        key=lambda value: _category_sort_key(value, category_name),
-    )
+    unique_values = sorted({value for value in values},
+        key=lambda value: _category_sort_key(value, category_name))
     n_values = len(unique_values)
     if n_values == 0:
         return {}, []
 
     if str(category_name) == "run":
-        run_colors = [
-            "#1f77b4",  # blue
+        run_colors = ["#1f77b4",  # blue
             "#d62728",  # red
             "#2ca02c",  # green
             "#ff7f0e",  # orange
             "#9467bd",  # purple
             "#17becf",  # cyan
-        ]
-        color_map = {
-            value: run_colors[idx % len(run_colors)]
-            for idx, value in enumerate(unique_values)
-        }
+            ]
+        color_map = {value: run_colors[idx % len(run_colors)] for idx, value in enumerate(unique_values)}
         return color_map, unique_values
 
     if str(category_name) == "ses":
@@ -841,10 +604,8 @@ def _build_category_color_map(values, category_name):
             "#9467bd",  # purple
             "#8c564b",  # brown
         ]
-        color_map = {
-            value: session_colors[idx % len(session_colors)]
-            for idx, value in enumerate(unique_values)
-        }
+        color_map = {value: session_colors[idx % len(session_colors)]
+            for idx, value in enumerate(unique_values)}
         return color_map, unique_values
 
     if str(category_name) == "sub_tag":
@@ -855,14 +616,10 @@ def _build_category_color_map(values, category_name):
         subject_palette = tab20 + tab20b + tab20c
         if n_values <= len(subject_palette):
             step = 11  # coprime with 60, spreads adjacent picks across the palette
-            spread_palette = [
-                subject_palette[(idx * step) % len(subject_palette)]
-                for idx in range(len(subject_palette))
-            ]
-            color_map = {
-                value: spread_palette[idx]
-                for idx, value in enumerate(unique_values)
-            }
+            spread_palette = [subject_palette[(idx * step) % len(subject_palette)]
+                for idx in range(len(subject_palette))]
+            color_map = {value: spread_palette[idx]
+                for idx, value in enumerate(unique_values)}
             return color_map, unique_values
 
     if n_values <= 10:
@@ -879,24 +636,10 @@ def _build_category_color_map(values, category_name):
 def _build_paired_metric_zscore_df(metric_df, projection_col, behavior_col):
     required_cols = {"sub_tag", "ses", "run", projection_col, behavior_col}
     missing_cols = required_cols.difference(metric_df.columns)
-    if missing_cols:
-        raise ValueError(
-            f"Missing required columns for paired z-score plot: {sorted(missing_cols)}"
-        )
 
-    projection_z = _scale_values(
-        metric_df[projection_col].to_numpy(dtype=np.float64),
-        method="zscore",
-    )
-    behavior_z = _scale_values(
-        metric_df[behavior_col].to_numpy(dtype=np.float64),
-        method="zscore",
-    )
+    projection_z = _scale_values(metric_df[projection_col], method="zscore")
+    behavior_z = _scale_values(metric_df[behavior_col], method="zscore")
     paired_mask = np.isfinite(projection_z) & np.isfinite(behavior_z)
-    if not np.any(paired_mask):
-        raise RuntimeError(
-            f"No paired finite values for {projection_col} and {behavior_col}."
-        )
 
     paired_df = metric_df.loc[paired_mask, ["sub_tag", "ses", "run"]].copy()
     paired_df = paired_df.reset_index(drop=True)
@@ -905,33 +648,32 @@ def _build_paired_metric_zscore_df(metric_df, projection_col, behavior_col):
     return paired_df
 
 
-def _plot_paired_box_with_connections(
-    ax,
-    paired_df,
-    group_col,
-    color_map,
-    jitter_seed=0,
-    y_limits=None,
-):
-    behavior_values = paired_df["behavior_z"].to_numpy(dtype=np.float64)
-    projection_values = paired_df["projection_z"].to_numpy(dtype=np.float64)
+def _build_paired_metric_raw_df(metric_df, projection_col, behavior_col):
+    required_cols = {"sub_tag", "ses", "run", projection_col, behavior_col}
+    missing_cols = required_cols.difference(metric_df.columns)
+
+    projection_raw = metric_df[projection_col]
+    behavior_raw = metric_df[behavior_col]
+    paired_mask = np.isfinite(projection_raw) & np.isfinite(behavior_raw)
+
+    paired_df = metric_df.loc[paired_mask, ["sub_tag", "ses", "run"]].copy()
+    paired_df = paired_df.reset_index(drop=True)
+    paired_df["projection_raw"] = projection_raw[paired_mask]
+    paired_df["behavior_raw"] = behavior_raw[paired_mask]
+    return paired_df
+
+
+def _plot_paired_box_with_connections(ax, paired_df, group_col, color_map, jitter_seed=0,
+                                      y_limits=None, behavior_value_col="behavior_z",
+                                      projection_value_col="projection_z", x_tick_labels=None):
+    behavior_values = paired_df[behavior_value_col]
+    projection_values = paired_df[projection_value_col]
     group_values = paired_df[group_col].tolist()
 
-    box_parts = ax.boxplot(
-        [behavior_values, projection_values],
-        positions=[0.0, 1.0],
-        widths=0.5,
-        patch_artist=True,
-        showfliers=False,
-        showmeans=True,
-        meanprops={
-            "marker": "D",
-            "markerfacecolor": "black",
-            "markeredgecolor": "black",
-            "markersize": 4.0,
-        },
-        zorder=1,
-    )
+    box_parts = ax.boxplot([behavior_values, projection_values], positions=[0.0, 1.0], widths=0.5,
+                           patch_artist=True, showfliers=False, showmeans=True,
+                           meanprops={"marker": "D", "markerfacecolor": "black", "markeredgecolor": "black",
+                                      "markersize": 4.0}, zorder=1)
     for box_patch in box_parts["boxes"]:
         box_patch.set(facecolor="0.94", edgecolor="0.35", linewidth=1.15)
     for whisker in box_parts["whiskers"]:
@@ -954,13 +696,8 @@ def _plot_paired_box_with_connections(
         y_min = float(y_limits[0])
         y_max = float(y_limits[1])
 
-    for x0, x1, y0, y1, group_value in zip(
-        x_behavior,
-        x_projection,
-        behavior_values,
-        projection_values,
-        group_values,
-    ):
+    for x0, x1, y0, y1, group_value in zip(x_behavior, x_projection, behavior_values, projection_values,
+                                           group_values):
         color = color_map[group_value]
         if y_min is None or y_max is None:
             y0_plot = y0
@@ -987,127 +724,52 @@ def _plot_paired_box_with_connections(
             else:
                 marker1 = "o"
 
-        ax.plot(
-            [x0, x1],
-            [y0_plot, y1_plot],
-            color=color,
-            linewidth=0.85,
-            alpha=0.28,
-            zorder=2,
-        )
-        ax.scatter(
-            [x0],
-            [y0_plot],
-            s=34 if marker0 != "o" else 30,
-            color=color,
-            alpha=0.9,
-            edgecolors="0.15",
-            linewidths=0.3,
-            marker=marker0,
-            zorder=3,
-        )
-        ax.scatter(
-            [x1],
-            [y1_plot],
-            s=34 if marker1 != "o" else 30,
-            color=color,
-            alpha=0.9,
-            edgecolors="0.15",
-            linewidths=0.3,
-            marker=marker1,
-            zorder=3,
-        )
+        ax.plot([x0, x1], [y0_plot, y1_plot], color=color, linewidth=0.85, alpha=0.28, zorder=2)
+        ax.scatter([x0], [y0_plot], s=34 if marker0 != "o" else 30, color=color, alpha=0.9, edgecolors="0.15",
+                   linewidths=0.3, marker=marker0, zorder=3)
+        ax.scatter([x1], [y1_plot], s=34 if marker1 != "o" else 30, color=color, alpha=0.9, edgecolors="0.15",
+                   linewidths=0.3, marker=marker1, zorder=3)
 
     ax.set_xlim(-0.45, 1.45)
     ax.axhline(0.0, color="0.55", linestyle=":", linewidth=0.9, zorder=0)
     ax.set_xticks([0.0, 1.0])
-    ax.set_xticklabels(["Behavior variability", "BOLD variability"])
+    if x_tick_labels is None:
+        x_tick_labels = ("Behavior variability", "BOLD variability")
+    ax.set_xticklabels([str(x_tick_labels[0]), str(x_tick_labels[1])])
     ax.grid(axis="y", linestyle=":", linewidth=0.8, alpha=0.5)
     return int(clipped_count)
 
 
 def _add_category_legend(ax, color_map, category_values, title):
-    handles = [
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            linestyle="",
-            markerfacecolor=color_map[value],
-            markeredgecolor="0.25",
-            markersize=5.5,
-            label=str(value),
-        )
-        for value in category_values
-    ]
-    if not handles:
-        return
-
+    handles = [Line2D([0], [0], marker="o", linestyle="", markerfacecolor=color_map[value],
+            markeredgecolor="0.25", markersize=5.5, label=str(value)) for value in category_values]
     ncol = 1
     if len(handles) > 16:
         ncol = 2
 
-    legend = ax.legend(
-        handles=handles,
-        title=str(title),
-        loc="upper right",
-        fontsize=7.5,
-        title_fontsize=8.5,
-        frameon=True,
-        ncol=ncol,
-        borderaxespad=0.4,
-        handletextpad=0.35,
-        columnspacing=0.8,
-        labelspacing=0.25,
-    )
+    legend = ax.legend(handles=handles, title=str(title), loc="upper right", fontsize=7.5, title_fontsize=8.5,
+                       frameon=True, ncol=ncol, borderaxespad=0.4, handletextpad=0.35, columnspacing=0.8,
+                       labelspacing=0.25)
     legend.get_frame().set_alpha(0.95)
 
 
 def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
-    required_cols = {
-        "sub_tag",
-        "ses",
-        "run",
-        "variance_projection",
-        "variance_behavior_col2",
-        "cv_projection",
-        "cv_behavior_col2",
-    }
+    required_cols = {"sub_tag", "ses", "run", "variance_projection", "variance_behavior_col2",
+                     "cv_projection", "cv_behavior_col2"}
     missing_cols = required_cols.difference(metric_df.columns)
-    if missing_cols:
-        raise ValueError(
-            f"Missing required columns for 3x2 variance/CV plot: {sorted(missing_cols)}"
-        )
 
-    variance_df = _build_paired_metric_zscore_df(
-        metric_df=metric_df,
-        projection_col="variance_projection",
-        behavior_col="variance_behavior_col2",
-    )
-    cv_df = _build_paired_metric_zscore_df(
-        metric_df=metric_df,
-        projection_col="cv_projection",
-        behavior_col="cv_behavior_col2",
-    )
+    variance_df = _build_paired_metric_zscore_df(metric_df=metric_df, projection_col="variance_projection",
+                                                 behavior_col="variance_behavior_col2")
+    cv_df = _build_paired_metric_zscore_df(metric_df=metric_df, projection_col="cv_projection", behavior_col="cv_behavior_col2")
 
-    column_defs = [
-        ("Z-scored variance", variance_df),
-        ("Z-scored CV", cv_df),
-    ]
-    row_defs = [
-        ("sub_tag", "Subject colors", "Subject"),
+    column_defs = [("Z-scored variance", variance_df), ("Z-scored CV", cv_df)]
+    row_defs = [("sub_tag", "Subject colors", "Subject"),
         ("ses", "Session colors", "Session"),
-        ("run", "Run colors", "Run"),
-    ]
+        ("run", "Run colors", "Run")]
 
     column_limits = []
     for _, metric_col_df in column_defs:
-        column_values = np.concatenate(
-            [
-                metric_col_df["behavior_z"].to_numpy(dtype=np.float64),
-                metric_col_df["projection_z"].to_numpy(dtype=np.float64),
-            ]
-        )
+        column_values = np.concatenate([metric_col_df["behavior_z"], metric_col_df["projection_z"]])
         finite_values = column_values[np.isfinite(column_values)]
         if finite_values.size == 0:
             column_limits.append((-1.0, 1.0))
@@ -1125,35 +787,21 @@ def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
     for row_idx, (group_col, row_title, legend_title) in enumerate(row_defs):
         for col_idx, (column_title, metric_col_df) in enumerate(column_defs):
             ax = axes[row_idx, col_idx]
-            color_map, category_values = _build_category_color_map(
-                metric_col_df[group_col].tolist(),
-                category_name=group_col,
-            )
-            clipped_here = _plot_paired_box_with_connections(
-                ax=ax,
-                paired_df=metric_col_df,
-                group_col=group_col,
-                color_map=color_map,
-                jitter_seed=111 + 17 * row_idx + 29 * col_idx,
-                y_limits=column_limits[col_idx],
-            )
+            color_map, category_values = _build_category_color_map(metric_col_df[group_col].tolist(),
+                                                                   category_name=group_col)
+            clipped_here = _plot_paired_box_with_connections(ax=ax, paired_df=metric_col_df,
+                                                             group_col=group_col, color_map=color_map,
+                                                             jitter_seed=111 + 17 * row_idx + 29 * col_idx,
+                                                             y_limits=column_limits[col_idx])
             total_clipped += int(clipped_here)
             ax.set_ylim(column_limits[col_idx])
             ax.set_title(f"{row_title} | {column_title}", fontsize=11.0)
             if col_idx == 0:
                 ax.set_ylabel("Variability")
             if col_idx == 1:
-                _add_category_legend(
-                    ax=ax,
-                    color_map=color_map,
-                    category_values=category_values,
-                    title=legend_title,
-                )
+                _add_category_legend(ax=ax, color_map=color_map, category_values=category_values, title=legend_title)
 
-    fig.suptitle(
-        "Behavior vs BOLD variability",
-        fontsize=13.0,
-    )
+    fig.suptitle("Behavior vs BOLD variability", fontsize=13.0)
     tight_bottom = 0.0
     # if total_clipped > 0:
     #     fig.text(
@@ -1166,6 +814,48 @@ def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
     #     )
         # tight_bottom = 0.02
     fig.tight_layout(rect=(0.0, tight_bottom, 0.995, 0.965))
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def plot_cv_subject_session_run_raw_3x1(metric_df, out_path):
+    required_cols = {"sub_tag", "ses", "run", "cv_projection", "cv_behavior_col2"}
+    missing_cols = required_cols.difference(metric_df.columns)
+
+    cv_df = _build_paired_metric_raw_df(metric_df=metric_df, projection_col="cv_projection",
+                                        behavior_col="cv_behavior_col2")
+
+    combined_values = np.concatenate([cv_df["behavior_raw"], cv_df["projection_raw"]])
+    finite_values = combined_values[np.isfinite(combined_values)]
+    q_low = float(np.percentile(finite_values, 2.0))
+    q_high = float(np.percentile(finite_values, 98.0))
+    q_span = q_high - q_low
+    pad = 0.18 * q_span if q_span > 0 else max(0.05 * abs(q_low), 1e-6)
+    y_limits = (q_low - pad, q_high + pad)
+
+    row_defs = [("sub_tag", "Subject colors", "Subject"), ("ses", "Session colors", "Session"),
+                ("run", "Run colors", "Run")]
+
+    fig, axes = plt.subplots(3, 1, figsize=(11.0, 14.0))
+    if not isinstance(axes, np.ndarray):
+        axes = np.asarray([axes])
+
+    for row_idx, (group_col, row_title, legend_title) in enumerate(row_defs):
+        ax = axes[row_idx]
+        color_map, category_values = _build_category_color_map(cv_df[group_col].tolist(), category_name=group_col)
+        _plot_paired_box_with_connections(ax=ax, paired_df=cv_df, group_col=group_col, color_map=color_map,
+            jitter_seed=211 + 31 * row_idx,
+            y_limits=y_limits,
+            behavior_value_col="behavior_raw",
+            projection_value_col="projection_raw",
+            x_tick_labels=("Behavior CV", "BOLD CV"))
+        ax.set_ylim(y_limits)
+        ax.set_title(f"{row_title} | Raw CV (no z-score)", fontsize=11.2)
+        ax.set_ylabel("CV")
+        _add_category_legend(ax=ax, color_map=color_map, category_values=category_values, title=legend_title)
+
+    fig.suptitle("Behavior vs BOLD CV (raw values, no z-score)", fontsize=13.0)
+    fig.tight_layout(rect=(0.0, 0.0, 0.995, 0.975))
     fig.savefig(out_path, dpi=220)
     plt.close(fig)
 
@@ -1597,6 +1287,224 @@ def plot_whisker_outlier_counts_behavior_vs_bold_3x2(
     )
     fig.suptitle(
         "Whisker outlier counts (below / near / above): Behavior vs BOLD",
+        fontsize=14.0,
+        y=1.01,
+    )
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.975))
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return counts_df, thresholds_df
+
+
+def compute_whisker_outlier_counts_behavior_vs_bold_cv_raw(metric_df, near_fraction=0.10):
+    near_fraction = float(near_fraction)
+    if near_fraction < 0:
+        raise ValueError(f"near_fraction must be >= 0, got {near_fraction}.")
+
+    required_cols = {"sub_tag", "ses", "run", "cv_projection", "cv_behavior_col2"}
+    missing_cols = required_cols.difference(metric_df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns for raw CV whisker outlier counts: {sorted(missing_cols)}"
+        )
+
+    cv_df = _build_paired_metric_raw_df(
+        metric_df=metric_df,
+        projection_col="cv_projection",
+        behavior_col="cv_behavior_col2",
+    )
+
+    behavior_values = cv_df["behavior_raw"].to_numpy(dtype=np.float64)
+    projection_values = cv_df["projection_raw"].to_numpy(dtype=np.float64)
+    behavior_cls = _classify_whisker_position(behavior_values, near_fraction=near_fraction)
+    projection_cls = _classify_whisker_position(projection_values, near_fraction=near_fraction)
+
+    thresholds_df = pd.DataFrame(
+        [
+            {
+                "column": "Raw CV (no z-score)",
+                "signal": "Behavior",
+                "q1": behavior_cls["q1"],
+                "q3": behavior_cls["q3"],
+                "iqr": behavior_cls["iqr"],
+                "low_fence": behavior_cls["low_fence"],
+                "high_fence": behavior_cls["high_fence"],
+                "near_band": behavior_cls["near_band"],
+            },
+            {
+                "column": "Raw CV (no z-score)",
+                "signal": "BOLD",
+                "q1": projection_cls["q1"],
+                "q3": projection_cls["q3"],
+                "iqr": projection_cls["iqr"],
+                "low_fence": projection_cls["low_fence"],
+                "high_fence": projection_cls["high_fence"],
+                "near_band": projection_cls["near_band"],
+            },
+        ]
+    )
+
+    row_defs = [
+        ("sub_tag", "Subject colors"),
+        ("ses", "Session colors"),
+        ("run", "Run colors"),
+    ]
+    rows = []
+    for group_col, row_title in row_defs:
+        group_values = cv_df[group_col].astype(str).to_numpy()
+        categories = sorted(
+            {value for value in group_values},
+            key=lambda value: _category_sort_key(value, group_col),
+        )
+        for category in categories:
+            category_mask = group_values == str(category)
+            behavior_below = int(np.count_nonzero(behavior_cls["below"] & category_mask))
+            behavior_near = int(np.count_nonzero(behavior_cls["near"] & category_mask))
+            behavior_above = int(np.count_nonzero(behavior_cls["above"] & category_mask))
+
+            bold_below = int(np.count_nonzero(projection_cls["below"] & category_mask))
+            bold_near = int(np.count_nonzero(projection_cls["near"] & category_mask))
+            bold_above = int(np.count_nonzero(projection_cls["above"] & category_mask))
+
+            rows.append(
+                {
+                    "row": row_title,
+                    "column": "Raw CV (no z-score)",
+                    "category": str(category),
+                    "behavior_below_whisker_count": behavior_below,
+                    "behavior_near_whisker_count": behavior_near,
+                    "behavior_above_whisker_count": behavior_above,
+                    "behavior_outlier_total": int(behavior_below + behavior_near + behavior_above),
+                    "bold_below_whisker_count": bold_below,
+                    "bold_near_whisker_count": bold_near,
+                    "bold_above_whisker_count": bold_above,
+                    "bold_outlier_total": int(bold_below + bold_near + bold_above),
+                }
+            )
+
+    return pd.DataFrame(rows), thresholds_df
+
+
+def plot_whisker_outlier_counts_behavior_vs_bold_cv_raw(
+    metric_df,
+    out_path,
+    out_csv_path=None,
+    thresholds_csv_path=None,
+    near_fraction=0.10,
+    sort_subject_by_behavior=True,
+):
+    counts_df, thresholds_df = compute_whisker_outlier_counts_behavior_vs_bold_cv_raw(
+        metric_df=metric_df,
+        near_fraction=near_fraction,
+    )
+    if out_csv_path is not None:
+        counts_df.to_csv(out_csv_path, index=False)
+    if thresholds_csv_path is not None:
+        thresholds_df.to_csv(thresholds_csv_path, index=False)
+
+    row_order = ["Subject colors", "Session colors", "Run colors"]
+    fig, axes = plt.subplots(3, 1, figsize=(20.0, 14.0), sharey=False)
+    if not isinstance(axes, np.ndarray):
+        axes = np.asarray([axes])
+
+    for row_idx, row_title in enumerate(row_order):
+        ax = axes[row_idx]
+        cell = counts_df.loc[counts_df["row"] == row_title].copy()
+        if cell.empty:
+            ax.set_axis_off()
+            continue
+
+        sort_col = "behavior_outlier_total" if bool(sort_subject_by_behavior) else None
+        cell = _sort_count_category_cell(
+            cell,
+            row_title=row_title,
+            primary_subject_sort_col=sort_col,
+        )
+
+        categories = cell["category"].astype(str).tolist()
+        x = np.arange(len(categories), dtype=np.float64)
+        width = 0.38
+
+        behavior_below = cell["behavior_below_whisker_count"].to_numpy(dtype=np.float64)
+        behavior_near = cell["behavior_near_whisker_count"].to_numpy(dtype=np.float64)
+        behavior_above = cell["behavior_above_whisker_count"].to_numpy(dtype=np.float64)
+        bold_below = cell["bold_below_whisker_count"].to_numpy(dtype=np.float64)
+        bold_near = cell["bold_near_whisker_count"].to_numpy(dtype=np.float64)
+        bold_above = cell["bold_above_whisker_count"].to_numpy(dtype=np.float64)
+
+        ax.bar(
+            x - (width / 2.0),
+            behavior_below,
+            width=width,
+            color="#6baed6",
+            label="Behavior below" if row_idx == 0 else None,
+        )
+        ax.bar(
+            x - (width / 2.0),
+            behavior_near,
+            width=width,
+            bottom=behavior_below,
+            color="#3182bd",
+            label="Behavior near" if row_idx == 0 else None,
+        )
+        ax.bar(
+            x - (width / 2.0),
+            behavior_above,
+            width=width,
+            bottom=(behavior_below + behavior_near),
+            color="#08519c",
+            label="Behavior above" if row_idx == 0 else None,
+        )
+
+        ax.bar(
+            x + (width / 2.0),
+            bold_below,
+            width=width,
+            color="#fcae91",
+            label="BOLD below" if row_idx == 0 else None,
+        )
+        ax.bar(
+            x + (width / 2.0),
+            bold_near,
+            width=width,
+            bottom=bold_below,
+            color="#fb6a4a",
+            label="BOLD near" if row_idx == 0 else None,
+        )
+        ax.bar(
+            x + (width / 2.0),
+            bold_above,
+            width=width,
+            bottom=(bold_below + bold_near),
+            color="#cb181d",
+            label="BOLD above" if row_idx == 0 else None,
+        )
+
+        ax.set_title(f"{row_title} | Raw CV (no z-score)", fontsize=11.5)
+        ax.set_ylabel("Whisker-based outlier count")
+        ax.grid(axis="y", linestyle=":", linewidth=0.8, alpha=0.55)
+        ax.set_xticks(x)
+        if row_title == "Subject colors":
+            ax.set_xticklabels(categories, rotation=45, ha="right", fontsize=8.0)
+        else:
+            ax.set_xticklabels(categories, fontsize=9.5)
+
+        behavior_total = behavior_below + behavior_near + behavior_above
+        bold_total = bold_below + bold_near + bold_above
+        ymax = float(np.max(np.concatenate([behavior_total, bold_total])))
+        ax.set_ylim(0.0, max(2.0, ymax + 1.0))
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=3,
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.995),
+    )
+    fig.suptitle(
+        "Whisker outlier counts for raw CV (below / near / above): Behavior vs BOLD",
         fontsize=14.0,
         y=1.01,
     )
@@ -2145,6 +2053,9 @@ def main():
         "variance_cv_3x2_plot": os.path.join(
             out_dir, f"{stem}_projection_behavior_variance_cv_zscore_3x2.png"
         ),
+        "cv_raw_3x1_plot": os.path.join(
+            out_dir, f"{stem}_projection_behavior_cv_raw_nozscore_3x1.png"
+        ),
         "outside_box_counts_csv": os.path.join(
             out_dir,
             f"{stem}_3x2_outside_box_counts_behavior_vs_bold_all_categories.csv",
@@ -2168,6 +2079,21 @@ def main():
             out_dir,
             (
                 f"{stem}_3x2_whisker_outlier_counts_behavior_vs_bold_all_categories_"
+                "subject_row_sorted_by_behavior.png"
+            ),
+        ),
+        "cv_raw_whisker_outlier_counts_csv": os.path.join(
+            out_dir,
+            f"{stem}_cv_raw_whisker_outlier_counts_behavior_vs_bold_all_categories.csv",
+        ),
+        "cv_raw_whisker_outlier_thresholds_csv": os.path.join(
+            out_dir,
+            f"{stem}_cv_raw_whisker_outlier_thresholds.csv",
+        ),
+        "cv_raw_whisker_outlier_counts_plot": os.path.join(
+            out_dir,
+            (
+                f"{stem}_cv_raw_whisker_outlier_counts_behavior_vs_bold_all_categories_"
                 "subject_row_sorted_by_behavior.png"
             ),
         ),
@@ -2205,6 +2131,10 @@ def main():
         comparison_df,
         output_paths["variance_cv_3x2_plot"],
     )
+    plot_cv_subject_session_run_raw_3x1(
+        run_cv_df,
+        output_paths["cv_raw_3x1_plot"],
+    )
     plot_outside_box_counts_behavior_vs_bold_3x2(
         comparison_df,
         output_paths["outside_box_counts_plot"],
@@ -2216,6 +2146,14 @@ def main():
         output_paths["whisker_outlier_counts_plot"],
         out_csv_path=output_paths["whisker_outlier_counts_csv"],
         thresholds_csv_path=output_paths["whisker_outlier_thresholds_csv"],
+        near_fraction=float(args.whisker_near_fraction),
+        sort_subject_by_behavior=True,
+    )
+    plot_whisker_outlier_counts_behavior_vs_bold_cv_raw(
+        run_cv_df,
+        output_paths["cv_raw_whisker_outlier_counts_plot"],
+        out_csv_path=output_paths["cv_raw_whisker_outlier_counts_csv"],
+        thresholds_csv_path=output_paths["cv_raw_whisker_outlier_thresholds_csv"],
         near_fraction=float(args.whisker_near_fraction),
         sort_subject_by_behavior=True,
     )
