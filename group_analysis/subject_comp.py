@@ -657,6 +657,7 @@ def _plot_subject_session_ks_summary(ks_df, group_ks_df, out_path, alpha=KS_ALPH
     df = ks_df.copy()
     df["sub_tag"] = df["sub_tag"].astype(str)
     df["_order"] = df["sub_tag"].map(_subject_order)
+    df = df[df["_order"] != 17].copy()
     df = df.sort_values(["_order", "sub_tag"]).reset_index(drop=True)
 
     labels = df["sub_tag"].tolist()
