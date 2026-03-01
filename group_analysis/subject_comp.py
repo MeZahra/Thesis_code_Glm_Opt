@@ -348,6 +348,23 @@ def _mad(values):
     return float(np.median(np.abs(finite_values - median_value)))
 
 
+def _ks_2samp_min_sign_flip(values_a, values_b):
+    ks_direct = ks_2samp(values_a, values_b, alternative="two-sided", method="auto")
+    ks_sign_flip = ks_2samp(values_a, -values_b, alternative="two-sided", method="auto")
+
+    d_direct = float(ks_direct.statistic)
+    d_sign_flip = float(ks_sign_flip.statistic)
+    if d_sign_flip < d_direct:
+        return ks_sign_flip
+    if d_sign_flip > d_direct:
+        return ks_direct
+
+    # If D ties, prefer the larger p-value so the choice is deterministic.
+    if float(ks_sign_flip.pvalue) > float(ks_direct.pvalue):
+        return ks_sign_flip
+    return ks_direct
+
+
 def build_group_level_session_cv_stats(subject_cv_df, session_a=1, session_b=2):
     row = {
         "session_a": int(session_a),
@@ -498,7 +515,7 @@ def compute_subject_session_ks(
                 row["higher_mad_session"] = f"session_{session_a}"
 
         if values_a.size > 0 and values_b.size > 0:
-            ks_result = ks_2samp(values_a, values_b, alternative="two-sided", method="auto")
+            ks_result = _ks_2samp_min_sign_flip(values_a, values_b)
             row["ks_statistic"] = float(ks_result.statistic)
             row["ks_p_two_sided"] = float(ks_result.pvalue)
 
