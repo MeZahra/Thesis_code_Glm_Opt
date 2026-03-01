@@ -15,6 +15,7 @@ Outputs:
 8) Per-subject pooled-trial CV CSV (session 1 vs 2, runs 1+2 pooled).
 9) Group-level pooled-trial CV session comparison stats CSV.
 10) Pooled-trial CV overlay figure with KS/IQR/MAD summary text.
+11) Subject distribution grid figure (2x7): session 1 vs 2 projected-signal densities.
 """
 
 import argparse
@@ -25,6 +26,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 from scipy.stats import gaussian_kde
@@ -228,7 +230,7 @@ def _benjamini_hochberg(p_values):
     return corrected
 
 
-def compute_subject_session_pooled_cv(
+def _collect_subject_session_pooled_values(
     run_segments,
     session_a=1,
     session_b=2,
@@ -238,7 +240,7 @@ def compute_subject_session_pooled_cv(
     session_b = int(session_b)
     run_set = {int(run) for run in runs}
 
-    pooled = {}
+    pooled_lists = {}
     run_counts = {}
 
     for segment in run_segments:
@@ -250,7 +252,7 @@ def compute_subject_session_pooled_cv(
 
         values = np.asarray(segment["values"], dtype=np.float64)
         finite_values = values[np.isfinite(values)]
-        pooled.setdefault((sub_tag, ses), []).append(finite_values)
+        pooled_lists.setdefault((sub_tag, ses), []).append(finite_values)
         run_counts[(sub_tag, ses)] = run_counts.get((sub_tag, ses), 0) + 1
 
     subjects = sorted(
@@ -258,20 +260,36 @@ def compute_subject_session_pooled_cv(
         key=lambda sub: (_subject_order(sub), str(sub)),
     )
 
+    pooled = {}
+    for sub_tag in subjects:
+        for ses in (session_a, session_b):
+            chunks = pooled_lists.get((sub_tag, ses), [])
+            pooled[(sub_tag, ses)] = (
+                np.concatenate(chunks).astype(np.float64, copy=False)
+                if chunks
+                else np.array([], dtype=np.float64)
+            )
+
+    return pooled, run_counts, subjects, run_set
+
+
+def compute_subject_session_pooled_cv(
+    run_segments,
+    session_a=1,
+    session_b=2,
+    runs=(1, 2),
+):
+    pooled, run_counts, subjects, run_set = _collect_subject_session_pooled_values(
+        run_segments,
+        session_a=session_a,
+        session_b=session_b,
+        runs=runs,
+    )
+
     rows = []
     for sub_tag in subjects:
-        chunks_a = pooled.get((sub_tag, session_a), [])
-        chunks_b = pooled.get((sub_tag, session_b), [])
-        values_a = (
-            np.concatenate(chunks_a).astype(np.float64, copy=False)
-            if chunks_a
-            else np.array([], dtype=np.float64)
-        )
-        values_b = (
-            np.concatenate(chunks_b).astype(np.float64, copy=False)
-            if chunks_b
-            else np.array([], dtype=np.float64)
-        )
+        values_a = pooled.get((sub_tag, int(session_a)), np.array([], dtype=np.float64))
+        values_b = pooled.get((sub_tag, int(session_b)), np.array([], dtype=np.float64))
 
         mean_a, std_a, cv_a = _coefficient_of_variation(values_a)
         mean_b, std_b, cv_b = _coefficient_of_variation(values_b)
@@ -400,44 +418,17 @@ def compute_subject_session_ks(
     runs=(1, 2),
     alpha=KS_ALPHA,
 ):
-    session_a = int(session_a)
-    session_b = int(session_b)
-    run_set = {int(run) for run in runs}
-
-    pooled = {}
-    run_counts = {}
-
-    for segment in run_segments:
-        sub_tag = str(segment["sub_tag"])
-        ses = int(segment["ses"])
-        run = int(segment["run"])
-        if ses not in {session_a, session_b} or run not in run_set:
-            continue
-
-        values = np.asarray(segment["values"], dtype=np.float64)
-        finite_values = values[np.isfinite(values)]
-        pooled.setdefault((sub_tag, ses), []).append(finite_values)
-        run_counts[(sub_tag, ses)] = run_counts.get((sub_tag, ses), 0) + 1
-
-    subjects = sorted(
-        {sub for sub, _ in run_counts.keys()},
-        key=lambda sub: (_subject_order(sub), str(sub)),
+    pooled, run_counts, subjects, run_set = _collect_subject_session_pooled_values(
+        run_segments,
+        session_a=session_a,
+        session_b=session_b,
+        runs=runs,
     )
 
     rows = []
     for sub_tag in subjects:
-        chunks_a = pooled.get((sub_tag, session_a), [])
-        chunks_b = pooled.get((sub_tag, session_b), [])
-        values_a = (
-            np.concatenate(chunks_a).astype(np.float64, copy=False)
-            if chunks_a
-            else np.array([], dtype=np.float64)
-        )
-        values_b = (
-            np.concatenate(chunks_b).astype(np.float64, copy=False)
-            if chunks_b
-            else np.array([], dtype=np.float64)
-        )
+        values_a = pooled.get((sub_tag, int(session_a)), np.array([], dtype=np.float64))
+        values_b = pooled.get((sub_tag, int(session_b)), np.array([], dtype=np.float64))
 
         row = {
             "sub_tag": str(sub_tag),
@@ -791,6 +782,157 @@ def _plot_subject_session_ks_summary(ks_df, group_ks_df, out_path, alpha=KS_ALPH
     plt.close(fig)
 
 
+def _plot_subject_session_projection_distribution_grid(
+    run_segments,
+    out_path,
+    session_a=1,
+    session_b=2,
+    runs=(1, 2),
+    n_rows=2,
+    n_cols=7,
+):
+    session_a = int(session_a)
+    session_b = int(session_b)
+    n_rows = int(n_rows)
+    n_cols = int(n_cols)
+    max_panels = int(n_rows * n_cols)
+
+    pooled, run_counts, subjects, _ = _collect_subject_session_pooled_values(
+        run_segments,
+        session_a=session_a,
+        session_b=session_b,
+        runs=runs,
+    )
+    paired_subjects = [
+        sub_tag
+        for sub_tag in subjects
+        if pooled.get((sub_tag, session_a), np.array([], dtype=np.float64)).size > 0
+        and pooled.get((sub_tag, session_b), np.array([], dtype=np.float64)).size > 0
+    ]
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(3.0 * n_cols, 3.0 * n_rows),
+        sharex=True,
+        sharey=True,
+    )
+    axes = np.asarray(axes).ravel()
+
+    if len(paired_subjects) == 0:
+        for ax in axes:
+            ax.set_axis_off()
+        axes[0].text(
+            0.5,
+            0.5,
+            "No paired session data for KS plotting",
+            ha="center",
+            va="center",
+            transform=axes[0].transAxes,
+        )
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
+
+    all_values = []
+    for sub_tag in paired_subjects:
+        values_a = pooled.get((sub_tag, session_a), np.array([], dtype=np.float64))
+        values_b = pooled.get((sub_tag, session_b), np.array([], dtype=np.float64))
+        all_values.append(values_a)
+        all_values.append(values_b)
+
+    shared_x = None
+    shared_xlim = None
+    if all_values:
+        combined_values = np.concatenate(all_values).astype(np.float64, copy=False)
+        shared_x = _density_grid(combined_values, grid_points=512, fallback_pad=1e-6)
+        shared_xlim = (float(shared_x[0]), float(shared_x[-1]))
+
+    n_to_plot = min(len(paired_subjects), max_panels)
+    for panel_idx, ax in enumerate(axes):
+        if panel_idx >= n_to_plot:
+            ax.set_axis_off()
+            continue
+
+        sub_tag = paired_subjects[panel_idx]
+        values_a = pooled.get((sub_tag, session_a), np.array([], dtype=np.float64))
+        values_b = pooled.get((sub_tag, session_b), np.array([], dtype=np.float64))
+
+        title = str(sub_tag)
+        x = shared_x
+        if x is None:
+            x = _density_grid(
+                np.concatenate([values_a, values_b]).astype(np.float64, copy=False),
+                grid_points=512,
+                fallback_pad=1e-6,
+            )
+
+        density_a = _evaluate_density(values_a, x)
+        ax.plot(x, density_a, color="tab:blue", linewidth=1.5, label=f"Session {session_a}")
+        ax.fill_between(x, density_a, color="tab:blue", alpha=0.16)
+        ax.axvline(float(np.median(values_a)), color="tab:blue", linestyle=":", linewidth=0.9)
+
+        density_b = _evaluate_density(values_b, x)
+        ax.plot(
+            x,
+            density_b,
+            color="tab:red",
+            linewidth=1.5,
+            linestyle="--",
+            label=f"Session {session_b}",
+        )
+        ax.fill_between(x, density_b, color="tab:red", alpha=0.12)
+        ax.axvline(float(np.median(values_b)), color="tab:red", linestyle=":", linewidth=0.9)
+
+        ks_result = ks_2samp(values_a, values_b, alternative="two-sided", method="auto")
+        ks_text = f"D={float(ks_result.statistic):.3g}\np={float(ks_result.pvalue):.3g}"
+
+        info_text = ks_text
+        ax.text(
+            0.98,
+            0.98,
+            info_text,
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=6.7,
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88, "edgecolor": "0.75"},
+        )
+
+        if shared_xlim is not None:
+            ax.set_xlim(shared_xlim)
+        ax.set_title(title, fontsize=9)
+        ax.grid(axis="y", alpha=0.2)
+
+        if panel_idx % n_cols == 0:
+            ax.set_ylabel("Density")
+        if panel_idx // n_cols == (n_rows - 1):
+            ax.set_xlabel("Projected signal")
+
+    n_subjects = len(paired_subjects)
+    if n_subjects > max_panels:
+        suffix = f" (first {max_panels} of {n_subjects} subjects)"
+    else:
+        suffix = ""
+    legend_handles = [
+        Line2D([0], [0], color="tab:blue", linewidth=2.0, linestyle="-", label=f"Session {session_a}"),
+        Line2D([0], [0], color="tab:red", linewidth=2.0, linestyle="--", label=f"Session {session_b}"),
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc="upper right",
+        bbox_to_anchor=(0.995, 0.995),
+        frameon=True,
+        framealpha=0.9,
+        edgecolor="0.75",
+        fontsize=9,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
 def _plot_session_cv_distribution_summary(subject_cv_df, group_cv_stats_df, out_path):
     fig, ax = plt.subplots(1, 1, figsize=(10.5, 6.0))
 
@@ -937,14 +1079,9 @@ def _plot_metric_by_ses_run(df, value_col, x_label, title, out_path, color):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--projection-path",
-        default=(
-            "/home/zkavian/Thesis_code_Glm_Opt/results/"
-            "projection_voxel_foldavg_sub9_ses1_task0.8_bold0.8_beta0.5_smooth0.6_gamma1.npy"
-        ),
-        help="Path to projection vector (.npy).",
-    )
+    parser.add_argument("--projection-path",
+        default=('results/behave_vs_bold/projection_voxel_foldavg_sub9_ses1_task0.8_bold0.8_beta0.5_smooth0.2_gamma1_bold_thr90.npy'),
+        help="Path to projection vector (.npy).")
     parser.add_argument(
         "--manifest-path",
         default=DEFAULT_MANIFEST_PATH,
@@ -995,6 +1132,9 @@ def main():
         out_dir, f"{stem}_sub_ses_run_projection_std_over_rms_subject_comp.png"
     )
     ks_plot_path = os.path.join(out_dir, f"{stem}_sub_session12_ks_summary.png")
+    ks_subject_grid_plot_path = os.path.join(
+        out_dir, f"{stem}_sub_session12_ks_subject_distribution_grid_2x7.png"
+    )
     pooled_cv_plot_path = os.path.join(out_dir, f"{stem}_sub_session12_pooled_cv_summary.png")
 
     pairwise_stats_df = build_projection_variability_stats_table(run_variance_df)
@@ -1048,6 +1188,15 @@ def main():
         out_path=ks_plot_path,
         alpha=KS_ALPHA,
     )
+    _plot_subject_session_projection_distribution_grid(
+        run_segments,
+        out_path=ks_subject_grid_plot_path,
+        session_a=1,
+        session_b=2,
+        runs=(1, 2),
+        n_rows=2,
+        n_cols=7,
+    )
     _plot_session_cv_distribution_summary(
         pooled_cv_subject_df,
         pooled_cv_group_df,
@@ -1070,6 +1219,7 @@ def main():
     print(f"Saved variability figure: {variance_plot_path}")
     print(f"Saved std/rms figure:    {std_rms_plot_path}")
     print(f"Saved KS figure:         {ks_plot_path}")
+    print(f"Saved KS 2x7 grid figure:{ks_subject_grid_plot_path}")
     print(f"Saved pooled CV figure:  {pooled_cv_plot_path}")
     print("\nProjection variability pairwise statistics:")
     print(pairwise_stats_df.to_string(index=False))
