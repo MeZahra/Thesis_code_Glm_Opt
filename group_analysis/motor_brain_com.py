@@ -850,7 +850,7 @@ def plot_cv_subject_session_run_raw_3x1(metric_df, out_path):
             projection_value_col="projection_raw",
             x_tick_labels=("Behavior CV", "BOLD CV"))
         ax.set_ylim(y_limits)
-        ax.set_title(f"{row_title} | Raw CV (no z-score)", fontsize=11.2)
+        ax.set_title(f"{row_title}", fontsize=11.2)
         ax.set_ylabel("CV")
         _add_category_legend(ax=ax, color_map=color_map, category_values=category_values, title=legend_title)
 
@@ -1480,7 +1480,7 @@ def plot_whisker_outlier_counts_behavior_vs_bold_cv_raw(
             label="BOLD above" if row_idx == 0 else None,
         )
 
-        ax.set_title(f"{row_title} | Raw CV (no z-score)", fontsize=11.5)
+        ax.set_title(f"{row_title}", fontsize=11.5)
         ax.set_ylabel("Whisker-based outlier count")
         ax.grid(axis="y", linestyle=":", linewidth=0.8, alpha=0.55)
         ax.set_xticks(x)

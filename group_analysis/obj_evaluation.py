@@ -318,12 +318,13 @@ def _plot_results(
     for _, row in summary_ordered.iterrows():
         key = (row["task"], row["bold"], row["beta"], row["smooth"], row["gamma"])
         seen_per_param[key] = seen_per_param.get(key, 0) + 1
+        gamma_text = "" if np.isclose(float(row["gamma"]), 1.0) else f"\ng={row['gamma']:g}"
         base_label = (
             f"t={row['task']:g}\n"
             f"b={row['bold']:g}\n"
             f"be={row['beta']:g}\n"
-            f"s={row['smooth']:g}\n"
-            f"g={row['gamma']:g}"
+            f"s={row['smooth']:g}"
+            f"{gamma_text}"
         )
         if totals_per_param[key] > 1:
             base_label = f"{base_label}\nrun {seen_per_param[key]}"
@@ -415,13 +416,14 @@ def _plot_results(
             ax.set_ylim(y_low, top_for_ylim + 1.8 * y_step)
 
     ax.text(
-        0.99,
-        1.02,
-        "Stars: first box vs others (Mann-Whitney U, Bonferroni)",
+        0.01,
+        0.01,
+        "*  p<0.05\n** p<0.01\n*** p<0.001",
         transform=ax.transAxes,
-        ha="right",
+        ha="left",
         va="bottom",
         fontsize=9,
+        bbox=dict(facecolor="white", edgecolor="black", linewidth=0.8),
     )
 
     rng = np.random.default_rng(7)
@@ -433,7 +435,7 @@ def _plot_results(
 
     ax.set_xticks(np.arange(len(combo_order)))
     ax.set_xticklabels(compact_labels)
-    ax.set_ylabel("Evaluation score (higher is better)")
+    ax.set_ylabel("Evaluation score")
     ax.set_title("Fold-level score distribution")
     ax.grid(alpha=0.25, axis="y")
 
@@ -471,11 +473,9 @@ def _plot_results(
     ax.set_xticks(x)
     ax.set_xticklabels(compact_labels)
     ax.set_ylabel("Mean weighted component")
-    ax.set_title("Why each model scores as it does")
     ax.legend(loc="upper right", frameon=True)
     ax.grid(alpha=0.25, axis="y")
 
-    fig.suptitle(title)
     fig.subplots_adjust(left=0.06, right=0.98, bottom=0.18, top=0.90, wspace=0.22)
     output_png.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_png, dpi=300)
