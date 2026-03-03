@@ -741,6 +741,122 @@ def _plot_fold_boxplots(
     plt.close(fig)
 
 
+def _pairwise_condition_delta_matrix(
+    run_condition_df: pd.DataFrame,
+    value_col: str,
+    conditions: List[str],
+) -> Tuple[np.ndarray, np.ndarray]:
+    n = len(conditions)
+    delta = np.full((n, n), np.nan, dtype=np.float64)
+    n_pairs = np.zeros((n, n), dtype=np.int32)
+
+    for i, ci in enumerate(conditions):
+        xi = run_condition_df[run_condition_df["condition"] == ci][["run_key", value_col]].rename(
+            columns={value_col: "x"}
+        )
+        for j, cj in enumerate(conditions):
+            if i == j:
+                delta[i, j] = 0.0
+                continue
+            xj = run_condition_df[run_condition_df["condition"] == cj][["run_key", value_col]].rename(
+                columns={value_col: "y"}
+            )
+            merged = xi.merge(xj, on="run_key", how="inner")
+            if merged.empty:
+                continue
+            d = merged["x"].to_numpy(dtype=np.float64) - merged["y"].to_numpy(dtype=np.float64)
+            d = d[np.isfinite(d)]
+            if d.size == 0:
+                continue
+            delta[i, j] = float(np.mean(d))
+            n_pairs[i, j] = int(d.size)
+
+    return delta, n_pairs
+
+
+def _plot_condition_matrix_heatmap(
+    matrix: np.ndarray,
+    labels: List[str],
+    title: str,
+    out_path: Path,
+    symmetric: bool,
+    cmap: str,
+) -> None:
+    if matrix.size == 0:
+        return
+
+    finite = matrix[np.isfinite(matrix)]
+    if finite.size == 0:
+        vmin, vmax = (-1.0, 1.0) if symmetric else (0.0, 1.0)
+    else:
+        if symmetric:
+            vmax = float(np.nanmax(np.abs(finite)))
+            if not np.isfinite(vmax) or np.isclose(vmax, 0.0):
+                vmax = 1.0
+            vmin = -vmax
+        else:
+            vmin = float(np.nanmin(finite))
+            vmax = float(np.nanmax(finite))
+            if np.isclose(vmin, vmax):
+                vmin -= 1.0
+                vmax += 1.0
+
+    fig, ax = plt.subplots(figsize=(8.2, 7.0))
+    im = ax.imshow(matrix, cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_yticks(np.arange(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_yticklabels(labels)
+    ax.set_title(title)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.ax.set_ylabel("Mean FC delta")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def _plot_condition_mean_fc_heatmap(
+    condition_summary_df: pd.DataFrame,
+    labels: List[str],
+    value_col: str,
+    title: str,
+    out_path: Path,
+    cmap: str,
+) -> None:
+    if condition_summary_df.empty:
+        return
+
+    val_map = {str(r["condition"]): float(r[value_col]) for _, r in condition_summary_df.iterrows()}
+    vals = np.array([val_map.get(lbl, np.nan) for lbl in labels], dtype=np.float64).reshape(1, -1)
+    finite = vals[np.isfinite(vals)]
+    if finite.size == 0:
+        vmin, vmax = 0.0, 1.0
+    else:
+        vmin = float(np.nanmin(finite))
+        vmax = float(np.nanmax(finite))
+        if np.isclose(vmin, vmax):
+            pad = 0.1 * (abs(vmax) + 1e-6)
+            vmin -= pad
+            vmax += pad
+
+    fig, ax = plt.subplots(figsize=(8.6, 2.4))
+    im = ax.imshow(vals, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_yticks([0])
+    ax.set_yticklabels(["mean FC"])
+    ax.set_title(title)
+    for j, lbl in enumerate(labels):
+        v = vals[0, j]
+        if np.isfinite(v):
+            ax.text(j, 0, f"{v:.4f}", ha="center", va="center", fontsize=8, color="black")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.06, pad=0.03)
+    cbar.ax.set_ylabel("Mean FC")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
 def main() -> None:
     args = parse_args()
     rng = np.random.default_rng(int(args.random_state))
@@ -885,6 +1001,7 @@ def main() -> None:
             edge_list = []
             labels_condition = []
             groups = []
+            run_condition_rows = []
 
             for sample in samples:
                 x_data = sample[x_key]
@@ -906,8 +1023,21 @@ def main() -> None:
                         "run": sample["run"],
                         "condition": sample["condition"],
                         "n_trials": sample["n_trials"],
+                        "mean_fc_signed": float(np.mean(edge_vec)),
                         "mean_abs_edge": float(np.mean(np.abs(edge_vec))),
                         "rms_edge": float(np.sqrt(np.mean(np.square(edge_vec)))),
+                    }
+                )
+                run_condition_rows.append(
+                    {
+                        "run_key": sample["run_key"],
+                        "sub_tag": sample["sub_tag"],
+                        "ses": sample["ses"],
+                        "run": sample["run"],
+                        "condition": sample["condition"],
+                        "n_trials": sample["n_trials"],
+                        "mean_fc_signed": float(np.mean(edge_vec)),
+                        "mean_fc_abs": float(np.mean(np.abs(edge_vec))),
                     }
                 )
 
@@ -972,6 +1102,80 @@ def main() -> None:
                 binary_cm_df.to_csv(output_dir / f"{stem}__binary_confusion.csv")
             if not gvs_cm_df.empty:
                 gvs_cm_df.to_csv(output_dir / f"{stem}__gvs_confusion.csv")
+
+            run_condition_df = pd.DataFrame(run_condition_rows)
+            run_condition_df.to_csv(output_dir / f"{stem}__run_condition_mean_fc.csv", index=False)
+            cond_summary = (
+                run_condition_df.groupby("condition", as_index=False)
+                .agg(
+                    n_runs=("run_key", "nunique"),
+                    mean_fc_signed_mean=("mean_fc_signed", "mean"),
+                    mean_fc_signed_std=("mean_fc_signed", "std"),
+                    mean_fc_abs_mean=("mean_fc_abs", "mean"),
+                    mean_fc_abs_std=("mean_fc_abs", "std"),
+                )
+            )
+            cond_summary["condition"] = pd.Categorical(
+                cond_summary["condition"], categories=GVS_LABELS, ordered=True
+            )
+            cond_summary = cond_summary.sort_values("condition").reset_index(drop=True)
+            cond_summary.to_csv(output_dir / f"{stem}__condition_mean_fc_summary.csv", index=False)
+            _plot_condition_mean_fc_heatmap(
+                condition_summary_df=cond_summary,
+                labels=GVS_LABELS,
+                value_col="mean_fc_signed_mean",
+                title=f"{space} | {method_id}\nCondition mean FC (signed)",
+                out_path=output_dir / f"{stem}__condition_mean_fc_signed_heatmap.png",
+                cmap="coolwarm",
+            )
+            _plot_condition_mean_fc_heatmap(
+                condition_summary_df=cond_summary,
+                labels=GVS_LABELS,
+                value_col="mean_fc_abs_mean",
+                title=f"{space} | {method_id}\nCondition mean FC (absolute)",
+                out_path=output_dir / f"{stem}__condition_mean_fc_abs_heatmap.png",
+                cmap="viridis",
+            )
+
+            delta_signed, npairs_signed = _pairwise_condition_delta_matrix(
+                run_condition_df=run_condition_df,
+                value_col="mean_fc_signed",
+                conditions=GVS_LABELS,
+            )
+            delta_abs, npairs_abs = _pairwise_condition_delta_matrix(
+                run_condition_df=run_condition_df,
+                value_col="mean_fc_abs",
+                conditions=GVS_LABELS,
+            )
+            pd.DataFrame(delta_signed, index=GVS_LABELS, columns=GVS_LABELS).to_csv(
+                output_dir / f"{stem}__condition_pairwise_mean_fc_signed_delta.csv"
+            )
+            pd.DataFrame(npairs_signed, index=GVS_LABELS, columns=GVS_LABELS).to_csv(
+                output_dir / f"{stem}__condition_pairwise_mean_fc_signed_npairs.csv"
+            )
+            pd.DataFrame(delta_abs, index=GVS_LABELS, columns=GVS_LABELS).to_csv(
+                output_dir / f"{stem}__condition_pairwise_mean_fc_abs_delta.csv"
+            )
+            pd.DataFrame(npairs_abs, index=GVS_LABELS, columns=GVS_LABELS).to_csv(
+                output_dir / f"{stem}__condition_pairwise_mean_fc_abs_npairs.csv"
+            )
+
+            _plot_condition_matrix_heatmap(
+                matrix=delta_signed,
+                labels=GVS_LABELS,
+                title=f"{space} | {method_id}\nMean FC (signed) delta: row - col",
+                out_path=output_dir / f"{stem}__condition_pairwise_mean_fc_signed_delta_heatmap.png",
+                symmetric=True,
+                cmap="coolwarm",
+            )
+            _plot_condition_matrix_heatmap(
+                matrix=delta_abs,
+                labels=GVS_LABELS,
+                title=f"{space} | {method_id}\nMean FC (absolute) delta: row - col",
+                out_path=output_dir / f"{stem}__condition_pairwise_mean_fc_abs_delta_heatmap.png",
+                symmetric=True,
+                cmap="coolwarm",
+            )
 
             summary_rows.append(
                 {
