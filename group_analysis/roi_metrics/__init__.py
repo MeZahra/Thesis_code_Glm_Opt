@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from . import (
-    graph_correlation_network,
     instantaneous_phase_sync,
+    linear_correlation_network,
     linear_granger,
     mutual_information,
     nonlinear_granger,
@@ -14,7 +14,7 @@ METRIC_ORDER = [
     wavelet_transform_coherence.METRIC_NAME,
     partial_correlation.METRIC_NAME,
     mutual_information.METRIC_NAME,
-    graph_correlation_network.METRIC_NAME,
+    linear_correlation_network.METRIC_NAME,
     linear_granger.METRIC_NAME,
     nonlinear_granger.METRIC_NAME,
     instantaneous_phase_sync.METRIC_NAME,
@@ -24,7 +24,8 @@ METRIC_REGISTRY = {
     wavelet_transform_coherence.METRIC_NAME: wavelet_transform_coherence.compute_metric,
     partial_correlation.METRIC_NAME: partial_correlation.compute_metric,
     mutual_information.METRIC_NAME: mutual_information.compute_metric,
-    graph_correlation_network.METRIC_NAME: graph_correlation_network.compute_metric,
+    linear_correlation_network.METRIC_NAME: linear_correlation_network.compute_metric,
+    "graph_correlation_network": linear_correlation_network.compute_metric,
     linear_granger.METRIC_NAME: linear_granger.compute_metric,
     nonlinear_granger.METRIC_NAME: nonlinear_granger.compute_metric,
     instantaneous_phase_sync.METRIC_NAME: instantaneous_phase_sync.compute_metric,

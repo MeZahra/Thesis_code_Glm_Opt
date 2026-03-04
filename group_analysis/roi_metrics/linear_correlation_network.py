@@ -5,9 +5,9 @@ import numpy as np
 from .common import ensure_2d_roi_ts, safe_corrcoef_rows
 
 
-METRIC_NAME = "graph_correlation_network"
+METRIC_NAME = "linear_correlation_network"
 METRIC_DESCRIPTION = (
-    "Correlation between node connectivity profiles (second-order graph correlation network)."
+    "Pearson correlation between node connectivity profiles (second-order linear correlation network)."
 )
 
 
@@ -22,13 +22,13 @@ def compute_metric(roi_ts: np.ndarray) -> dict:
     profiles = base_corr.copy()
     np.fill_diagonal(profiles, np.nan)
 
-    graph_corr = safe_corrcoef_rows(profiles, min_overlap=max(3, profiles.shape[0] // 2))
-    graph_corr = np.nan_to_num(graph_corr, nan=0.0, posinf=0.0, neginf=0.0)
-    graph_corr = np.clip(graph_corr, -1.0, 1.0)
-    np.fill_diagonal(graph_corr, 1.0)
+    linear_corr = safe_corrcoef_rows(profiles, min_overlap=max(3, profiles.shape[0] // 2))
+    linear_corr = np.nan_to_num(linear_corr, nan=0.0, posinf=0.0, neginf=0.0)
+    linear_corr = np.clip(linear_corr, -1.0, 1.0)
+    np.fill_diagonal(linear_corr, 1.0)
 
     return {
-        "matrix": graph_corr,
+        "matrix": linear_corr,
         "vmin": -1.0,
         "vmax": 1.0,
         "cmap": "jet",
