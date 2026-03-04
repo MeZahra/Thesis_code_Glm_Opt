@@ -20,30 +20,154 @@ from nilearn import plotting
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=("For each selected_beta_trials_* file, average voxel beta series within ROIs, "
-            "compute ROI-to-ROI connectivity (edges), and compute edge-to-edge correlations."))
-    parser.add_argument("--data-dir", type=Path, default=Path("results/connectivity/data"),
-                        help="Directory containing selected_beta_trials_*.npy files.")
-    parser.add_argument("--beta-pattern", default="selected_beta_trials_*.npy",
-                        help="Glob pattern for condition beta files.")
-    parser.add_argument("--roi-img", type=Path, default=Path("results/connectivity/created_rois_fitted.nii.gz"),
-                        help="ROI label image used to define node membership.")
-    parser.add_argument("--roi-summary", type=Path, default=Path("results/connectivity/created_roi_summary.json"),
-                        help="ROI summary JSON that contains all_roi_names_in_order (optional).")
-    parser.add_argument("--voxel-indices-path", type=Path, default=Path("results/connectivity/data/selected_voxel_indices.npz"),
-                        help="NPZ with selected_ijk or selected_flat_indices for selected beta rows.")
-    parser.add_argument("--out-dir", type=Path, default=Path("results/connectivity/roi_edge_network"), help="Output directory.")
-    parser.add_argument("--min-roi-voxels", type=int, default=5, help="Minimum selected voxels required to keep an ROI node.")
-    parser.add_argument("--edge-threshold-percentile", type=float, default=85.0, help="Percentile threshold for connectome plotting.")
-    parser.add_argument("--split-hemispheres", action="store_true", default=True,
-                        help="Split each ROI into left/right hemisphere nodes using MNI x coordinate.")
-    parser.add_argument("--no-split-hemispheres", dest="split_hemispheres", action="store_false",
-                        help="Disable left/right splitting and keep one node per ROI label.")
-    parser.add_argument("--midline-band-mm", type=float, default=1.0,
-                        help="Absolute MNI x band treated as midline when splitting hemispheres.")
-    parser.add_argument("--node-size", type=float, default=135.0, help="Static connectome node size.")
-    parser.add_argument("--edge-linewidth", type=float, default=5.0, help="Static connectome edge linewidth.")
-    parser.add_argument("--no-html", action="store_true", help="Skip interactive HTML connectome outputs.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "For each selected_beta_trials_* file, average voxel beta series within ROIs, "
+            "compute ROI-to-ROI connectivity (edges), and compute edge-to-edge correlations."
+        )
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("results/connectivity/data"),
+        help="Directory containing selected_beta_trials_*.npy files.",
+    )
+    parser.add_argument(
+        "--beta-pattern",
+        default="selected_beta_trials_*.npy",
+        help="Glob pattern for condition beta files.",
+    )
+    parser.add_argument(
+        "--roi-img",
+        type=Path,
+        default=Path("results/connectivity/created_rois_fitted.nii.gz"),
+        help="ROI label image used to define node membership.",
+    )
+    parser.add_argument(
+        "--roi-summary",
+        type=Path,
+        default=Path("results/connectivity/created_roi_summary.json"),
+        help="ROI summary JSON that contains all_roi_names_in_order (optional).",
+    )
+    parser.add_argument(
+        "--voxel-indices-path",
+        type=Path,
+        default=Path("results/connectivity/data/selected_voxel_indices.npz"),
+        help="NPZ with selected_ijk or selected_flat_indices for selected beta rows.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("results/connectivity/roi_edge_network"),
+        help="Output directory.",
+    )
+    parser.add_argument(
+        "--min-roi-voxels",
+        type=int,
+        default=5,
+        help="Minimum selected voxels required to keep an ROI node.",
+    )
+    parser.add_argument(
+        "--edge-threshold-percentile",
+        type=float,
+        default=85.0,
+        help="Percentile threshold for connectome plotting.",
+    )
+    parser.add_argument(
+        "--split-hemispheres",
+        action="store_true",
+        default=True,
+        help="Split each ROI into left/right hemisphere nodes using MNI x coordinate.",
+    )
+    parser.add_argument(
+        "--no-split-hemispheres",
+        dest="split_hemispheres",
+        action="store_false",
+        help="Disable left/right splitting and keep one node per ROI label.",
+    )
+    parser.add_argument(
+        "--midline-band-mm",
+        type=float,
+        default=1.0,
+        help="Absolute MNI x band treated as midline when splitting hemispheres.",
+    )
+    parser.add_argument(
+        "--node-size",
+        type=float,
+        default=135.0,
+        help="Static connectome node size.",
+    )
+    parser.add_argument(
+        "--edge-linewidth",
+        type=float,
+        default=5.0,
+        help="Static connectome edge linewidth.",
+    )
+    parser.add_argument(
+        "--no-html",
+        action="store_true",
+        help="Skip interactive HTML connectome outputs.",
+    )
+    parser.add_argument(
+        "--run-advanced-metrics",
+        action="store_true",
+        default=True,
+        help="Run advanced ROI-network metrics after base connectivity outputs (default: enabled).",
+    )
+    parser.add_argument(
+        "--skip-advanced-metrics",
+        dest="run_advanced_metrics",
+        action="store_false",
+        help="Skip advanced ROI-network metric computation.",
+    )
+    parser.add_argument(
+        "--advanced-metrics",
+        default="all",
+        help="Comma-separated advanced metric list or 'all'.",
+    )
+    parser.add_argument(
+        "--advanced-metrics-out-subdir",
+        default="advanced_metrics",
+        help="Output subfolder under --out-dir for advanced metric files.",
+    )
+    parser.add_argument(
+        "--mi-bins",
+        type=int,
+        default=8,
+        help="Quantile bins for mutual information metric.",
+    )
+    parser.add_argument(
+        "--granger-max-lag",
+        type=int,
+        default=3,
+        help="Lag order for linear/nonlinear Granger metrics.",
+    )
+    parser.add_argument(
+        "--granger-ridge",
+        type=float,
+        default=1e-6,
+        help="Ridge regularization for Granger regression fits.",
+    )
+    parser.add_argument("--wavelet-min-scale", type=int, default=2, help="Minimum wavelet scale.")
+    parser.add_argument("--wavelet-max-scale", type=int, default=20, help="Maximum wavelet scale.")
+    parser.add_argument(
+        "--wavelet-omega0",
+        type=float,
+        default=6.0,
+        help="Morlet omega0 for wavelet coherence.",
+    )
+    parser.add_argument(
+        "--wavelet-smooth-scale-sigma",
+        type=float,
+        default=1.0,
+        help="Scale-axis smoothing sigma for wavelet coherence.",
+    )
+    parser.add_argument(
+        "--wavelet-smooth-time-sigma",
+        type=float,
+        default=2.0,
+        help="Time-axis smoothing sigma for wavelet coherence.",
+    )
     return parser.parse_args()
 
 
@@ -54,6 +178,8 @@ def _condition_sort_key(label: str) -> Tuple[int, int | str]:
     if match:
         return (1, int(match.group(1)))
     return (2, label.lower())
+
+
 def _discover_beta_files(data_dir: Path, pattern: str) -> List[Tuple[str, Path]]:
     out: List[Tuple[str, Path]] = []
     for path in sorted(data_dir.glob(pattern)):
@@ -66,6 +192,8 @@ def _discover_beta_files(data_dir: Path, pattern: str) -> List[Tuple[str, Path]]
         out.append((label, path))
     out.sort(key=lambda x: _condition_sort_key(x[0]))
     return out
+
+
 def _load_selected_ijk(path: Path, volume_shape: Tuple[int, int, int]) -> np.ndarray:
     pack = np.load(path, allow_pickle=True)
     if "selected_ijk" in pack.files:
@@ -73,17 +201,35 @@ def _load_selected_ijk(path: Path, volume_shape: Tuple[int, int, int]) -> np.nda
     elif "selected_flat_indices" in pack.files:
         flat = np.asarray(pack["selected_flat_indices"], dtype=np.int64)
         ijk = np.column_stack(np.unravel_index(flat, volume_shape)).astype(np.int32, copy=False)
+    else:
+        raise KeyError("selected_voxel_indices.npz must contain selected_ijk or selected_flat_indices.")
 
-    valid = ((ijk[:, 0] >= 0) & (ijk[:, 0] < volume_shape[0]) & (ijk[:, 1] >= 0) & (ijk[:, 1] < volume_shape[1])
-             & (ijk[:, 2] >= 0) & (ijk[:, 2] < volume_shape[2]))
+    if ijk.ndim != 2 or ijk.shape[1] != 3:
+        raise ValueError(f"Expected selected_ijk shape (N, 3); got {ijk.shape}")
+
+    valid = (
+        (ijk[:, 0] >= 0)
+        & (ijk[:, 0] < volume_shape[0])
+        & (ijk[:, 1] >= 0)
+        & (ijk[:, 1] < volume_shape[1])
+        & (ijk[:, 2] >= 0)
+        & (ijk[:, 2] < volume_shape[2])
+    )
     if not np.all(valid):
         dropped = int(np.count_nonzero(~valid))
         print(f"Warning: dropping {dropped} out-of-bounds selected voxels from metadata.", flush=True)
         ijk = ijk[valid]
     return ijk
+
+
 def _load_roi_names(summary_path: Path) -> Dict[int, str]:
     names: Dict[int, str] = {}
-    payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    if not summary_path.exists():
+        return names
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return names
     rows = payload.get("roi_rows")
     if isinstance(rows, list) and rows:
         for row in rows:
@@ -302,6 +448,16 @@ def main() -> None:
 
     for label, beta_path in beta_files:
         beta = np.load(beta_path, mmap_mode="r")
+        if beta.ndim != 2:
+            print(f"Skipping {beta_path.name}: expected 2D, got {beta.shape}", flush=True)
+            continue
+        if beta.shape[0] != n_selected:
+            print(
+                f"Skipping {beta_path.name}: voxel count {beta.shape[0]} does not match selected_ijk {n_selected}.",
+                flush=True,
+            )
+            continue
+
         roi_ts = np.full((n_rois, beta.shape[1]), np.nan, dtype=np.float64)
         for idx, members in enumerate(roi_member_indices):
             roi_ts[idx] = np.nanmean(np.asarray(beta[members, :], dtype=np.float64), axis=0)
@@ -353,6 +509,9 @@ def main() -> None:
              "roi_ts_finite_fraction": float(np.mean(np.isfinite(roi_ts))), "conn_finite_fraction": float(np.mean(np.isfinite(node_conn))),
              "edge_corr_finite_fraction": float(np.mean(np.isfinite(edge_corr)))})
         print(f"Processed {label}: trials={beta.shape[1]}, rois={n_rois}, edges={len(edge_pairs)}", flush=True)
+
+    if not connectivity_vec_rows:
+        raise RuntimeError("No beta files were processed successfully.")
 
     edge_strength = np.vstack(connectivity_vec_rows).astype(np.float64, copy=False)  # files x edges
     np.save(out_dir / "edge_strength_by_file.npy", edge_strength.astype(np.float32, copy=False))
@@ -425,12 +584,37 @@ def main() -> None:
         "edge_labels": edge_labels,
         "per_file_summary": per_file_summary,
     }
+
+    advanced_info = None
+    if args.run_advanced_metrics:
+        from roi_metric_runner import run_metric_pipeline
+
+        advanced_info = run_metric_pipeline(
+            network_dir=out_dir,
+            out_subdir=args.advanced_metrics_out_subdir,
+            metrics=args.advanced_metrics,
+            labels=connectivity_vec_labels,
+            args=args,
+        )
+        summary["advanced_metrics"] = {
+            "enabled": True,
+            "selected_metrics": advanced_info["selected_metrics"],
+            "selected_labels": advanced_info["selected_labels"],
+            "n_outputs": int(advanced_info["n_outputs"]),
+            "summary_csv": str(advanced_info["summary_csv"]),
+            "out_root": str(advanced_info["out_root"]),
+        }
+    else:
+        summary["advanced_metrics"] = {"enabled": False}
+
     (out_dir / "roi_edge_network_summary.json").write_text(
         json.dumps(summary, indent=2),
         encoding="utf-8",
     )
 
     print(f"Saved outputs to: {out_dir}", flush=True)
+    if advanced_info is not None:
+        print(f"Saved advanced metrics to: {advanced_info['out_root']}", flush=True)
 
 
 if __name__ == "__main__":
