@@ -32,7 +32,7 @@ def zscore_rows(roi_ts: np.ndarray) -> np.ndarray:
     return out
 
 
-def prepare_trial_by_node(roi_ts: np.ndarray, zscore: bool = True) -> np.ndarray:
+def prepare_trial_by_node(roi_ts: np.ndarray, zscore: bool = False) -> np.ndarray:
     x = impute_nan_by_row_median(roi_ts)
     if zscore:
         x = zscore_rows(x)

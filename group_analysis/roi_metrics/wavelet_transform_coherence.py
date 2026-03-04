@@ -4,7 +4,7 @@ import numpy as np
 from scipy import signal
 from scipy.ndimage import gaussian_filter
 
-from .common import ensure_2d_roi_ts, zscore_rows
+from .common import ensure_2d_roi_ts
 
 
 METRIC_NAME = "wavelet_transform_coherence"
@@ -40,7 +40,7 @@ def compute_metric(
     smooth_scale_sigma: float = 1.0,
     smooth_time_sigma: float = 2.0,
 ) -> dict:
-    x = zscore_rows(ensure_2d_roi_ts(roi_ts))
+    x = ensure_2d_roi_ts(roi_ts)
 
     min_scale = int(max(1, min_scale))
     max_scale = int(max(min_scale + 1, max_scale))

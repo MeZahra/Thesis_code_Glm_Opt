@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .common import ensure_2d_roi_ts, safe_corrcoef_rows, zscore_rows
+from .common import ensure_2d_roi_ts, safe_corrcoef_rows
 
 
 METRIC_NAME = "graph_correlation_network"
@@ -12,7 +12,7 @@ METRIC_DESCRIPTION = (
 
 
 def compute_metric(roi_ts: np.ndarray) -> dict:
-    x = zscore_rows(ensure_2d_roi_ts(roi_ts))
+    x = ensure_2d_roi_ts(roi_ts)
 
     base_corr = safe_corrcoef_rows(x, min_overlap=3)
     base_corr = np.nan_to_num(base_corr, nan=0.0, posinf=0.0, neginf=0.0)

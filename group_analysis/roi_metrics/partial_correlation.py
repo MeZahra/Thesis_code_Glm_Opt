@@ -10,7 +10,7 @@ METRIC_DESCRIPTION = "Inverse-covariance partial correlation between ROI nodes."
 
 
 def compute_metric(roi_ts: np.ndarray, ridge: float = 1e-4) -> dict:
-    x = prepare_trial_by_node(roi_ts, zscore=True)
+    x = prepare_trial_by_node(roi_ts, zscore=False)
     cov = np.cov(x, rowvar=False)
     if cov.ndim != 2:
         raise ValueError(f"Unexpected covariance shape: {cov.shape}")

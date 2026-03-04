@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.signal import hilbert
 
-from .common import ensure_2d_roi_ts, zscore_rows
+from .common import ensure_2d_roi_ts
 
 
 METRIC_NAME = "instantaneous_phase_sync"
@@ -11,7 +11,7 @@ METRIC_DESCRIPTION = "Instantaneous phase-locking value (PLV) between ROI node p
 
 
 def compute_metric(roi_ts: np.ndarray) -> dict:
-    x = zscore_rows(ensure_2d_roi_ts(roi_ts))
+    x = ensure_2d_roi_ts(roi_ts)
     analytic = hilbert(x, axis=1)
     phase = np.angle(analytic)
 
