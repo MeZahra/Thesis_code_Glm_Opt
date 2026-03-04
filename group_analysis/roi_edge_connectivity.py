@@ -20,94 +20,30 @@ from nilearn import plotting
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "For each selected_beta_trials_* file, average voxel beta series within ROIs, "
-            "compute ROI-to-ROI connectivity (edges), and compute edge-to-edge correlations."
-        )
-    )
-    parser.add_argument(
-        "--data-dir",
-        type=Path,
-        default=Path("results/connectivity/data"),
-        help="Directory containing selected_beta_trials_*.npy files.",
-    )
-    parser.add_argument(
-        "--beta-pattern",
-        default="selected_beta_trials_*.npy",
-        help="Glob pattern for condition beta files.",
-    )
-    parser.add_argument(
-        "--roi-img",
-        type=Path,
-        default=Path("results/connectivity/created_rois_fitted.nii.gz"),
-        help="ROI label image used to define node membership.",
-    )
-    parser.add_argument(
-        "--roi-summary",
-        type=Path,
-        default=Path("results/connectivity/created_roi_summary.json"),
-        help="ROI summary JSON that contains all_roi_names_in_order (optional).",
-    )
-    parser.add_argument(
-        "--voxel-indices-path",
-        type=Path,
-        default=Path("results/connectivity/data/selected_voxel_indices.npz"),
-        help="NPZ with selected_ijk or selected_flat_indices for selected beta rows.",
-    )
-    parser.add_argument(
-        "--out-dir",
-        type=Path,
-        default=Path("results/connectivity/roi_edge_network"),
-        help="Output directory.",
-    )
-    parser.add_argument(
-        "--min-roi-voxels",
-        type=int,
-        default=5,
-        help="Minimum selected voxels required to keep an ROI node.",
-    )
-    parser.add_argument(
-        "--edge-threshold-percentile",
-        type=float,
-        default=85.0,
-        help="Percentile threshold for connectome plotting.",
-    )
-    parser.add_argument(
-        "--split-hemispheres",
-        action="store_true",
-        default=True,
-        help="Split each ROI into left/right hemisphere nodes using MNI x coordinate.",
-    )
-    parser.add_argument(
-        "--no-split-hemispheres",
-        dest="split_hemispheres",
-        action="store_false",
-        help="Disable left/right splitting and keep one node per ROI label.",
-    )
-    parser.add_argument(
-        "--midline-band-mm",
-        type=float,
-        default=1.0,
-        help="Absolute MNI x band treated as midline when splitting hemispheres.",
-    )
-    parser.add_argument(
-        "--node-size",
-        type=float,
-        default=135.0,
-        help="Static connectome node size.",
-    )
-    parser.add_argument(
-        "--edge-linewidth",
-        type=float,
-        default=5.0,
-        help="Static connectome edge linewidth.",
-    )
-    parser.add_argument(
-        "--no-html",
-        action="store_true",
-        help="Skip interactive HTML connectome outputs.",
-    )
+    parser = argparse.ArgumentParser(description=("For each selected_beta_trials_* file, average voxel beta series within ROIs, "
+            "compute ROI-to-ROI connectivity (edges), and compute edge-to-edge correlations."))
+    parser.add_argument("--data-dir", type=Path, default=Path("results/connectivity/data"),
+                        help="Directory containing selected_beta_trials_*.npy files.")
+    parser.add_argument("--beta-pattern", default="selected_beta_trials_*.npy",
+                        help="Glob pattern for condition beta files.")
+    parser.add_argument("--roi-img", type=Path, default=Path("results/connectivity/created_rois_fitted.nii.gz"),
+                        help="ROI label image used to define node membership.")
+    parser.add_argument("--roi-summary", type=Path, default=Path("results/connectivity/created_roi_summary.json"),
+                        help="ROI summary JSON that contains all_roi_names_in_order (optional).")
+    parser.add_argument("--voxel-indices-path", type=Path, default=Path("results/connectivity/data/selected_voxel_indices.npz"),
+                        help="NPZ with selected_ijk or selected_flat_indices for selected beta rows.")
+    parser.add_argument("--out-dir", type=Path, default=Path("results/connectivity/roi_edge_network"), help="Output directory.")
+    parser.add_argument("--min-roi-voxels", type=int, default=5, help="Minimum selected voxels required to keep an ROI node.")
+    parser.add_argument("--edge-threshold-percentile", type=float, default=85.0, help="Percentile threshold for connectome plotting.")
+    parser.add_argument("--split-hemispheres", action="store_true", default=True,
+                        help="Split each ROI into left/right hemisphere nodes using MNI x coordinate.")
+    parser.add_argument("--no-split-hemispheres", dest="split_hemispheres", action="store_false",
+                        help="Disable left/right splitting and keep one node per ROI label.")
+    parser.add_argument("--midline-band-mm", type=float, default=1.0,
+                        help="Absolute MNI x band treated as midline when splitting hemispheres.")
+    parser.add_argument("--node-size", type=float, default=135.0, help="Static connectome node size.")
+    parser.add_argument("--edge-linewidth", type=float, default=5.0, help="Static connectome edge linewidth.")
+    parser.add_argument("--no-html", action="store_true", help="Skip interactive HTML connectome outputs.")
     return parser.parse_args()
 
 
@@ -118,8 +54,6 @@ def _condition_sort_key(label: str) -> Tuple[int, int | str]:
     if match:
         return (1, int(match.group(1)))
     return (2, label.lower())
-
-
 def _discover_beta_files(data_dir: Path, pattern: str) -> List[Tuple[str, Path]]:
     out: List[Tuple[str, Path]] = []
     for path in sorted(data_dir.glob(pattern)):
@@ -132,8 +66,6 @@ def _discover_beta_files(data_dir: Path, pattern: str) -> List[Tuple[str, Path]]
         out.append((label, path))
     out.sort(key=lambda x: _condition_sort_key(x[0]))
     return out
-
-
 def _load_selected_ijk(path: Path, volume_shape: Tuple[int, int, int]) -> np.ndarray:
     pack = np.load(path, allow_pickle=True)
     if "selected_ijk" in pack.files:
@@ -141,35 +73,17 @@ def _load_selected_ijk(path: Path, volume_shape: Tuple[int, int, int]) -> np.nda
     elif "selected_flat_indices" in pack.files:
         flat = np.asarray(pack["selected_flat_indices"], dtype=np.int64)
         ijk = np.column_stack(np.unravel_index(flat, volume_shape)).astype(np.int32, copy=False)
-    else:
-        raise KeyError("selected_voxel_indices.npz must contain selected_ijk or selected_flat_indices.")
 
-    if ijk.ndim != 2 or ijk.shape[1] != 3:
-        raise ValueError(f"Expected selected_ijk shape (N, 3); got {ijk.shape}")
-
-    valid = (
-        (ijk[:, 0] >= 0)
-        & (ijk[:, 0] < volume_shape[0])
-        & (ijk[:, 1] >= 0)
-        & (ijk[:, 1] < volume_shape[1])
-        & (ijk[:, 2] >= 0)
-        & (ijk[:, 2] < volume_shape[2])
-    )
+    valid = ((ijk[:, 0] >= 0) & (ijk[:, 0] < volume_shape[0]) & (ijk[:, 1] >= 0) & (ijk[:, 1] < volume_shape[1])
+             & (ijk[:, 2] >= 0) & (ijk[:, 2] < volume_shape[2]))
     if not np.all(valid):
         dropped = int(np.count_nonzero(~valid))
         print(f"Warning: dropping {dropped} out-of-bounds selected voxels from metadata.", flush=True)
         ijk = ijk[valid]
     return ijk
-
-
 def _load_roi_names(summary_path: Path) -> Dict[int, str]:
     names: Dict[int, str] = {}
-    if not summary_path.exists():
-        return names
-    try:
-        payload = json.loads(summary_path.read_text(encoding="utf-8"))
-    except Exception:
-        return names
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
     rows = payload.get("roi_rows")
     if isinstance(rows, list) and rows:
         for row in rows:
@@ -183,12 +97,8 @@ def _load_roi_names(summary_path: Path) -> Dict[int, str]:
             if idx not in names and isinstance(name, str) and name:
                 names[idx] = name
     return names
-
-
 def _safe_corrcoef_rows(series: np.ndarray, min_overlap: int = 3) -> np.ndarray:
     x = np.asarray(series, dtype=np.float64)
-    if x.ndim != 2:
-        raise ValueError(f"Expected 2D series array, got {x.shape}")
     n_rows = x.shape[0]
     out = np.full((n_rows, n_rows), np.nan, dtype=np.float64)
     for i in range(n_rows):
@@ -214,32 +124,17 @@ def _safe_corrcoef_rows(series: np.ndarray, min_overlap: int = 3) -> np.ndarray:
             out[i, j] = val
             out[j, i] = val
     return out
-
-
 def _zscore_rows_nan(series: np.ndarray) -> np.ndarray:
     x = np.asarray(series, dtype=np.float64)
     mu = np.nanmean(x, axis=1, keepdims=True)
     sd = np.nanstd(x, axis=1, keepdims=True)
     sd = np.where(sd <= 1e-12, np.nan, sd)
     return (x - mu) / sd
-
-
 def _write_matrix_csv(path: Path, matrix: np.ndarray, row_labels: List[str], col_labels: List[str]) -> None:
     df = pd.DataFrame(matrix, index=row_labels, columns=col_labels)
     df.to_csv(path, index=True)
-
-
-def _plot_connectome(
-    conn: np.ndarray,
-    node_coords_mm: np.ndarray,
-    node_labels: List[str],
-    out_png: Path,
-    out_html: Path | None,
-    percentile: float,
-    node_size: float,
-    edge_linewidth: float,
-    title: str,
-) -> None:
+def _plot_connectome(conn: np.ndarray, node_coords_mm: np.ndarray, node_labels: List[str], out_png: Path,
+                     out_html: Path | None, percentile: float, node_size: float, edge_linewidth: float, title: str):
     finite_edges = np.abs(conn[np.triu_indices(conn.shape[0], k=1)])
     finite_edges = finite_edges[np.isfinite(finite_edges)]
     if finite_edges.size == 0:
@@ -248,47 +143,21 @@ def _plot_connectome(
         percentile = float(np.clip(percentile, 0.0, 100.0))
         edge_threshold = f"{percentile:.1f}%"
 
-    plotting.plot_connectome(
-        np.nan_to_num(conn, nan=0.0),
-        node_coords_mm,
-        node_color="#1f78b4",
-        node_size=float(node_size),
-        edge_cmap="jet",
-        edge_vmin=-1.0,
-        edge_vmax=1.0,
-        edge_threshold=edge_threshold,
-        edge_kwargs={"linewidth": float(edge_linewidth), "alpha": 0.85},
-        node_kwargs={"alpha": 0.95},
-        colorbar=True,
-        title=title,
-        output_file=str(out_png),
-    )
+    plotting.plot_connectome(np.nan_to_num(conn, nan=0.0), node_coords_mm, node_color="#1f78b4", node_size=float(node_size),
+                             edge_cmap="jet", edge_vmin=-1.0, edge_vmax=1.0, edge_threshold=edge_threshold,
+                             edge_kwargs={"linewidth": float(edge_linewidth), "alpha": 0.85}, node_kwargs={"alpha": 0.95}, colorbar=True, 
+                             title=title, output_file=str(out_png))
+    
     if out_html is not None:
-        view = plotting.view_connectome(
-            np.nan_to_num(conn, nan=0.0),
-            node_coords_mm,
-            edge_threshold=edge_threshold,
-            linewidth=max(1.5, float(edge_linewidth) * 1.8),
-            colorbar=True,
-            node_size=max(3.0, float(node_size) / 16.0),
-            title=title,
-        )
+        view = plotting.view_connectome(np.nan_to_num(conn, nan=0.0), node_coords_mm, edge_threshold=edge_threshold, edge_cmap="jet",
+                                        symmetric_cmap=False, linewidth=max(1.5, float(edge_linewidth) * 1.8), colorbar=True,
+                                        node_size=max(3.0, float(node_size) / 16.0), title=title)
         view.save_as_html(str(out_html))
 
     labels_path = out_png.with_suffix(".labels.txt")
     labels_path.write_text("\n".join(node_labels), encoding="utf-8")
-
-
-def _plot_heatmap(
-    matrix: np.ndarray,
-    labels: List[str],
-    out_png: Path,
-    title: str,
-    cmap: str = "jet",
-    vmin: float = -1.0,
-    vmax: float = 1.0,
-    cbar_label: str = "Correlation",
-) -> None:
+def _plot_heatmap(matrix: np.ndarray, labels: List[str], out_png: Path, title: str, cmap: str = "jet", vmin: float = -1.0, vmax: float = 1.0,
+                  cbar_label: str = "Correlation") -> None:
     values = np.nan_to_num(matrix, nan=0.0, posinf=0.0, neginf=0.0)
     n = values.shape[0]
     fig, ax = plt.subplots(figsize=(10.5, 8.5))
@@ -314,8 +183,6 @@ def _plot_heatmap(
     fig.tight_layout()
     fig.savefig(out_png, dpi=220, bbox_inches="tight")
     plt.close(fig)
-
-
 def _offdiag_abs_vmax(matrix: np.ndarray, percentile: float = 99.0, fallback: float = 0.10) -> float:
     m = np.asarray(matrix, dtype=np.float64)
     if m.ndim != 2 or m.shape[0] != m.shape[1]:
@@ -338,21 +205,9 @@ def main() -> None:
     out_dir = args.out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if not data_dir.exists():
-        raise FileNotFoundError(f"Data directory not found: {data_dir}")
-    if not roi_img_path.exists():
-        raise FileNotFoundError(f"ROI image not found: {roi_img_path}")
-    if not voxel_indices_path.exists():
-        raise FileNotFoundError(f"Voxel index metadata not found: {voxel_indices_path}")
-
     beta_files = _discover_beta_files(data_dir, args.beta_pattern)
-    if not beta_files:
-        raise FileNotFoundError(f"No files matched {args.beta_pattern} in {data_dir}")
-
     roi_img = nib.load(str(roi_img_path))
     roi_data = roi_img.get_fdata().astype(np.int32)
-    if roi_data.ndim != 3:
-        raise ValueError(f"ROI image must be 3D labels, got shape {roi_data.shape}")
 
     selected_ijk = _load_selected_ijk(voxel_indices_path, roi_data.shape)
     n_selected = selected_ijk.shape[0]
@@ -360,22 +215,12 @@ def main() -> None:
     roi_labels_at_selected = roi_data[x, y, z]
 
     roi_names_lookup = _load_roi_names(roi_summary_path)
-    unique_ids, counts = np.unique(
-        roi_labels_at_selected[roi_labels_at_selected > 0], return_counts=True
-    )
+    unique_ids, counts = np.unique(roi_labels_at_selected[roi_labels_at_selected > 0], return_counts=True)
     unique_ids = unique_ids.astype(np.int32, copy=False)
     counts = counts.astype(np.int64, copy=False)
-
     keep = counts >= int(max(1, args.min_roi_voxels))
     kept_roi_ids = unique_ids[keep]
-    if kept_roi_ids.size < 2:
-        raise RuntimeError(
-            f"Need at least 2 ROIs after min-roi-voxels filter ({args.min_roi_voxels}); got {kept_roi_ids.size}."
-        )
-
-    selected_coords_mm = nib.affines.apply_affine(roi_img.affine, selected_ijk).astype(
-        np.float64, copy=False
-    )
+    selected_coords_mm = nib.affines.apply_affine(roi_img.affine, selected_ijk)
     selected_x = selected_coords_mm[:, 0]
     midline_band = float(max(0.0, args.midline_band_mm))
     min_node_vox = int(max(1, args.min_roi_voxels))
@@ -432,27 +277,17 @@ def main() -> None:
             node_base_roi_ids.append(int(roi_id))
             node_hemisphere.append("B")
 
-    if len(roi_member_indices) < 2:
-        raise RuntimeError(
-            "Need at least 2 ROI nodes after hemisphere split/filtering; "
-            f"got {len(roi_member_indices)}."
-        )
-
     node_coords_mm_arr = np.vstack(node_coords_mm).astype(np.float64, copy=False)
     node_counts = np.asarray([int(m.size) for m in roi_member_indices], dtype=np.int64)
 
-    roi_meta = pd.DataFrame(
-        {
-            "node_id": np.arange(1, len(roi_member_indices) + 1, dtype=int),
+    roi_meta = pd.DataFrame({"node_id": np.arange(1, len(roi_member_indices) + 1, dtype=int),
             "base_roi_id": np.asarray(node_base_roi_ids, dtype=int),
             "hemisphere": node_hemisphere,
             "node_name": roi_labels,
             "n_selected_voxels": node_counts.astype(int),
             "x_mm": node_coords_mm_arr[:, 0],
             "y_mm": node_coords_mm_arr[:, 1],
-            "z_mm": node_coords_mm_arr[:, 2],
-        }
-    )
+            "z_mm": node_coords_mm_arr[:, 2]})
     roi_meta.to_csv(out_dir / "roi_nodes.csv", index=False)
 
     n_rois = int(len(roi_member_indices))
@@ -493,102 +328,45 @@ def main() -> None:
         np.save(cond_dir / f"edge_timeseries_{label}.npy", edge_ts.astype(np.float32, copy=False))
         np.save(cond_dir / f"edge_correlation_{label}.npy", edge_corr.astype(np.float32, copy=False))
 
-        _write_matrix_csv(
-            cond_dir / f"roi_connectivity_corr_{label}.csv",
-            node_conn,
-            row_labels=roi_labels,
-            col_labels=roi_labels,
-        )
-        _write_matrix_csv(
-            cond_dir / f"edge_correlation_{label}.csv",
-            edge_corr,
-            row_labels=edge_labels,
-            col_labels=edge_labels,
-        )
+        _write_matrix_csv(cond_dir / f"roi_connectivity_corr_{label}.csv", node_conn, row_labels=roi_labels, col_labels=roi_labels)
+        _write_matrix_csv(cond_dir / f"edge_correlation_{label}.csv", edge_corr, row_labels=edge_labels, col_labels=edge_labels)
 
-        edge_df = pd.DataFrame(
-            {
+        edge_df = pd.DataFrame({
                 "edge_id": np.arange(len(edge_pairs), dtype=int),
                 "roi_i_idx": [i for i, _ in edge_pairs],
                 "roi_j_idx": [j for _, j in edge_pairs],
                 "roi_i_name": [roi_labels[i] for i, _ in edge_pairs],
                 "roi_j_name": [roi_labels[j] for _, j in edge_pairs],
-                "roi_pair_corr": conn_vec.astype(np.float64),
-            }
-        )
+                "roi_pair_corr": conn_vec.astype(np.float64)})
         edge_df.to_csv(cond_dir / f"roi_edges_{label}.csv", index=False)
 
         connectome_png = cond_dir / f"connectome_{label}.png"
         connectome_html = None if args.no_html else cond_dir / f"connectome_{label}.html"
-        _plot_connectome(
-            conn=node_conn,
-            node_coords_mm=node_coords_mm_arr,
-            node_labels=roi_labels,
-            out_png=connectome_png,
-            out_html=connectome_html,
-            percentile=float(args.edge_threshold_percentile),
-            node_size=float(args.node_size),
-            edge_linewidth=float(args.edge_linewidth),
-            title=f"ROI connectome ({label})",
-        )
+        _plot_connectome(conn=node_conn, node_coords_mm=node_coords_mm_arr, node_labels=roi_labels, out_png=connectome_png,
+                         out_html=connectome_html, percentile=float(args.edge_threshold_percentile), node_size=float(args.node_size),
+                         edge_linewidth=float(args.edge_linewidth), title=f"ROI connectome ({label})")
 
-        _plot_heatmap(
-            edge_corr,
-            labels=edge_labels,
-            out_png=cond_dir / f"edge_correlation_{label}.png",
-            title=f"Edge correlation matrix ({label})",
-        )
+        _plot_heatmap(edge_corr, labels=edge_labels, out_png=cond_dir / f"edge_correlation_{label}.png", title=f"Edge correlation matrix ({label})")
         edge_corr_by_label[label] = edge_corr.copy()
 
-        per_file_summary.append(
-            {
-                "label": label,
-                "beta_file": str(beta_path),
-                "n_trials": int(beta.shape[1]),
-                "n_rois": n_rois,
-                "n_edges": int(len(edge_pairs)),
-                "roi_ts_finite_fraction": float(np.mean(np.isfinite(roi_ts))),
-                "conn_finite_fraction": float(np.mean(np.isfinite(node_conn))),
-                "edge_corr_finite_fraction": float(np.mean(np.isfinite(edge_corr))),
-            }
-        )
-        print(
-            f"Processed {label}: trials={beta.shape[1]}, rois={n_rois}, edges={len(edge_pairs)}",
-            flush=True,
-        )
+        per_file_summary.append({"label": label, "beta_file": str(beta_path), "n_trials": int(beta.shape[1]), "n_rois": n_rois, "n_edges": int(len(edge_pairs)),
+             "roi_ts_finite_fraction": float(np.mean(np.isfinite(roi_ts))), "conn_finite_fraction": float(np.mean(np.isfinite(node_conn))),
+             "edge_corr_finite_fraction": float(np.mean(np.isfinite(edge_corr)))})
+        print(f"Processed {label}: trials={beta.shape[1]}, rois={n_rois}, edges={len(edge_pairs)}", flush=True)
 
     edge_strength = np.vstack(connectivity_vec_rows).astype(np.float64, copy=False)  # files x edges
     np.save(out_dir / "edge_strength_by_file.npy", edge_strength.astype(np.float32, copy=False))
-    _write_matrix_csv(
-        out_dir / "edge_strength_by_file.csv",
-        edge_strength,
-        row_labels=connectivity_vec_labels,
-        col_labels=edge_labels,
-    )
+    _write_matrix_csv(out_dir / "edge_strength_by_file.csv", edge_strength, row_labels=connectivity_vec_labels, col_labels=edge_labels)
 
     file_similarity = _safe_corrcoef_rows(edge_strength)
     np.save(out_dir / "file_similarity_from_edges.npy", file_similarity.astype(np.float32, copy=False))
-    _write_matrix_csv(
-        out_dir / "file_similarity_from_edges.csv",
-        file_similarity,
-        row_labels=connectivity_vec_labels,
-        col_labels=connectivity_vec_labels,
-    )
+    _write_matrix_csv(out_dir / "file_similarity_from_edges.csv", file_similarity, row_labels=connectivity_vec_labels, col_labels=connectivity_vec_labels)
 
     edge_strength_corr = _safe_corrcoef_rows(edge_strength.T)
     np.save(out_dir / "edge_strength_correlation_across_files.npy", edge_strength_corr.astype(np.float32, copy=False))
-    _write_matrix_csv(
-        out_dir / "edge_strength_correlation_across_files.csv",
-        edge_strength_corr,
-        row_labels=edge_labels,
-        col_labels=edge_labels,
-    )
-    _plot_heatmap(
-        edge_strength_corr,
-        edge_labels,
-        out_png=out_dir / "edge_strength_correlation_across_files.png",
-        title="Edge-strength correlation across selected_beta_trials_* files",
-    )
+    _write_matrix_csv(out_dir / "edge_strength_correlation_across_files.csv", edge_strength_corr, row_labels=edge_labels, col_labels=edge_labels)
+    _plot_heatmap(edge_strength_corr, edge_labels, out_png=out_dir / "edge_strength_correlation_across_files.png",
+                  title="Edge-strength correlation across selected_beta_trials_* files")
 
     if "sham" in edge_corr_by_label:
         sham_edge_corr = edge_corr_by_label["sham"]
@@ -611,7 +389,7 @@ def main() -> None:
                 labels=edge_labels,
                 out_png=cond_dir / f"edge_correlation_delta_vs_sham_{label}.png",
                 title=f"Edge correlation delta vs sham ({label} - sham)",
-                cmap="RdBu_r",
+                cmap="jet",
                 vmin=-delta_vmax,
                 vmax=delta_vmax,
                 cbar_label="Delta correlation",
