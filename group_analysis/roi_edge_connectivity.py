@@ -160,6 +160,37 @@ def _parse_args() -> argparse.Namespace:
         default=1e-6,
         help="Ridge regularization for Granger regression fits.",
     )
+    parser.add_argument(
+        "--kernel-granger-kernel",
+        type=str,
+        default="ip",
+        choices=["ip", "gaussian"],
+        help="Kernel type for nonlinear_granger metric.",
+    )
+    parser.add_argument(
+        "--kernel-granger-degree",
+        type=int,
+        default=2,
+        help="Inhomogeneous polynomial order for nonlinear_granger when using IP kernel.",
+    )
+    parser.add_argument(
+        "--kernel-granger-sigma",
+        type=float,
+        default=0.0,
+        help="Gaussian kernel width for nonlinear_granger (<=0 uses median-distance heuristic).",
+    )
+    parser.add_argument(
+        "--kernel-granger-eig-frac",
+        type=float,
+        default=1e-6,
+        help="Relative eigenvalue threshold used to retain kernel components.",
+    )
+    parser.add_argument(
+        "--kernel-granger-alpha",
+        type=float,
+        default=0.05,
+        help="FDR significance level for selecting kernel Granger components.",
+    )
     parser.add_argument("--wavelet-min-scale", type=int, default=2, help="Minimum wavelet scale.")
     parser.add_argument("--wavelet-max-scale", type=int, default=20, help="Maximum wavelet scale.")
     parser.add_argument(

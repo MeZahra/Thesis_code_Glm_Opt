@@ -54,6 +54,37 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mi-ksg-jitter", type=float, default=1e-10)
     parser.add_argument("--granger-max-lag", type=int, default=3)
     parser.add_argument("--granger-ridge", type=float, default=1e-6)
+    parser.add_argument(
+        "--kernel-granger-kernel",
+        type=str,
+        default="ip",
+        choices=["ip", "gaussian"],
+        help="Kernel type for nonlinear_granger metric.",
+    )
+    parser.add_argument(
+        "--kernel-granger-degree",
+        type=int,
+        default=2,
+        help="Inhomogeneous polynomial order for nonlinear_granger when using IP kernel.",
+    )
+    parser.add_argument(
+        "--kernel-granger-sigma",
+        type=float,
+        default=0.0,
+        help="Gaussian kernel width for nonlinear_granger (<=0 uses median-distance heuristic).",
+    )
+    parser.add_argument(
+        "--kernel-granger-eig-frac",
+        type=float,
+        default=1e-6,
+        help="Relative eigenvalue threshold used to retain kernel components.",
+    )
+    parser.add_argument(
+        "--kernel-granger-alpha",
+        type=float,
+        default=0.05,
+        help="FDR significance level for selecting kernel Granger components.",
+    )
 
     parser.add_argument("--wavelet-min-scale", type=int, default=2)
     parser.add_argument("--wavelet-max-scale", type=int, default=20)
@@ -277,10 +308,21 @@ def _metric_kwargs(metric_name: str, args: argparse.Namespace) -> dict:
             "k": int(args.mi_ksg_k),
             "jitter": float(args.mi_ksg_jitter),
         }
-    if metric_name in {"linear_granger", "nonlinear_granger"}:
+    if metric_name == "linear_granger":
         return {
             "max_lag": int(args.granger_max_lag),
             "ridge": float(args.granger_ridge),
+        }
+    if metric_name == "nonlinear_granger":
+        sigma_raw = float(getattr(args, "kernel_granger_sigma", 0.0))
+        return {
+            "max_lag": int(args.granger_max_lag),
+            "ridge": float(args.granger_ridge),
+            "kernel": str(getattr(args, "kernel_granger_kernel", "ip")),
+            "degree": int(getattr(args, "kernel_granger_degree", 2)),
+            "sigma": None if sigma_raw <= 0.0 else sigma_raw,
+            "eig_frac": float(getattr(args, "kernel_granger_eig_frac", 1e-6)),
+            "alpha": float(getattr(args, "kernel_granger_alpha", 0.05)),
         }
     if metric_name == "wavelet_transform_coherence":
         return {

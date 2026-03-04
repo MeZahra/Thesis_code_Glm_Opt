@@ -31,6 +31,7 @@ METRIC_REGISTRY = {
     "graph_correlation_network": linear_correlation_network.compute_metric,
     linear_granger.METRIC_NAME: linear_granger.compute_metric,
     nonlinear_granger.METRIC_NAME: nonlinear_granger.compute_metric,
+    "kernel_granger": nonlinear_granger.compute_metric,
     instantaneous_phase_sync.METRIC_NAME: instantaneous_phase_sync.compute_metric,
     "instantaneous_phase_sync_plv": instantaneous_phase_sync.compute_metric,
 }
