@@ -50,6 +50,8 @@ def _parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--mi-bins", type=int, default=8)
+    parser.add_argument("--mi-ksg-k", type=int, default=3)
+    parser.add_argument("--mi-ksg-jitter", type=float, default=1e-10)
     parser.add_argument("--granger-max-lag", type=int, default=3)
     parser.add_argument("--granger-ridge", type=float, default=1e-6)
 
@@ -270,6 +272,11 @@ def _resolve_labels(network_dir: Path, requested: str, summary: dict) -> list[st
 def _metric_kwargs(metric_name: str, args: argparse.Namespace) -> dict:
     if metric_name == "mutual_information":
         return {"n_bins": int(args.mi_bins)}
+    if metric_name == "mutual_information_ksg":
+        return {
+            "k": int(args.mi_ksg_k),
+            "jitter": float(args.mi_ksg_jitter),
+        }
     if metric_name in {"linear_granger", "nonlinear_granger"}:
         return {
             "max_lag": int(args.granger_max_lag),

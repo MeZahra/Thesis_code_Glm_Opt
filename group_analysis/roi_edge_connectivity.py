@@ -137,6 +137,18 @@ def _parse_args() -> argparse.Namespace:
         help="Quantile bins for mutual information metric.",
     )
     parser.add_argument(
+        "--mi-ksg-k",
+        type=int,
+        default=3,
+        help="k-nearest neighbors for KSG continuous mutual information metric.",
+    )
+    parser.add_argument(
+        "--mi-ksg-jitter",
+        type=float,
+        default=1e-10,
+        help="Small Gaussian jitter scale to break ties for KSG MI estimation.",
+    )
+    parser.add_argument(
         "--granger-max-lag",
         type=int,
         default=3,
