@@ -15,6 +15,56 @@ DEFAULT_MANIFEST_PATH = "/Data/zahra/results_beta_preprocessed/group_concat/conc
 DEFAULT_TRIAL_KEEP_ROOT = "/Data/zahra/results_glm"
 DEFAULT_BEHAVIOR_ROOT = "/Data/zahra/behaviour"
 
+METRIC_SPECS = [
+    {
+        "key": "variance",
+        "label": "variance",
+        "projection_col": "variance_projection",
+        "behavior_col": "variance_behavior_col2",
+        "projection_plot_scale": 1e7,
+        "file_stub": "variance",
+    },
+    {
+        "key": "cv",
+        "label": "CV",
+        "projection_col": "cv_projection",
+        "behavior_col": "cv_behavior_col2",
+        "projection_plot_scale": 1.0,
+        "file_stub": "cv",
+    },
+    {
+        "key": "mad_mean",
+        "label": "MAD(mean)",
+        "projection_col": "mad_mean_projection",
+        "behavior_col": "mad_mean_behavior_col2",
+        "projection_plot_scale": 1.0,
+        "file_stub": "mad_mean",
+    },
+    {
+        "key": "mad_mean_over_median",
+        "label": "MAD(mean)/|median|",
+        "projection_col": "mad_mean_over_median_projection",
+        "behavior_col": "mad_mean_over_median_behavior_col2",
+        "projection_plot_scale": 1.0,
+        "file_stub": "mad_mean_over_median",
+    },
+    {
+        "key": "std_centered_range",
+        "label": "std((X-mean)/(max-min))",
+        "projection_col": "std_centered_range_projection",
+        "behavior_col": "std_centered_range_behavior_col2",
+        "projection_plot_scale": 1.0,
+        "file_stub": "std_centered_range",
+    },
+]
+
+RUN_OUTLIER_METRIC_KEYS = [
+    "cv",
+    "mad_mean",
+    "mad_mean_over_median",
+    "std_centered_range",
+]
+
 
 def _resolve_trial_keep_path(row, trial_keep_root):
     from_manifest = str(getattr(row, "trial_keep_path", "") or "").strip()
@@ -110,12 +160,83 @@ def split_projection_by_run(projection, manifest_df, trial_keep_root):
 
 
 def _coefficient_of_variation(values):
+    values = np.asarray(values, dtype=np.float64)
     finite_values = values[np.isfinite(values)]
-    mean_value = np.mean(finite_values)
-    std_value = np.std(finite_values)
-    mean_abs = abs(mean_value)
-    cv_value = float(std_value / mean_abs)
+    if finite_values.size == 0:
+        return np.nan, np.nan, np.nan
+    mean_value = float(np.mean(finite_values))
+    std_value = float(np.std(finite_values))
+    cv_value = _safe_abs_ratio(std_value, mean_value)
     return mean_value, std_value, cv_value
+
+
+def _mean_absolute_deviation(values):
+    values = np.asarray(values, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        return np.nan
+    mean_value = float(np.mean(finite_values))
+    return float(np.mean(np.abs(finite_values - mean_value)))
+
+
+def _safe_abs_ratio(numerator, denominator):
+    numerator = float(numerator)
+    denominator_abs = abs(float(denominator))
+    if not np.isfinite(numerator) or not np.isfinite(denominator_abs) or np.isclose(denominator_abs, 0.0):
+        return np.nan
+    return float(numerator / denominator_abs)
+
+
+def _std_centered_over_range(values):
+    values = np.asarray(values, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        return np.nan
+
+    vmin = float(np.min(finite_values))
+    vmax = float(np.max(finite_values))
+    value_range = float(vmax - vmin)
+    if not np.isfinite(value_range) or np.isclose(value_range, 0.0):
+        return np.nan
+
+    mean_value = float(np.mean(finite_values))
+    centered_scaled = (finite_values - mean_value) / value_range
+    return float(np.std(centered_scaled))
+
+
+def _compute_variability_summary(values):
+    values = np.asarray(values, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        return {
+            "mean": np.nan,
+            "median": np.nan,
+            "std": np.nan,
+            "variance": np.nan,
+            "cv": np.nan,
+            "mad_mean": np.nan,
+            "mad_mean_over_median": np.nan,
+            "std_centered_range": np.nan,
+        }
+
+    mean_value = float(np.mean(finite_values))
+    median_value = float(np.median(finite_values))
+    std_value = float(np.std(finite_values))
+    variance_value = float(np.var(finite_values))
+    _, _, cv_value = _coefficient_of_variation(finite_values)
+    mad_mean_value = _mean_absolute_deviation(finite_values)
+    mad_mean_over_median_value = _safe_abs_ratio(mad_mean_value, median_value)
+    std_centered_range_value = _std_centered_over_range(finite_values)
+    return {
+        "mean": mean_value,
+        "median": median_value,
+        "std": std_value,
+        "variance": variance_value,
+        "cv": cv_value,
+        "mad_mean": mad_mean_value,
+        "mad_mean_over_median": mad_mean_over_median_value,
+        "std_centered_range": std_centered_range_value,
+    }
 
 
 def compute_run_variances(run_segments):
@@ -139,7 +260,7 @@ def compute_run_variances(run_segments):
 def compute_run_behavior_tables(run_segments, behavior_root, behavior_column):
     run_rows = []
     behavior_rows = []
-    cv_rows = []
+    metric_rows = []
 
     for segment in run_segments:
         kept_projection, kept_behavior, behavior_path = _load_run_kept_projection_behavior(segment, behavior_root, behavior_column)
@@ -147,52 +268,50 @@ def compute_run_behavior_tables(run_segments, behavior_root, behavior_column):
         projection_values = np.asarray(kept_projection[finite_mask], dtype=np.float64)
         behavior_values = np.asarray(kept_behavior[finite_mask], dtype=np.float64)
 
-        if projection_values.size == 0:
-            proj_mean = np.nan
-            proj_var = np.nan
-        else:
-            proj_mean = float(np.mean(projection_values))
-            proj_var = float(np.var(projection_values))
+        proj_stats = _compute_variability_summary(projection_values)
+        beh_stats = _compute_variability_summary(behavior_values)
+
         run_rows.append({
                 "sub_tag": str(segment["sub_tag"]),
                 "ses": int(segment["ses"]),
                 "run": int(segment["run"]),
                 "n_trials_source": int(segment["n_trials_source"]),
                 "n_trials_kept": int(projection_values.size),
-                "mean_projection": proj_mean,
-                "variance_projection": proj_var})
+                "mean_projection": proj_stats["mean"],
+                "variance_projection": proj_stats["variance"]})
 
-        if behavior_values.size == 0:
-            beh_mean = np.nan
-            beh_var = np.nan
-        else:
-            beh_mean = np.mean(behavior_values)
-            beh_var = np.var(behavior_values)
         behavior_rows.append({
                 "sub_tag": str(segment["sub_tag"]),
                 "ses": int(segment["ses"]),
                 "run": int(segment["run"]),
                 "n_trials_behavior_source": int(segment["n_trials_source"]),
                 "n_trials_behavior_kept": int(behavior_values.size),
-                "mean_behavior_col2": beh_mean,
-                "variance_behavior_col2": beh_var,
+                "mean_behavior_col2": beh_stats["mean"],
+                "variance_behavior_col2": beh_stats["variance"],
                 "behavior_path": behavior_path})
 
-        proj_mean, proj_std, proj_cv = _coefficient_of_variation(projection_values)
-        beh_mean, beh_std, beh_cv = _coefficient_of_variation(behavior_values)
-
-        cv_rows.append({"sub_tag": str(segment["sub_tag"]),
+        metric_rows.append({"sub_tag": str(segment["sub_tag"]),
                 "ses": int(segment["ses"]),
                 "run": int(segment["run"]),
                 "n_trials_paired_finite": int(projection_values.size),
-                "mean_projection": proj_mean,
-                "std_projection": proj_std,
-                "cv_projection": proj_cv,
-                "mean_behavior_col2": beh_mean,
-                "std_behavior_col2": beh_std,
-                "cv_behavior_col2": beh_cv})
+                "mean_projection": proj_stats["mean"],
+                "median_projection": proj_stats["median"],
+                "std_projection": proj_stats["std"],
+                "variance_projection": proj_stats["variance"],
+                "cv_projection": proj_stats["cv"],
+                "mad_mean_projection": proj_stats["mad_mean"],
+                "mad_mean_over_median_projection": proj_stats["mad_mean_over_median"],
+                "std_centered_range_projection": proj_stats["std_centered_range"],
+                "mean_behavior_col2": beh_stats["mean"],
+                "median_behavior_col2": beh_stats["median"],
+                "std_behavior_col2": beh_stats["std"],
+                "variance_behavior_col2": beh_stats["variance"],
+                "cv_behavior_col2": beh_stats["cv"],
+                "mad_mean_behavior_col2": beh_stats["mad_mean"],
+                "mad_mean_over_median_behavior_col2": beh_stats["mad_mean_over_median"],
+                "std_centered_range_behavior_col2": beh_stats["std_centered_range"]})
 
-    return (pd.DataFrame(run_rows), pd.DataFrame(behavior_rows), pd.DataFrame(cv_rows))
+    return (pd.DataFrame(run_rows), pd.DataFrame(behavior_rows), pd.DataFrame(metric_rows))
 
 
 def _scale_values(values, method):
@@ -452,46 +571,70 @@ def compute_subject_projection_behavior_metrics(run_segments, behavior_root,beha
             proj_values = np.concatenate(projection_chunks, axis=0)
             beh_values = np.concatenate(behavior_chunks, axis=0)
 
-        if proj_values.size == 0:
-            proj_mean = np.nan
-            proj_var = np.nan
-        else:
-            proj_mean = float(np.mean(proj_values))
-            proj_var = float(np.var(proj_values))
-        if beh_values.size == 0:
-            beh_mean = np.nan
-            beh_var = np.nan
-        else:
-            beh_mean = float(np.mean(beh_values))
-            beh_var = float(np.var(beh_values))
-
-        proj_mean_cv, proj_std, proj_cv = _coefficient_of_variation(proj_values)
-        beh_mean_cv, beh_std, beh_cv = _coefficient_of_variation(beh_values)
+        proj_stats = _compute_variability_summary(proj_values)
+        beh_stats = _compute_variability_summary(beh_values)
 
         rows.append(
             {"sub_tag": str(sub_tag),
                 "n_runs_with_paired_trials": int(n_runs),
                 "n_trials_paired_finite": int(n_trials_paired),
-                "mean_projection": proj_mean,
-                "variance_projection": proj_var,
-                "std_projection": proj_std,
-                "cv_projection": proj_cv,
-                "mean_behavior_col2": beh_mean,
-                "variance_behavior_col2": beh_var,
-                "std_behavior_col2": beh_std,
-                "cv_behavior_col2": beh_cv,
-                "d_var_projection_minus_behavior": (float(proj_var - beh_var)
-                                                    if np.isfinite(proj_var) and np.isfinite(beh_var)
-                                                    else np.nan),
-                "d_cv_projection_minus_behavior": (float(proj_cv - beh_cv)
-                                                   if np.isfinite(proj_cv) and np.isfinite(beh_cv)
-                                                   else np.nan)})
+                "mean_projection": proj_stats["mean"],
+                "median_projection": proj_stats["median"],
+                "variance_projection": proj_stats["variance"],
+                "std_projection": proj_stats["std"],
+                "cv_projection": proj_stats["cv"],
+                "mad_mean_projection": proj_stats["mad_mean"],
+                "mad_mean_over_median_projection": proj_stats["mad_mean_over_median"],
+                "std_centered_range_projection": proj_stats["std_centered_range"],
+                "mean_behavior_col2": beh_stats["mean"],
+                "median_behavior_col2": beh_stats["median"],
+                "variance_behavior_col2": beh_stats["variance"],
+                "std_behavior_col2": beh_stats["std"],
+                "cv_behavior_col2": beh_stats["cv"],
+                "mad_mean_behavior_col2": beh_stats["mad_mean"],
+                "mad_mean_over_median_behavior_col2": beh_stats["mad_mean_over_median"],
+                "std_centered_range_behavior_col2": beh_stats["std_centered_range"],
+                "d_var_projection_minus_behavior": (
+                    float(proj_stats["variance"] - beh_stats["variance"])
+                    if np.isfinite(proj_stats["variance"]) and np.isfinite(beh_stats["variance"])
+                    else np.nan
+                ),
+                "d_cv_projection_minus_behavior": (
+                    float(proj_stats["cv"] - beh_stats["cv"])
+                    if np.isfinite(proj_stats["cv"]) and np.isfinite(beh_stats["cv"])
+                    else np.nan
+                ),
+                "d_mad_mean_projection_minus_behavior": (
+                    float(proj_stats["mad_mean"] - beh_stats["mad_mean"])
+                    if np.isfinite(proj_stats["mad_mean"]) and np.isfinite(beh_stats["mad_mean"])
+                    else np.nan
+                ),
+                "d_mad_mean_over_median_projection_minus_behavior": (
+                    float(proj_stats["mad_mean_over_median"] - beh_stats["mad_mean_over_median"])
+                    if (
+                        np.isfinite(proj_stats["mad_mean_over_median"])
+                        and np.isfinite(beh_stats["mad_mean_over_median"])
+                    )
+                    else np.nan
+                ),
+                "d_std_centered_range_projection_minus_behavior": (
+                    float(proj_stats["std_centered_range"] - beh_stats["std_centered_range"])
+                    if (
+                        np.isfinite(proj_stats["std_centered_range"])
+                        and np.isfinite(beh_stats["std_centered_range"])
+                    )
+                    else np.nan
+                )})
     return pd.DataFrame(rows)
 
 
 def identify_run_outliers(metric_df, projection_col, behavior_col, outlier_iqr_multiplier=3.0):
     required_cols = {"sub_tag", "ses", "run", projection_col, behavior_col}
     missing_cols = required_cols.difference(metric_df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns for run outlier detection: {sorted(missing_cols)}"
+        )
 
     labels = _build_pair_labels(metric_df)
     paired = _paired_outlier_filtered(metric_df[projection_col],metric_df[behavior_col],
@@ -636,6 +779,10 @@ def _build_category_color_map(values, category_name):
 def _build_paired_metric_zscore_df(metric_df, projection_col, behavior_col):
     required_cols = {"sub_tag", "ses", "run", projection_col, behavior_col}
     missing_cols = required_cols.difference(metric_df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns for z-score paired metric table: {sorted(missing_cols)}"
+        )
 
     projection_z = _scale_values(metric_df[projection_col], method="zscore")
     behavior_z = _scale_values(metric_df[behavior_col], method="zscore")
@@ -651,6 +798,10 @@ def _build_paired_metric_zscore_df(metric_df, projection_col, behavior_col):
 def _build_paired_metric_raw_df(metric_df, projection_col, behavior_col):
     required_cols = {"sub_tag", "ses", "run", projection_col, behavior_col}
     missing_cols = required_cols.difference(metric_df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns for raw paired metric table: {sorted(missing_cols)}"
+        )
 
     projection_raw = metric_df[projection_col]
     behavior_raw = metric_df[behavior_col]
@@ -740,36 +891,101 @@ def _plot_paired_box_with_connections(ax, paired_df, group_col, color_map, jitte
     return int(clipped_count)
 
 
-def _add_category_legend(ax, color_map, category_values, title):
+def _add_category_legend(ax, color_map, category_values, title, loc="upper right"):
     handles = [Line2D([0], [0], marker="o", linestyle="", markerfacecolor=color_map[value],
             markeredgecolor="0.25", markersize=5.5, label=str(value)) for value in category_values]
     ncol = 1
     if len(handles) > 16:
         ncol = 2
 
-    legend = ax.legend(handles=handles, title=str(title), loc="upper right", fontsize=7.5, title_fontsize=8.5,
+    legend = ax.legend(handles=handles, title=str(title), loc=str(loc), fontsize=7.5, title_fontsize=8.5,
                        frameon=True, ncol=ncol, borderaxespad=0.4, handletextpad=0.35, columnspacing=0.8,
                        labelspacing=0.25)
     legend.get_frame().set_alpha(0.95)
 
 
-def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
-    required_cols = {"sub_tag", "ses", "run", "variance_projection", "variance_behavior_col2",
-                     "cv_projection", "cv_behavior_col2"}
+def _metric_specs_from_keys(metric_keys=None):
+    if metric_keys is None:
+        return [dict(spec) for spec in METRIC_SPECS]
+
+    by_key = {str(spec["key"]): dict(spec) for spec in METRIC_SPECS}
+    specs = []
+    for key in metric_keys:
+        key = str(key)
+        if key not in by_key:
+            raise ValueError(f"Unknown metric key: {key}. Available keys: {sorted(by_key)}")
+        specs.append(dict(by_key[key]))
+    return specs
+
+
+def _metric_z_column_title(metric_spec):
+    return f"Z-scored {str(metric_spec['label'])}"
+
+
+def _metric_raw_column_title(metric_spec):
+    return f"Raw {str(metric_spec['label'])}"
+
+
+def _validate_metric_df(metric_df, metric_specs=None):
+    specs = _metric_specs_from_keys(
+        None if metric_specs is None else [spec["key"] for spec in metric_specs]
+    )
+    required_cols = {"sub_tag", "ses", "run"}
+    for spec in specs:
+        required_cols.add(str(spec["projection_col"]))
+        required_cols.add(str(spec["behavior_col"]))
     missing_cols = required_cols.difference(metric_df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns for metric plots: {sorted(missing_cols)}"
+        )
 
-    variance_df = _build_paired_metric_zscore_df(metric_df=metric_df, projection_col="variance_projection",
-                                                 behavior_col="variance_behavior_col2")
-    cv_df = _build_paired_metric_zscore_df(metric_df=metric_df, projection_col="cv_projection", behavior_col="cv_behavior_col2")
 
-    column_defs = [("Z-scored variance", variance_df), ("Z-scored CV", cv_df)]
+def _build_metric_column_dfs(metric_df, metric_specs=None, use_zscore=False):
+    specs = _metric_specs_from_keys(
+        None if metric_specs is None else [spec["key"] for spec in metric_specs]
+    )
+    _validate_metric_df(metric_df, metric_specs=specs)
+
+    column_defs = []
+    for spec in specs:
+        if bool(use_zscore):
+            paired_df = _build_paired_metric_zscore_df(
+                metric_df=metric_df,
+                projection_col=str(spec["projection_col"]),
+                behavior_col=str(spec["behavior_col"]),
+            )
+            column_title = _metric_z_column_title(spec)
+        else:
+            paired_df = _build_paired_metric_raw_df(
+                metric_df=metric_df,
+                projection_col=str(spec["projection_col"]),
+                behavior_col=str(spec["behavior_col"]),
+            )
+            column_title = _metric_raw_column_title(spec)
+        column_defs.append((column_title, paired_df, spec))
+    return column_defs
+
+
+def _reshape_axes_grid(axes, n_rows, n_cols):
+    if n_rows == 1 and n_cols == 1:
+        return np.asarray([[axes]])
+    if n_rows == 1:
+        return np.asarray([axes])
+    if n_cols == 1:
+        return np.asarray(axes).reshape(n_rows, 1)
+    return axes
+
+
+def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
+    column_defs = _build_metric_column_dfs(metric_df=metric_df, metric_specs=METRIC_SPECS[1:], use_zscore=False)
     row_defs = [("sub_tag", "Subject colors", "Subject"),
         ("ses", "Session colors", "Session"),
         ("run", "Run colors", "Run")]
 
     column_limits = []
-    for _, metric_col_df in column_defs:
-        column_values = np.concatenate([metric_col_df["behavior_z"], metric_col_df["projection_z"]])
+    for _, metric_col_df, _ in column_defs:
+        column_values = np.concatenate([metric_col_df["behavior_raw"], metric_col_df["projection_raw"]])
         finite_values = column_values[np.isfinite(column_values)]
         if finite_values.size == 0:
             column_limits.append((-1.0, 1.0))
@@ -778,121 +994,108 @@ def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
         q_high = float(np.percentile(finite_values, 98.0))
         q_span = q_high - q_low
         pad = 0.18 * q_span if q_span > 0 else 0.55
-        y_low = min(q_low - pad, -2.8)
-        y_high = max(q_high + pad, 2.8)
+        y_low = q_low - pad
+        y_high = q_high + pad
         column_limits.append((y_low, y_high))
 
-    fig, axes = plt.subplots(3, 2, figsize=(17.8, 14.2))
+    n_cols = len(column_defs)
+    fig, axes = plt.subplots(3, n_cols, figsize=(max(6.0 * n_cols, 12.0), 14.2))
+    axes = _reshape_axes_grid(axes, n_rows=3, n_cols=n_cols)
     total_clipped = 0
     for row_idx, (group_col, row_title, legend_title) in enumerate(row_defs):
-        for col_idx, (column_title, metric_col_df) in enumerate(column_defs):
+        for col_idx, (column_title, metric_col_df, metric_spec) in enumerate(column_defs):
             ax = axes[row_idx, col_idx]
             color_map, category_values = _build_category_color_map(metric_col_df[group_col].tolist(),
                                                                    category_name=group_col)
             clipped_here = _plot_paired_box_with_connections(ax=ax, paired_df=metric_col_df,
                                                              group_col=group_col, color_map=color_map,
                                                              jitter_seed=111 + 17 * row_idx + 29 * col_idx,
-                                                             y_limits=column_limits[col_idx])
+                                                             y_limits=column_limits[col_idx],
+                                                             behavior_value_col="behavior_raw",
+                                                             projection_value_col="projection_raw",
+                                                             x_tick_labels=(
+                                                                 f"Behavior {metric_spec['label']}",
+                                                                 f"BOLD {metric_spec['label']}",
+                                                             ))
             total_clipped += int(clipped_here)
             ax.set_ylim(column_limits[col_idx])
-            ax.set_title(f"{row_title} | {column_title}", fontsize=11.0)
+            ax.set_title(f"{column_title}", fontsize=11.0)
             if col_idx == 0:
                 ax.set_ylabel("Variability")
-            if col_idx == 1:
-                _add_category_legend(ax=ax, color_map=color_map, category_values=category_values, title=legend_title)
+            if col_idx == (n_cols - 1):
+                legend_loc = "lower right" if row_idx == 0 else "upper right"
+                _add_category_legend(
+                    ax=ax,
+                    color_map=color_map,
+                    category_values=category_values,
+                    title=legend_title,
+                    loc=legend_loc,
+                )
 
-    fig.suptitle("Behavior vs BOLD variability", fontsize=13.0)
+    fig.suptitle("Behavior vs BOLD variability (raw values, no z-score)", fontsize=13.0)
     tight_bottom = 0.0
-    # if total_clipped > 0:
-    #     fig.text(
-    #         0.5,
-    #         0.006,
-    #         "Triangle markers denote values clipped by y-axis limits for readability.",
-    #         ha="center",
-    #         va="bottom",
-    #         fontsize=9.0,
-    #     )
-        # tight_bottom = 0.02
     fig.tight_layout(rect=(0.0, tight_bottom, 0.995, 0.965))
     fig.savefig(out_path, dpi=220)
     plt.close(fig)
 
 
 def plot_cv_subject_session_run_raw_3x1(metric_df, out_path):
-    required_cols = {"sub_tag", "ses", "run", "cv_projection", "cv_behavior_col2"}
-    missing_cols = required_cols.difference(metric_df.columns)
+    column_defs = _build_metric_column_dfs(metric_df=metric_df, metric_specs=METRIC_SPECS, use_zscore=False)
 
-    cv_df = _build_paired_metric_raw_df(metric_df=metric_df, projection_col="cv_projection",
-                                        behavior_col="cv_behavior_col2")
-
-    combined_values = np.concatenate([cv_df["behavior_raw"], cv_df["projection_raw"]])
-    finite_values = combined_values[np.isfinite(combined_values)]
-    q_low = float(np.percentile(finite_values, 2.0))
-    q_high = float(np.percentile(finite_values, 98.0))
-    q_span = q_high - q_low
-    pad = 0.18 * q_span if q_span > 0 else max(0.05 * abs(q_low), 1e-6)
-    y_limits = (q_low - pad, q_high + pad)
+    column_limits = []
+    for _, metric_col_df, _ in column_defs:
+        combined_values = np.concatenate([metric_col_df["behavior_raw"], metric_col_df["projection_raw"]])
+        finite_values = combined_values[np.isfinite(combined_values)]
+        if finite_values.size == 0:
+            column_limits.append((-1.0, 1.0))
+            continue
+        q_low = float(np.percentile(finite_values, 2.0))
+        q_high = float(np.percentile(finite_values, 98.0))
+        q_span = q_high - q_low
+        pad = 0.18 * q_span if q_span > 0 else max(0.05 * abs(q_low), 1e-6)
+        column_limits.append((q_low - pad, q_high + pad))
 
     row_defs = [("sub_tag", "Subject colors", "Subject"), ("ses", "Session colors", "Session"),
                 ("run", "Run colors", "Run")]
 
-    fig, axes = plt.subplots(3, 1, figsize=(11.0, 14.0))
-    if not isinstance(axes, np.ndarray):
-        axes = np.asarray([axes])
+    n_cols = len(column_defs)
+    fig, axes = plt.subplots(3, n_cols, figsize=(max(6.0 * n_cols, 12.0), 14.0))
+    axes = _reshape_axes_grid(axes, n_rows=3, n_cols=n_cols)
 
     for row_idx, (group_col, row_title, legend_title) in enumerate(row_defs):
-        ax = axes[row_idx]
-        color_map, category_values = _build_category_color_map(cv_df[group_col].tolist(), category_name=group_col)
-        _plot_paired_box_with_connections(ax=ax, paired_df=cv_df, group_col=group_col, color_map=color_map,
-            jitter_seed=211 + 31 * row_idx,
-            y_limits=y_limits,
-            behavior_value_col="behavior_raw",
-            projection_value_col="projection_raw",
-            x_tick_labels=("Behavior CV", "BOLD CV"))
-        ax.set_ylim(y_limits)
-        ax.set_title(f"{row_title}", fontsize=11.2)
-        ax.set_ylabel("CV")
-        _add_category_legend(ax=ax, color_map=color_map, category_values=category_values, title=legend_title)
+        for col_idx, (column_title, metric_col_df, metric_spec) in enumerate(column_defs):
+            ax = axes[row_idx, col_idx]
+            color_map, category_values = _build_category_color_map(metric_col_df[group_col].tolist(), category_name=group_col)
+            _plot_paired_box_with_connections(ax=ax, paired_df=metric_col_df, group_col=group_col, color_map=color_map,
+                jitter_seed=211 + 31 * row_idx + 19 * col_idx,
+                y_limits=column_limits[col_idx],
+                behavior_value_col="behavior_raw",
+                projection_value_col="projection_raw",
+                x_tick_labels=(f"Behavior {metric_spec['label']}", f"BOLD {metric_spec['label']}"))
+            ax.set_ylim(column_limits[col_idx])
+            ax.set_title(f"{row_title} | {column_title}", fontsize=11.2)
+            if col_idx == 0:
+                ax.set_ylabel("Value")
+            if col_idx == (n_cols - 1):
+                _add_category_legend(
+                    ax=ax,
+                    color_map=color_map,
+                    category_values=category_values,
+                    title=legend_title,
+                )
 
-    fig.suptitle("Behavior vs BOLD CV (raw values, no z-score)", fontsize=13.0)
+    fig.suptitle("Behavior vs BOLD variability (raw values, no z-score)", fontsize=13.0)
     fig.tight_layout(rect=(0.0, 0.0, 0.995, 0.975))
     fig.savefig(out_path, dpi=220)
     plt.close(fig)
 
 
 def _validate_3x2_metric_df(metric_df):
-    required_cols = {
-        "sub_tag",
-        "ses",
-        "run",
-        "variance_projection",
-        "variance_behavior_col2",
-        "cv_projection",
-        "cv_behavior_col2",
-    }
-    missing_cols = required_cols.difference(metric_df.columns)
-    if missing_cols:
-        raise ValueError(
-            f"Missing required columns for 3x2 variability plots: {sorted(missing_cols)}"
-        )
+    _validate_metric_df(metric_df, metric_specs=METRIC_SPECS)
 
 
 def _build_3x2_column_metric_dfs(metric_df):
-    _validate_3x2_metric_df(metric_df)
-    variance_df = _build_paired_metric_zscore_df(
-        metric_df=metric_df,
-        projection_col="variance_projection",
-        behavior_col="variance_behavior_col2",
-    )
-    cv_df = _build_paired_metric_zscore_df(
-        metric_df=metric_df,
-        projection_col="cv_projection",
-        behavior_col="cv_behavior_col2",
-    )
-    return [
-        ("Z-scored variance", variance_df),
-        ("Z-scored CV", cv_df),
-    ]
+    return _build_metric_column_dfs(metric_df=metric_df, metric_specs=METRIC_SPECS, use_zscore=False)
 
 
 def _sort_count_category_cell(cell_df, row_title, primary_subject_sort_col=None):
@@ -936,9 +1139,11 @@ def compute_outside_box_counts_behavior_vs_bold_3x2(metric_df):
     column_defs = _build_3x2_column_metric_dfs(metric_df)
 
     rows = []
-    for column_title, metric_col_df in column_defs:
-        behavior_values = metric_col_df["behavior_z"].to_numpy(dtype=np.float64)
-        projection_values = metric_col_df["projection_z"].to_numpy(dtype=np.float64)
+    for column_title, metric_col_df, metric_spec in column_defs:
+        behavior_values = metric_col_df["behavior_raw"].to_numpy(dtype=np.float64)
+        projection_values = metric_col_df["projection_raw"].to_numpy(dtype=np.float64)
+        if behavior_values.size == 0 or projection_values.size == 0:
+            continue
 
         bq1, bq3 = np.percentile(behavior_values, [25.0, 75.0])
         pq1, pq3 = np.percentile(projection_values, [25.0, 75.0])
@@ -957,6 +1162,7 @@ def compute_outside_box_counts_behavior_vs_bold_3x2(metric_df):
                     {
                         "row": row_title,
                         "column": column_title,
+                        "metric_key": str(metric_spec["key"]),
                         "category": str(category),
                         "behavior_outside_box_count": int(
                             np.count_nonzero(behavior_out & category_mask)
@@ -980,10 +1186,13 @@ def plot_outside_box_counts_behavior_vs_bold_3x2(
     if out_csv_path is not None:
         counts_df.to_csv(out_csv_path, index=False)
 
+    column_defs = _build_3x2_column_metric_dfs(metric_df)
     row_order = ["Subject colors", "Session colors", "Run colors"]
-    column_order = ["Z-scored variance", "Z-scored CV"]
+    column_order = [column_title for column_title, _, _ in column_defs]
 
-    fig, axes = plt.subplots(3, 2, figsize=(19.0, 14.0), sharey=False)
+    n_cols = len(column_order)
+    fig, axes = plt.subplots(3, n_cols, figsize=(max(6.5 * n_cols, 19.0), 14.0), sharey=False)
+    axes = _reshape_axes_grid(axes, n_rows=3, n_cols=n_cols)
     for row_idx, row_title in enumerate(row_order):
         for col_idx, column_title in enumerate(column_order):
             ax = axes[row_idx, col_idx]
@@ -1035,14 +1244,15 @@ def plot_outside_box_counts_behavior_vs_bold_3x2(
             ax.set_ylim(0.0, max(3.0, ymax + 1.0))
 
     handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(
-        handles,
-        labels,
-        loc="upper center",
-        ncol=2,
-        frameon=False,
-        bbox_to_anchor=(0.5, 0.995),
-    )
+    if handles:
+        fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            ncol=2,
+            frameon=False,
+            bbox_to_anchor=(0.5, 0.995),
+        )
     fig.suptitle("Outside-box counts (Q1-Q3): Behavior vs BOLD", fontsize=14.0, y=1.01)
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.975))
     fig.savefig(out_path, dpi=220, bbox_inches="tight")
@@ -1097,9 +1307,11 @@ def compute_whisker_outlier_counts_behavior_vs_bold_3x2(metric_df, near_fraction
 
     rows = []
     thresholds = []
-    for column_title, metric_col_df in column_defs:
-        behavior_values = metric_col_df["behavior_z"].to_numpy(dtype=np.float64)
-        projection_values = metric_col_df["projection_z"].to_numpy(dtype=np.float64)
+    for column_title, metric_col_df, metric_spec in column_defs:
+        behavior_values = metric_col_df["behavior_raw"].to_numpy(dtype=np.float64)
+        projection_values = metric_col_df["projection_raw"].to_numpy(dtype=np.float64)
+        if behavior_values.size == 0 or projection_values.size == 0:
+            continue
         behavior_cls = _classify_whisker_position(behavior_values, near_fraction=near_fraction)
         projection_cls = _classify_whisker_position(
             projection_values, near_fraction=near_fraction
@@ -1109,6 +1321,7 @@ def compute_whisker_outlier_counts_behavior_vs_bold_3x2(metric_df, near_fraction
             [
                 {
                     "column": column_title,
+                    "metric_key": str(metric_spec["key"]),
                     "signal": "Behavior",
                     "q1": behavior_cls["q1"],
                     "q3": behavior_cls["q3"],
@@ -1119,6 +1332,7 @@ def compute_whisker_outlier_counts_behavior_vs_bold_3x2(metric_df, near_fraction
                 },
                 {
                     "column": column_title,
+                    "metric_key": str(metric_spec["key"]),
                     "signal": "BOLD",
                     "q1": projection_cls["q1"],
                     "q3": projection_cls["q3"],
@@ -1150,6 +1364,7 @@ def compute_whisker_outlier_counts_behavior_vs_bold_3x2(metric_df, near_fraction
                     {
                         "row": row_title,
                         "column": column_title,
+                        "metric_key": str(metric_spec["key"]),
                         "category": str(category),
                         "behavior_below_whisker_count": behavior_below,
                         "behavior_near_whisker_count": behavior_near,
@@ -1182,10 +1397,13 @@ def plot_whisker_outlier_counts_behavior_vs_bold_3x2(
     if thresholds_csv_path is not None:
         thresholds_df.to_csv(thresholds_csv_path, index=False)
 
+    column_defs = _build_3x2_column_metric_dfs(metric_df)
     row_order = ["Subject colors", "Session colors", "Run colors"]
-    column_order = ["Z-scored variance", "Z-scored CV"]
+    column_order = [column_title for column_title, _, _ in column_defs]
 
-    fig, axes = plt.subplots(3, 2, figsize=(20.0, 14.0), sharey=False)
+    n_cols = len(column_order)
+    fig, axes = plt.subplots(3, n_cols, figsize=(max(6.8 * n_cols, 20.0), 14.0), sharey=False)
+    axes = _reshape_axes_grid(axes, n_rows=3, n_cols=n_cols)
     for row_idx, row_title in enumerate(row_order):
         for col_idx, column_title in enumerate(column_order):
             ax = axes[row_idx, col_idx]
@@ -1277,14 +1495,15 @@ def plot_whisker_outlier_counts_behavior_vs_bold_3x2(
             ax.set_ylim(0.0, max(2.0, ymax + 1.0))
 
     handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(
-        handles,
-        labels,
-        loc="upper center",
-        ncol=3,
-        frameon=False,
-        bbox_to_anchor=(0.5, 0.995),
-    )
+    if handles:
+        fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            ncol=3,
+            frameon=False,
+            bbox_to_anchor=(0.5, 0.995),
+        )
     fig.suptitle(
         "Whisker outlier counts (below / near / above): Behavior vs BOLD",
         fontsize=14.0,
@@ -1301,88 +1520,84 @@ def compute_whisker_outlier_counts_behavior_vs_bold_cv_raw(metric_df, near_fract
     if near_fraction < 0:
         raise ValueError(f"near_fraction must be >= 0, got {near_fraction}.")
 
-    required_cols = {"sub_tag", "ses", "run", "cv_projection", "cv_behavior_col2"}
-    missing_cols = required_cols.difference(metric_df.columns)
-    if missing_cols:
-        raise ValueError(
-            f"Missing required columns for raw CV whisker outlier counts: {sorted(missing_cols)}"
-        )
-
-    cv_df = _build_paired_metric_raw_df(
-        metric_df=metric_df,
-        projection_col="cv_projection",
-        behavior_col="cv_behavior_col2",
-    )
-
-    behavior_values = cv_df["behavior_raw"].to_numpy(dtype=np.float64)
-    projection_values = cv_df["projection_raw"].to_numpy(dtype=np.float64)
-    behavior_cls = _classify_whisker_position(behavior_values, near_fraction=near_fraction)
-    projection_cls = _classify_whisker_position(projection_values, near_fraction=near_fraction)
-
-    thresholds_df = pd.DataFrame(
-        [
-            {
-                "column": "Raw CV (no z-score)",
-                "signal": "Behavior",
-                "q1": behavior_cls["q1"],
-                "q3": behavior_cls["q3"],
-                "iqr": behavior_cls["iqr"],
-                "low_fence": behavior_cls["low_fence"],
-                "high_fence": behavior_cls["high_fence"],
-                "near_band": behavior_cls["near_band"],
-            },
-            {
-                "column": "Raw CV (no z-score)",
-                "signal": "BOLD",
-                "q1": projection_cls["q1"],
-                "q3": projection_cls["q3"],
-                "iqr": projection_cls["iqr"],
-                "low_fence": projection_cls["low_fence"],
-                "high_fence": projection_cls["high_fence"],
-                "near_band": projection_cls["near_band"],
-            },
-        ]
-    )
-
     row_defs = [
         ("sub_tag", "Subject colors"),
         ("ses", "Session colors"),
         ("run", "Run colors"),
     ]
+    column_defs = _build_metric_column_dfs(metric_df=metric_df, metric_specs=METRIC_SPECS, use_zscore=False)
+
     rows = []
-    for group_col, row_title in row_defs:
-        group_values = cv_df[group_col].astype(str).to_numpy()
-        categories = sorted(
-            {value for value in group_values},
-            key=lambda value: _category_sort_key(value, group_col),
-        )
-        for category in categories:
-            category_mask = group_values == str(category)
-            behavior_below = int(np.count_nonzero(behavior_cls["below"] & category_mask))
-            behavior_near = int(np.count_nonzero(behavior_cls["near"] & category_mask))
-            behavior_above = int(np.count_nonzero(behavior_cls["above"] & category_mask))
+    thresholds = []
+    for column_title, metric_col_df, metric_spec in column_defs:
+        behavior_values = metric_col_df["behavior_raw"].to_numpy(dtype=np.float64)
+        projection_values = metric_col_df["projection_raw"].to_numpy(dtype=np.float64)
+        if behavior_values.size == 0 or projection_values.size == 0:
+            continue
+        behavior_cls = _classify_whisker_position(behavior_values, near_fraction=near_fraction)
+        projection_cls = _classify_whisker_position(projection_values, near_fraction=near_fraction)
 
-            bold_below = int(np.count_nonzero(projection_cls["below"] & category_mask))
-            bold_near = int(np.count_nonzero(projection_cls["near"] & category_mask))
-            bold_above = int(np.count_nonzero(projection_cls["above"] & category_mask))
-
-            rows.append(
+        thresholds.extend(
+            [
                 {
-                    "row": row_title,
-                    "column": "Raw CV (no z-score)",
-                    "category": str(category),
-                    "behavior_below_whisker_count": behavior_below,
-                    "behavior_near_whisker_count": behavior_near,
-                    "behavior_above_whisker_count": behavior_above,
-                    "behavior_outlier_total": int(behavior_below + behavior_near + behavior_above),
-                    "bold_below_whisker_count": bold_below,
-                    "bold_near_whisker_count": bold_near,
-                    "bold_above_whisker_count": bold_above,
-                    "bold_outlier_total": int(bold_below + bold_near + bold_above),
-                }
-            )
+                    "column": column_title,
+                    "metric_key": str(metric_spec["key"]),
+                    "signal": "Behavior",
+                    "q1": behavior_cls["q1"],
+                    "q3": behavior_cls["q3"],
+                    "iqr": behavior_cls["iqr"],
+                    "low_fence": behavior_cls["low_fence"],
+                    "high_fence": behavior_cls["high_fence"],
+                    "near_band": behavior_cls["near_band"],
+                },
+                {
+                    "column": column_title,
+                    "metric_key": str(metric_spec["key"]),
+                    "signal": "BOLD",
+                    "q1": projection_cls["q1"],
+                    "q3": projection_cls["q3"],
+                    "iqr": projection_cls["iqr"],
+                    "low_fence": projection_cls["low_fence"],
+                    "high_fence": projection_cls["high_fence"],
+                    "near_band": projection_cls["near_band"],
+                },
+            ]
+        )
 
-    return pd.DataFrame(rows), thresholds_df
+        for group_col, row_title in row_defs:
+            group_values = metric_col_df[group_col].astype(str).to_numpy()
+            categories = sorted(
+                {value for value in group_values},
+                key=lambda value: _category_sort_key(value, group_col),
+            )
+            for category in categories:
+                category_mask = group_values == str(category)
+                behavior_below = int(np.count_nonzero(behavior_cls["below"] & category_mask))
+                behavior_near = int(np.count_nonzero(behavior_cls["near"] & category_mask))
+                behavior_above = int(np.count_nonzero(behavior_cls["above"] & category_mask))
+
+                bold_below = int(np.count_nonzero(projection_cls["below"] & category_mask))
+                bold_near = int(np.count_nonzero(projection_cls["near"] & category_mask))
+                bold_above = int(np.count_nonzero(projection_cls["above"] & category_mask))
+
+                rows.append(
+                    {
+                        "row": row_title,
+                        "column": column_title,
+                        "metric_key": str(metric_spec["key"]),
+                        "category": str(category),
+                        "behavior_below_whisker_count": behavior_below,
+                        "behavior_near_whisker_count": behavior_near,
+                        "behavior_above_whisker_count": behavior_above,
+                        "behavior_outlier_total": int(behavior_below + behavior_near + behavior_above),
+                        "bold_below_whisker_count": bold_below,
+                        "bold_near_whisker_count": bold_near,
+                        "bold_above_whisker_count": bold_above,
+                        "bold_outlier_total": int(bold_below + bold_near + bold_above),
+                    }
+                )
+
+    return pd.DataFrame(rows), pd.DataFrame(thresholds)
 
 
 def plot_whisker_outlier_counts_behavior_vs_bold_cv_raw(
@@ -1402,109 +1617,116 @@ def plot_whisker_outlier_counts_behavior_vs_bold_cv_raw(
     if thresholds_csv_path is not None:
         thresholds_df.to_csv(thresholds_csv_path, index=False)
 
+    column_defs = _build_metric_column_dfs(metric_df=metric_df, metric_specs=METRIC_SPECS, use_zscore=False)
     row_order = ["Subject colors", "Session colors", "Run colors"]
-    fig, axes = plt.subplots(3, 1, figsize=(20.0, 14.0), sharey=False)
-    if not isinstance(axes, np.ndarray):
-        axes = np.asarray([axes])
+    column_order = [column_title for column_title, _, _ in column_defs]
+
+    n_cols = len(column_order)
+    fig, axes = plt.subplots(3, n_cols, figsize=(max(6.8 * n_cols, 20.0), 14.0), sharey=False)
+    axes = _reshape_axes_grid(axes, n_rows=3, n_cols=n_cols)
 
     for row_idx, row_title in enumerate(row_order):
-        ax = axes[row_idx]
-        cell = counts_df.loc[counts_df["row"] == row_title].copy()
-        if cell.empty:
-            ax.set_axis_off()
-            continue
+        for col_idx, column_title in enumerate(column_order):
+            ax = axes[row_idx, col_idx]
+            cell = counts_df.loc[
+                (counts_df["row"] == row_title) & (counts_df["column"] == column_title)
+            ].copy()
+            if cell.empty:
+                ax.set_axis_off()
+                continue
 
-        sort_col = "behavior_outlier_total" if bool(sort_subject_by_behavior) else None
-        cell = _sort_count_category_cell(
-            cell,
-            row_title=row_title,
-            primary_subject_sort_col=sort_col,
+            sort_col = "behavior_outlier_total" if bool(sort_subject_by_behavior) else None
+            cell = _sort_count_category_cell(
+                cell,
+                row_title=row_title,
+                primary_subject_sort_col=sort_col,
+            )
+
+            categories = cell["category"].astype(str).tolist()
+            x = np.arange(len(categories), dtype=np.float64)
+            width = 0.38
+
+            behavior_below = cell["behavior_below_whisker_count"].to_numpy(dtype=np.float64)
+            behavior_near = cell["behavior_near_whisker_count"].to_numpy(dtype=np.float64)
+            behavior_above = cell["behavior_above_whisker_count"].to_numpy(dtype=np.float64)
+            bold_below = cell["bold_below_whisker_count"].to_numpy(dtype=np.float64)
+            bold_near = cell["bold_near_whisker_count"].to_numpy(dtype=np.float64)
+            bold_above = cell["bold_above_whisker_count"].to_numpy(dtype=np.float64)
+
+            ax.bar(
+                x - (width / 2.0),
+                behavior_below,
+                width=width,
+                color="#6baed6",
+                label="Behavior below" if (row_idx, col_idx) == (0, 0) else None,
+            )
+            ax.bar(
+                x - (width / 2.0),
+                behavior_near,
+                width=width,
+                bottom=behavior_below,
+                color="#3182bd",
+                label="Behavior near" if (row_idx, col_idx) == (0, 0) else None,
+            )
+            ax.bar(
+                x - (width / 2.0),
+                behavior_above,
+                width=width,
+                bottom=(behavior_below + behavior_near),
+                color="#08519c",
+                label="Behavior above" if (row_idx, col_idx) == (0, 0) else None,
+            )
+
+            ax.bar(
+                x + (width / 2.0),
+                bold_below,
+                width=width,
+                color="#fcae91",
+                label="BOLD below" if (row_idx, col_idx) == (0, 0) else None,
+            )
+            ax.bar(
+                x + (width / 2.0),
+                bold_near,
+                width=width,
+                bottom=bold_below,
+                color="#fb6a4a",
+                label="BOLD near" if (row_idx, col_idx) == (0, 0) else None,
+            )
+            ax.bar(
+                x + (width / 2.0),
+                bold_above,
+                width=width,
+                bottom=(bold_below + bold_near),
+                color="#cb181d",
+                label="BOLD above" if (row_idx, col_idx) == (0, 0) else None,
+            )
+
+            ax.set_title(f"{row_title} | {column_title}", fontsize=11.5)
+            ax.set_ylabel("Whisker-based outlier count")
+            ax.grid(axis="y", linestyle=":", linewidth=0.8, alpha=0.55)
+            ax.set_xticks(x)
+            if row_title == "Subject colors":
+                ax.set_xticklabels(categories, rotation=45, ha="right", fontsize=8.0)
+            else:
+                ax.set_xticklabels(categories, fontsize=9.5)
+
+            behavior_total = behavior_below + behavior_near + behavior_above
+            bold_total = bold_below + bold_near + bold_above
+            ymax = float(np.max(np.concatenate([behavior_total, bold_total])))
+            ax.set_ylim(0.0, max(2.0, ymax + 1.0))
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    if handles:
+        fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            ncol=3,
+            frameon=False,
+            bbox_to_anchor=(0.5, 0.995),
         )
-
-        categories = cell["category"].astype(str).tolist()
-        x = np.arange(len(categories), dtype=np.float64)
-        width = 0.38
-
-        behavior_below = cell["behavior_below_whisker_count"].to_numpy(dtype=np.float64)
-        behavior_near = cell["behavior_near_whisker_count"].to_numpy(dtype=np.float64)
-        behavior_above = cell["behavior_above_whisker_count"].to_numpy(dtype=np.float64)
-        bold_below = cell["bold_below_whisker_count"].to_numpy(dtype=np.float64)
-        bold_near = cell["bold_near_whisker_count"].to_numpy(dtype=np.float64)
-        bold_above = cell["bold_above_whisker_count"].to_numpy(dtype=np.float64)
-
-        ax.bar(
-            x - (width / 2.0),
-            behavior_below,
-            width=width,
-            color="#6baed6",
-            label="Behavior below" if row_idx == 0 else None,
-        )
-        ax.bar(
-            x - (width / 2.0),
-            behavior_near,
-            width=width,
-            bottom=behavior_below,
-            color="#3182bd",
-            label="Behavior near" if row_idx == 0 else None,
-        )
-        ax.bar(
-            x - (width / 2.0),
-            behavior_above,
-            width=width,
-            bottom=(behavior_below + behavior_near),
-            color="#08519c",
-            label="Behavior above" if row_idx == 0 else None,
-        )
-
-        ax.bar(
-            x + (width / 2.0),
-            bold_below,
-            width=width,
-            color="#fcae91",
-            label="BOLD below" if row_idx == 0 else None,
-        )
-        ax.bar(
-            x + (width / 2.0),
-            bold_near,
-            width=width,
-            bottom=bold_below,
-            color="#fb6a4a",
-            label="BOLD near" if row_idx == 0 else None,
-        )
-        ax.bar(
-            x + (width / 2.0),
-            bold_above,
-            width=width,
-            bottom=(bold_below + bold_near),
-            color="#cb181d",
-            label="BOLD above" if row_idx == 0 else None,
-        )
-
-        ax.set_title(f"{row_title}", fontsize=11.5)
-        ax.set_ylabel("Whisker-based outlier count")
-        ax.grid(axis="y", linestyle=":", linewidth=0.8, alpha=0.55)
-        ax.set_xticks(x)
-        if row_title == "Subject colors":
-            ax.set_xticklabels(categories, rotation=45, ha="right", fontsize=8.0)
-        else:
-            ax.set_xticklabels(categories, fontsize=9.5)
-
-        behavior_total = behavior_below + behavior_near + behavior_above
-        bold_total = bold_below + bold_near + bold_above
-        ymax = float(np.max(np.concatenate([behavior_total, bold_total])))
-        ax.set_ylim(0.0, max(2.0, ymax + 1.0))
-
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(
-        handles,
-        labels,
-        loc="upper center",
-        ncol=3,
-        frameon=False,
-        bbox_to_anchor=(0.5, 0.995),
-    )
     fig.suptitle(
-        "Whisker outlier counts for raw CV (below / near / above): Behavior vs BOLD",
+        "Whisker outlier counts for raw metrics (below / near / above): Behavior vs BOLD",
         fontsize=14.0,
         y=1.01,
     )
@@ -1569,12 +1791,12 @@ def _plot_subject_metric_comparison(
     x_beh = _density_grid(finite_beh, grid_points=grid_points, fallback_pad=1e-6)
     beh_density = _evaluate_density(finite_beh, x_beh)
 
-    proj_z = _scale_values(paired["paired_a_kept"], method="zscore")
-    beh_z = _scale_values(paired["paired_b_kept"], method="zscore")
-    z_all = np.concatenate([proj_z, beh_z])
-    x_z = _density_grid(z_all, grid_points=grid_points, fallback_pad=1e-6)
-    proj_z_density = _evaluate_density(proj_z, x_z)
-    beh_z_density = _evaluate_density(beh_z, x_z)
+    proj_paired = paired["paired_a_kept"]
+    beh_paired = paired["paired_b_kept"]
+    raw_all = np.concatenate([proj_paired, beh_paired])
+    x_raw = _density_grid(raw_all, grid_points=grid_points, fallback_pad=1e-6)
+    proj_raw_density = _evaluate_density(proj_paired, x_raw)
+    beh_raw_density = _evaluate_density(beh_paired, x_raw)
 
     if bool(use_2x2_layout):
         fig, axes = plt.subplots(2, 2, figsize=(13.5, 9.2))
@@ -1600,26 +1822,25 @@ def _plot_subject_metric_comparison(
     ax1.set_title(f"2) Behavior {metric_label}")
 
     ax2.plot(
-        x_z,
-        proj_z_density,
+        x_raw,
+        proj_raw_density,
         color="tab:blue",
         linewidth=2.0,
-        label=f"Projection {metric_label} (z)",
+        label=f"Projection {metric_label}",
     )
-    ax2.fill_between(x_z, proj_z_density, alpha=0.15, color="tab:blue")
+    ax2.fill_between(x_raw, proj_raw_density, alpha=0.15, color="tab:blue")
     ax2.plot(
-        x_z,
-        beh_z_density,
+        x_raw,
+        beh_raw_density,
         color="tab:orange",
         linewidth=2.0,
         linestyle="--",
-        label=f"Behavior {metric_label} (z)",
+        label=f"Behavior {metric_label}",
     )
-    ax2.fill_between(x_z, beh_z_density, alpha=0.15, color="tab:orange")
-    ax2.axvline(0.0, color="0.35", linewidth=1.0, linestyle=":")
-    ax2.set_xlabel(f"Z-scored {metric_label} (within metric)")
+    ax2.fill_between(x_raw, beh_raw_density, alpha=0.15, color="tab:orange")
+    ax2.set_xlabel(f"Raw {metric_label}")
     ax2.set_ylabel("Probability density")
-    ax2.set_title(f"3) Z-scored {metric_label} + paired tests")
+    ax2.set_title(f"3) Raw {metric_label} + paired tests")
     ax2.legend(fontsize=8, loc="upper right")
 
     removed_labels = paired_table.loc[paired_table["removed_outlier"], "pair_label"].astype(str).tolist()
@@ -1641,19 +1862,19 @@ def _plot_subject_metric_comparison(
 
     if ax3 is not None:
         ax3.scatter(
-            beh_z,
-            proj_z,
+            beh_paired,
+            proj_paired,
             s=36,
             alpha=0.85,
             color="tab:green",
             edgecolors="none",
         )
-        z_min = float(np.min(np.concatenate([beh_z, proj_z])))
-        z_max = float(np.max(np.concatenate([beh_z, proj_z])))
-        z_span = z_max - z_min
-        z_pad = 0.06 * z_span if z_span > 0 else 0.05
-        line_min = z_min - z_pad
-        line_max = z_max + z_pad
+        raw_min = float(np.min(np.concatenate([beh_paired, proj_paired])))
+        raw_max = float(np.max(np.concatenate([beh_paired, proj_paired])))
+        raw_span = raw_max - raw_min
+        raw_pad = 0.06 * raw_span if raw_span > 0 else 0.05
+        line_min = raw_min - raw_pad
+        line_max = raw_max + raw_pad
         ax3.plot(
             [line_min, line_max],
             [line_min, line_max],
@@ -1663,9 +1884,9 @@ def _plot_subject_metric_comparison(
         )
         ax3.set_xlim(line_min, line_max)
         ax3.set_ylim(line_min, line_max)
-        ax3.set_xlabel(f"Z-scored behavior {metric_label}")
-        ax3.set_ylabel(f"Z-scored projection {metric_label}")
-        ax3.set_title(f"4) Z-scored {metric_label} scatter")
+        ax3.set_xlabel(f"Behavior {metric_label}")
+        ax3.set_ylabel(f"Projection {metric_label}")
+        ax3.set_title(f"4) Raw {metric_label} scatter")
 
         text_projection_col = z_text_projection_col or projection_col
         text_behavior_col = z_text_behavior_col or behavior_col
@@ -1732,18 +1953,17 @@ def plot_scaled_variance_comparison_density(
     grid_points=512,
     outlier_iqr_multiplier=3.0,
 ):
+    metric_spec = next(spec for spec in METRIC_SPECS if str(spec["key"]) == "variance")
     return _plot_subject_metric_comparison(
         subject_metrics_df=subject_metrics_df,
-        projection_col="variance_projection",
-        behavior_col="variance_behavior_col2",
-        metric_label="variance",
+        projection_col=str(metric_spec["projection_col"]),
+        behavior_col=str(metric_spec["behavior_col"]),
+        metric_label=str(metric_spec["label"]),
         out_path=out_path,
         outlier_iqr_multiplier=outlier_iqr_multiplier,
-        projection_plot_scale=1e7,
+        projection_plot_scale=float(metric_spec.get("projection_plot_scale", 1.0)),
         grid_points=grid_points,
         use_2x2_layout=True,
-        z_text_projection_col="cv_projection",
-        z_text_behavior_col="cv_behavior_col2",
     )
 
 
@@ -1753,21 +1973,25 @@ def plot_sub_ses_run_cv_comparison(
     grid_points=512,
     outlier_iqr_multiplier=3.0,
 ):
+    metric_spec = next(spec for spec in METRIC_SPECS if str(spec["key"]) == "cv")
     return _plot_subject_metric_comparison(
         subject_metrics_df=subject_metrics_df,
-        projection_col="cv_projection",
-        behavior_col="cv_behavior_col2",
-        metric_label="CV",
+        projection_col=str(metric_spec["projection_col"]),
+        behavior_col=str(metric_spec["behavior_col"]),
+        metric_label=str(metric_spec["label"]),
         out_path=out_path,
         outlier_iqr_multiplier=outlier_iqr_multiplier,
-        projection_plot_scale=1.0,
+        projection_plot_scale=float(metric_spec.get("projection_plot_scale", 1.0)),
         grid_points=grid_points,
         use_2x2_layout=True,
     )
 
 
-def analyze_subject_cv_difference(
+def analyze_subject_metric_difference(
     metric_df,
+    projection_col,
+    behavior_col,
+    metric_label,
     out_path,
     outlier_iqr_multiplier=3.0,
     n_permutations=20000,
@@ -1776,18 +2000,27 @@ def analyze_subject_cv_difference(
     random_seed=0,
     grid_points=512,
 ):
-    cv_projection = metric_df["cv_projection"].to_numpy(dtype=np.float64)
-    cv_behavior = metric_df["cv_behavior_col2"].to_numpy(dtype=np.float64)
+    required_cols = {"sub_tag", "ses", "run", projection_col, behavior_col}
+    missing_cols = required_cols.difference(metric_df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns for subject metric difference analysis: {sorted(missing_cols)}"
+        )
+
+    metric_projection = metric_df[projection_col].to_numpy(dtype=np.float64)
+    metric_behavior = metric_df[behavior_col].to_numpy(dtype=np.float64)
     subject_labels = _build_pair_labels(metric_df)
 
     paired = _paired_outlier_filtered(
-        cv_projection,
-        cv_behavior,
+        metric_projection,
+        metric_behavior,
         labels=subject_labels,
         iqr_multiplier=outlier_iqr_multiplier,
     )
     if paired["n_pairs_kept"] == 0:
-        raise RuntimeError("No paired subject CV values after outlier filtering.")
+        raise RuntimeError(
+            f"No paired subject values for {metric_label} after outlier filtering."
+        )
 
     d_s = paired["paired_a_kept"] - paired["paired_b_kept"]
     d_mean = float(np.mean(d_s))
@@ -1813,29 +2046,31 @@ def analyze_subject_cv_difference(
         random_seed=int(random_seed) + 1,
     )
 
-    paired_cv_df = pd.DataFrame(
+    paired_metric_df = pd.DataFrame(
         index=np.arange(paired["paired_a_all"].size)
     )
     base_cols = [col for col in ("sub_tag", "ses", "run") if col in metric_df.columns]
     if base_cols:
-        paired_cv_df = metric_df.loc[paired["input_paired_mask"], base_cols].copy()
-        paired_cv_df = paired_cv_df.reset_index(drop=True)
-    paired_cv_df["pair_label"] = paired["paired_labels_all"]
-    paired_cv_df["cv_projection"] = paired["paired_a_all"]
-    paired_cv_df["cv_behavior_col2"] = paired["paired_b_all"]
-    paired_cv_df["removed_outlier"] = paired["paired_outlier_mask"]
-    paired_cv_df["d_s_projection_minus_behavior"] = (
-        paired_cv_df["cv_projection"] - paired_cv_df["cv_behavior_col2"]
+        paired_metric_df = metric_df.loc[paired["input_paired_mask"], base_cols].copy()
+        paired_metric_df = paired_metric_df.reset_index(drop=True)
+    paired_metric_df["pair_label"] = paired["paired_labels_all"]
+    paired_metric_df[projection_col] = paired["paired_a_all"]
+    paired_metric_df[behavior_col] = paired["paired_b_all"]
+    paired_metric_df["removed_outlier"] = paired["paired_outlier_mask"]
+    paired_metric_df["d_s_projection_minus_behavior"] = (
+        paired_metric_df[projection_col] - paired_metric_df[behavior_col]
     )
-    paired_cv_df.loc[paired_cv_df["removed_outlier"], "d_s_projection_minus_behavior"] = np.nan
+    paired_metric_df.loc[paired_metric_df["removed_outlier"], "d_s_projection_minus_behavior"] = np.nan
 
     fig, axes = plt.subplots(1, 2, figsize=(12.0, 5.0))
     ax1, ax2 = axes
 
-    proj_cv_kept = paired["paired_a_kept"]
-    beh_cv_kept = paired["paired_b_kept"]
-    if proj_cv_kept.size == 0 or beh_cv_kept.size == 0:
-        raise RuntimeError("No finite paired CV values after outlier filtering.")
+    proj_kept = paired["paired_a_kept"]
+    beh_kept = paired["paired_b_kept"]
+    if proj_kept.size == 0 or beh_kept.size == 0:
+        raise RuntimeError(
+            f"No finite paired {metric_label} values after outlier filtering."
+        )
 
     x_ds = _density_grid(d_s, grid_points=grid_points, fallback_pad=1e-6)
     ds_density = _evaluate_density(d_s, x_ds)
@@ -1844,21 +2079,21 @@ def analyze_subject_cv_difference(
     ax1.axvline(0.0, color="0.35", linewidth=1.0, linestyle=":")
     ax1.axvline(d_mean, color="black", linewidth=1.2, linestyle="-", label="mean")
     ax1.axvline(d_median, color="black", linewidth=1.2, linestyle="--", label="median")
-    ax1.set_xlabel("d_s = CV projection - CV behavior")
+    ax1.set_xlabel(f"d_s = projection {metric_label} - behavior {metric_label}")
     ax1.set_ylabel("Probability density")
     ax1.set_title("1) d_s distribution")
     ax1.legend(fontsize=8, loc="upper right")
 
     ax2.scatter(
-        beh_cv_kept,
-        proj_cv_kept,
+        beh_kept,
+        proj_kept,
         s=36,
         alpha=0.85,
         color="tab:blue",
         edgecolors="none",
     )
-    scatter_x_kept = beh_cv_kept
-    scatter_y_kept = proj_cv_kept
+    scatter_x_kept = beh_kept
+    scatter_y_kept = proj_kept
     xy_min = float(np.min(np.concatenate([scatter_x_kept, scatter_y_kept])))
     xy_max = float(np.max(np.concatenate([scatter_x_kept, scatter_y_kept])))
     xy_span = xy_max - xy_min
@@ -1874,11 +2109,11 @@ def analyze_subject_cv_difference(
     )
     ax2.set_xlim(line_min, line_max)
     ax2.set_ylim(line_min, line_max)
-    ax2.set_xlabel("CV behavior")
-    ax2.set_ylabel("CV projection")
-    ax2.set_title("2) Paired scatter (raw CV)")
+    ax2.set_xlabel(f"Behavior {metric_label}")
+    ax2.set_ylabel(f"Projection {metric_label}")
+    ax2.set_title(f"2) Paired scatter ({metric_label})")
 
-    removed_labels = paired_cv_df.loc[paired_cv_df["removed_outlier"], "pair_label"].astype(str).tolist()
+    removed_labels = paired_metric_df.loc[paired_metric_df["removed_outlier"], "pair_label"].astype(str).tolist()
     stats_text = (
         f"mean(d_s)={d_mean:.3g}, median(d_s)={d_median:.3g}\n"
         f"Sign-flip permutation p(two-sided)={perm_p_two_sided:.3g}\n"
@@ -1901,6 +2136,9 @@ def analyze_subject_cv_difference(
     plt.close(fig)
 
     stats_row = {
+        "metric": str(metric_label),
+        "projection_col": str(projection_col),
+        "behavior_col": str(behavior_col),
         "n_pairs_total": int(paired["n_pairs_total"]),
         "n_pairs_removed_outlier": int(paired["n_pairs_removed"]),
         "n_pairs_used": int(paired["n_pairs_kept"]),
@@ -1918,7 +2156,33 @@ def analyze_subject_cv_difference(
         "n_bootstrap": int(n_bootstrap),
         "random_seed": int(random_seed),
     }
-    return stats_row, paired_cv_df
+    return stats_row, paired_metric_df
+
+
+def analyze_subject_cv_difference(
+    metric_df,
+    out_path,
+    outlier_iqr_multiplier=3.0,
+    n_permutations=20000,
+    n_bootstrap=10000,
+    bootstrap_ci_percent=95.0,
+    random_seed=0,
+    grid_points=512,
+):
+    metric_spec = next(spec for spec in METRIC_SPECS if str(spec["key"]) == "cv")
+    return analyze_subject_metric_difference(
+        metric_df=metric_df,
+        projection_col=str(metric_spec["projection_col"]),
+        behavior_col=str(metric_spec["behavior_col"]),
+        metric_label=str(metric_spec["label"]),
+        out_path=out_path,
+        outlier_iqr_multiplier=outlier_iqr_multiplier,
+        n_permutations=n_permutations,
+        n_bootstrap=n_bootstrap,
+        bootstrap_ci_percent=bootstrap_ci_percent,
+        random_seed=random_seed,
+        grid_points=grid_points,
+    )
 
 
 def main():
@@ -1987,37 +2251,67 @@ def main():
     manifest_df = pd.read_csv(manifest_path, sep="\t")
 
     run_segments, _ = split_projection_by_run(projection, manifest_df, trial_keep_root)
-    run_df, behavior_df, run_cv_df = compute_run_behavior_tables(
+    run_df, behavior_df, run_metric_df = compute_run_behavior_tables(
         run_segments,
         behavior_root=behavior_root,
         behavior_column=int(args.behavior_column),
     )
-    cv_run_outlier_keys, cv_run_pair_outlier_df = identify_run_outliers(
-        run_cv_df,
-        projection_col="cv_projection",
-        behavior_col="cv_behavior_col2",
-        outlier_iqr_multiplier=float(args.outlier_iqr_multiplier),
-    )
+
+    run_pair_outlier_tables = []
+    excluded_run_keys = set()
+    run_outlier_specs = _metric_specs_from_keys(RUN_OUTLIER_METRIC_KEYS)
+    for metric_spec in run_outlier_specs:
+        metric_outlier_keys, metric_pair_outlier_df = identify_run_outliers(
+            run_metric_df,
+            projection_col=str(metric_spec["projection_col"]),
+            behavior_col=str(metric_spec["behavior_col"]),
+            outlier_iqr_multiplier=float(args.outlier_iqr_multiplier),
+        )
+        metric_pair_outlier_df = metric_pair_outlier_df.copy()
+        metric_pair_outlier_df["metric_key"] = str(metric_spec["key"])
+        metric_pair_outlier_df["metric_label"] = str(metric_spec["label"])
+        run_pair_outlier_tables.append(metric_pair_outlier_df)
+        excluded_run_keys.update(metric_outlier_keys)
+
+    if run_pair_outlier_tables:
+        run_pair_outlier_df = pd.concat(run_pair_outlier_tables, axis=0, ignore_index=True)
+    else:
+        run_pair_outlier_df = pd.DataFrame(
+            columns=[
+                "sub_tag",
+                "ses",
+                "run",
+                "pair_label",
+                "removed_outlier",
+                "metric_key",
+                "metric_label",
+            ]
+        )
+
     subject_metrics_df = compute_subject_projection_behavior_metrics(
         run_segments,
         behavior_root=behavior_root,
         behavior_column=int(args.behavior_column),
-        excluded_run_keys=cv_run_outlier_keys,
+        excluded_run_keys=excluded_run_keys,
     )
     comparison_df = build_projection_behavior_comparison(
         run_df, behavior_df, scale_method=args.scale_method
     )
+
+    metric_merge_cols = ["sub_tag", "ses", "run", "n_trials_paired_finite"]
+    for metric_spec in METRIC_SPECS:
+        for col in (str(metric_spec["projection_col"]), str(metric_spec["behavior_col"])):
+            if col not in {"variance_projection", "variance_behavior_col2"}:
+                metric_merge_cols.append(col)
+    seen_cols = set()
+    unique_metric_merge_cols = []
+    for col in metric_merge_cols:
+        if col not in seen_cols:
+            unique_metric_merge_cols.append(col)
+            seen_cols.add(col)
+
     comparison_df = comparison_df.merge(
-        run_cv_df[
-            [
-                "sub_tag",
-                "ses",
-                "run",
-                "cv_projection",
-                "cv_behavior_col2",
-                "n_trials_paired_finite",
-            ]
-        ],
+        run_metric_df[unique_metric_merge_cols],
         on=["sub_tag", "ses", "run"],
         how="left",
         validate="one_to_one",
@@ -2037,103 +2331,96 @@ def main():
         "compare_csv": os.path.join(
             out_dir, f"{stem}_sub_ses_run_projection_behavior_variance.csv"
         ),
+        "run_metric_csv": os.path.join(
+            out_dir, f"{stem}_sub_ses_run_projection_behavior_metrics.csv"
+        ),
         "subject_metrics_csv": os.path.join(
             out_dir, f"{stem}_subject_projection_behavior_metrics.csv"
         ),
         "run_density_plot": os.path.join(out_dir, f"{stem}_sub_ses_run_variance_density.png"),
-        "compare_density_plot": os.path.join(
-            out_dir, f"{stem}_projection_behavior_variance_scaled_density.png"
-        ),
-        "run_cv_csv": os.path.join(
-            out_dir, f"{stem}_sub_ses_run_projection_behavior_cv.csv"
-        ),
-        "run_cv_plot": os.path.join(
-            out_dir, f"{stem}_sub_ses_run_projection_behavior_cv_density.png"
-        ),
-        "variance_cv_3x2_plot": os.path.join(
-            out_dir, f"{stem}_projection_behavior_variance_cv_zscore_3x2.png"
-        ),
-        "cv_raw_3x1_plot": os.path.join(
-            out_dir, f"{stem}_projection_behavior_cv_raw_nozscore_3x1.png"
+        "metric_grid_plot": os.path.join(
+            out_dir, f"{stem}_projection_behavior_all_metrics_raw_grid.png"
         ),
         "outside_box_counts_csv": os.path.join(
             out_dir,
-            f"{stem}_3x2_outside_box_counts_behavior_vs_bold_all_categories.csv",
+            f"{stem}_all_metrics_outside_box_counts_behavior_vs_bold_all_categories.csv",
         ),
         "outside_box_counts_plot": os.path.join(
             out_dir,
             (
-                f"{stem}_3x2_outside_box_counts_behavior_vs_bold_all_categories_"
+                f"{stem}_all_metrics_outside_box_counts_behavior_vs_bold_all_categories_"
                 "subject_row_sorted_by_behavior.png"
             ),
         ),
         "whisker_outlier_counts_csv": os.path.join(
             out_dir,
-            f"{stem}_3x2_whisker_outlier_counts_behavior_vs_bold_all_categories.csv",
+            f"{stem}_all_metrics_whisker_outlier_counts_behavior_vs_bold_all_categories.csv",
         ),
         "whisker_outlier_thresholds_csv": os.path.join(
             out_dir,
-            f"{stem}_3x2_whisker_outlier_thresholds.csv",
+            f"{stem}_all_metrics_whisker_outlier_thresholds.csv",
         ),
         "whisker_outlier_counts_plot": os.path.join(
             out_dir,
             (
-                f"{stem}_3x2_whisker_outlier_counts_behavior_vs_bold_all_categories_"
+                f"{stem}_all_metrics_whisker_outlier_counts_behavior_vs_bold_all_categories_"
                 "subject_row_sorted_by_behavior.png"
             ),
         ),
-        "cv_raw_whisker_outlier_counts_csv": os.path.join(
+        "raw_whisker_outlier_counts_csv": os.path.join(
             out_dir,
-            f"{stem}_cv_raw_whisker_outlier_counts_behavior_vs_bold_all_categories.csv",
+            f"{stem}_all_metrics_raw_whisker_outlier_counts_behavior_vs_bold_all_categories.csv",
         ),
-        "cv_raw_whisker_outlier_thresholds_csv": os.path.join(
+        "raw_whisker_outlier_thresholds_csv": os.path.join(
             out_dir,
-            f"{stem}_cv_raw_whisker_outlier_thresholds.csv",
+            f"{stem}_all_metrics_raw_whisker_outlier_thresholds.csv",
         ),
-        "cv_raw_whisker_outlier_counts_plot": os.path.join(
+        "raw_whisker_outlier_counts_plot": os.path.join(
             out_dir,
             (
-                f"{stem}_cv_raw_whisker_outlier_counts_behavior_vs_bold_all_categories_"
+                f"{stem}_all_metrics_raw_whisker_outlier_counts_behavior_vs_bold_all_categories_"
                 "subject_row_sorted_by_behavior.png"
             ),
         ),
         "paired_stats_csv": os.path.join(
             out_dir, f"{stem}_subject_projection_behavior_paired_stats.csv"
         ),
-        "variance_pairs_csv": os.path.join(
-            out_dir, f"{stem}_subject_projection_behavior_variance_pairs.csv"
+        "metric_ds_stats_csv": os.path.join(
+            out_dir, f"{stem}_sub_ses_run_projection_behavior_metric_ds_stats.csv"
         ),
-        "cv_pairs_csv": os.path.join(
-            out_dir, f"{stem}_subject_projection_behavior_cv_pairs.csv"
-        ),
-        "cv_ds_plot": os.path.join(
-            out_dir, f"{stem}_projection_behavior_cv_ds_analysis.png"
-        ),
-        "cv_ds_pairs_csv": os.path.join(
-            out_dir, f"{stem}_sub_ses_run_projection_behavior_cv_ds_pairs.csv"
-        ),
-        "cv_ds_stats_csv": os.path.join(
-            out_dir, f"{stem}_sub_ses_run_projection_behavior_cv_ds_stats.csv"
-        ),
-        "cv_run_pairs_outlier_csv": os.path.join(
-            out_dir, f"{stem}_sub_ses_run_cv_pairs_outlier_flags.csv"
+        "run_pairs_outlier_csv": os.path.join(
+            out_dir, f"{stem}_sub_ses_run_all_metric_pairs_outlier_flags.csv"
         ),
     }
+    metric_path_map = {}
+    for metric_spec in METRIC_SPECS:
+        metric_key = str(metric_spec["key"])
+        metric_stub = str(metric_spec["file_stub"])
+        metric_path_map[metric_key] = {
+            "comparison_plot": os.path.join(
+                out_dir, f"{stem}_sub_ses_run_projection_behavior_{metric_stub}_density.png"
+            ),
+            "pairs_csv": os.path.join(
+                out_dir, f"{stem}_sub_ses_run_projection_behavior_{metric_stub}_pairs.csv"
+            ),
+            "ds_plot": os.path.join(
+                out_dir, f"{stem}_projection_behavior_{metric_stub}_ds_analysis.png"
+            ),
+            "ds_pairs_csv": os.path.join(
+                out_dir, f"{stem}_sub_ses_run_projection_behavior_{metric_stub}_ds_pairs.csv"
+            ),
+        }
 
     run_df.to_csv(output_paths["run_csv"], index=False)
     behavior_df.to_csv(output_paths["behavior_csv"], index=False)
     comparison_df.to_csv(output_paths["compare_csv"], index=False)
-    run_cv_df.to_csv(output_paths["run_cv_csv"], index=False)
+    run_metric_df.to_csv(output_paths["run_metric_csv"], index=False)
     subject_metrics_df.to_csv(output_paths["subject_metrics_csv"], index=False)
-    cv_run_pair_outlier_df.to_csv(output_paths["cv_run_pairs_outlier_csv"], index=False)
+    run_pair_outlier_df.to_csv(output_paths["run_pairs_outlier_csv"], index=False)
 
     plot_variance_cv_subject_session_run_3x2(
         comparison_df,
-        output_paths["variance_cv_3x2_plot"],
-    )
-    plot_cv_subject_session_run_raw_3x1(
-        run_cv_df,
-        output_paths["cv_raw_3x1_plot"],
+        output_paths["metric_grid_plot"],
     )
     plot_outside_box_counts_behavior_vs_bold_3x2(
         comparison_df,
@@ -2150,40 +2437,56 @@ def main():
         sort_subject_by_behavior=True,
     )
     plot_whisker_outlier_counts_behavior_vs_bold_cv_raw(
-        run_cv_df,
-        output_paths["cv_raw_whisker_outlier_counts_plot"],
-        out_csv_path=output_paths["cv_raw_whisker_outlier_counts_csv"],
-        thresholds_csv_path=output_paths["cv_raw_whisker_outlier_thresholds_csv"],
+        run_metric_df,
+        output_paths["raw_whisker_outlier_counts_plot"],
+        out_csv_path=output_paths["raw_whisker_outlier_counts_csv"],
+        thresholds_csv_path=output_paths["raw_whisker_outlier_thresholds_csv"],
         near_fraction=float(args.whisker_near_fraction),
         sort_subject_by_behavior=True,
     )
     plot_run_variance_density(run_df, output_paths["run_density_plot"])
-    variance_stats_row, variance_pairs_df = plot_scaled_variance_comparison_density(
-        comparison_df,
-        output_paths["compare_density_plot"],
-        outlier_iqr_multiplier=float(args.outlier_iqr_multiplier),
-    )
-    cv_stats_row, cv_pairs_df = plot_sub_ses_run_cv_comparison(
-        run_cv_df,
-        output_paths["run_cv_plot"],
-        outlier_iqr_multiplier=float(args.outlier_iqr_multiplier),
-    )
-    cv_ds_stats_row, cv_ds_pairs_df = analyze_subject_cv_difference(
-        run_cv_df,
-        output_paths["cv_ds_plot"],
-        outlier_iqr_multiplier=float(args.outlier_iqr_multiplier),
-        n_permutations=int(args.permutation_iterations),
-        n_bootstrap=int(args.bootstrap_iterations),
-        bootstrap_ci_percent=float(args.bootstrap_ci_percent),
-        random_seed=int(args.random_seed),
-    )
 
-    paired_stats_df = pd.DataFrame([variance_stats_row, cv_stats_row])
-    variance_pairs_df.to_csv(output_paths["variance_pairs_csv"], index=False)
-    cv_pairs_df.to_csv(output_paths["cv_pairs_csv"], index=False)
-    cv_ds_pairs_df.to_csv(output_paths["cv_ds_pairs_csv"], index=False)
+    paired_stats_rows = []
+    ds_stats_rows = []
+    for metric_spec in METRIC_SPECS:
+        metric_key = str(metric_spec["key"])
+        metric_paths = metric_path_map[metric_key]
+
+        summary_row, metric_pairs_df = _plot_subject_metric_comparison(
+            subject_metrics_df=run_metric_df,
+            projection_col=str(metric_spec["projection_col"]),
+            behavior_col=str(metric_spec["behavior_col"]),
+            metric_label=str(metric_spec["label"]),
+            out_path=metric_paths["comparison_plot"],
+            outlier_iqr_multiplier=float(args.outlier_iqr_multiplier),
+            projection_plot_scale=float(metric_spec.get("projection_plot_scale", 1.0)),
+            grid_points=512,
+            use_2x2_layout=True,
+        )
+        summary_row["metric_key"] = metric_key
+        paired_stats_rows.append(summary_row)
+        metric_pairs_df.to_csv(metric_paths["pairs_csv"], index=False)
+
+        ds_stats_row, ds_pairs_df = analyze_subject_metric_difference(
+            metric_df=run_metric_df,
+            projection_col=str(metric_spec["projection_col"]),
+            behavior_col=str(metric_spec["behavior_col"]),
+            metric_label=str(metric_spec["label"]),
+            out_path=metric_paths["ds_plot"],
+            outlier_iqr_multiplier=float(args.outlier_iqr_multiplier),
+            n_permutations=int(args.permutation_iterations),
+            n_bootstrap=int(args.bootstrap_iterations),
+            bootstrap_ci_percent=float(args.bootstrap_ci_percent),
+            random_seed=int(args.random_seed),
+            grid_points=512,
+        )
+        ds_stats_row["metric_key"] = metric_key
+        ds_stats_rows.append(ds_stats_row)
+        ds_pairs_df.to_csv(metric_paths["ds_pairs_csv"], index=False)
+
+    paired_stats_df = pd.DataFrame(paired_stats_rows)
     paired_stats_df.to_csv(output_paths["paired_stats_csv"], index=False)
-    pd.DataFrame([cv_ds_stats_row]).to_csv(output_paths["cv_ds_stats_csv"], index=False)
+    pd.DataFrame(ds_stats_rows).to_csv(output_paths["metric_ds_stats_csv"], index=False)
 
     print(f"Saved outputs to: {out_dir}")
 

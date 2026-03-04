@@ -12,9 +12,9 @@ Outputs:
 5) Per-subject KS stats CSV (session 1 vs 2, runs 1+2 pooled within session).
 6) Group-level KS inference CSV.
 7) KS summary figure (3x1): KS statistic, IQR diff, MAD diff.
-8) Per-subject pooled-trial CV CSV (session 1 vs 2, runs 1+2 pooled).
-9) Group-level pooled-trial CV session comparison stats CSV.
-10) Pooled-trial CV overlay figure with KS/IQR/MAD summary text.
+8) Per-subject pooled-trial metric CSV (session 1 vs 2, runs 1+2 pooled).
+9) Group-level pooled-trial metric session comparison stats CSV.
+10) Pooled-trial metric overlay figures with KS/IQR/MAD summary text.
 11) Subject distribution grid figure (2x7): session 1 vs 2 projected-signal densities.
 """
 
@@ -42,6 +42,41 @@ from motor_brain_com import (
 VARIANCE_SCALE = 1e7
 PAIRWISE_ALPHA = 0.05
 KS_ALPHA = 0.05
+
+POOLED_METRIC_SPECS = [
+    {
+        "key": "cv_projection",
+        "label": "CV",
+        "formula": "std(X) / |mean(X)|",
+        "file_stub": "pooled_cv",
+        "x_label": "Pooled-trial CV projection (runs 1+2)",
+        "title": "Session 1 vs Session 2 pooled-trial CV distribution",
+    },
+    {
+        "key": "mad_mean_projection",
+        "label": "MAD(mean)",
+        "formula": "mean(|X - mean(X)|)",
+        "file_stub": "pooled_mad_mean",
+        "x_label": "Pooled-trial MAD(mean) projection (runs 1+2)",
+        "title": "Session 1 vs Session 2 pooled-trial MAD(mean) distribution",
+    },
+    {
+        "key": "mad_mean_over_median_projection",
+        "label": "MAD(mean)/|median|",
+        "formula": "mean(|X - mean(X)|) / |median(X)|",
+        "file_stub": "pooled_mad_mean_over_median",
+        "x_label": "Pooled-trial MAD(mean)/|median| projection (runs 1+2)",
+        "title": "Session 1 vs Session 2 pooled-trial MAD(mean)/|median| distribution",
+    },
+    {
+        "key": "std_centered_range_projection",
+        "label": "std((X-mean)/(max-min))",
+        "formula": "std((X - mean(X)) / (max(X) - min(X)))",
+        "file_stub": "pooled_std_centered_range",
+        "x_label": "Pooled-trial std((X-mean)/(max-min)) projection (runs 1+2)",
+        "title": "Session 1 vs Session 2 pooled-trial centered-range-normalized std",
+    },
+]
 
 
 def build_projection_variability_stats_table(
@@ -187,6 +222,74 @@ def _coefficient_of_variation(values):
     return mean_value, std_value, cv_value
 
 
+def _mean_absolute_deviation(values):
+    values = np.asarray(values, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        return np.nan
+
+    mean_value = float(np.mean(finite_values))
+    return float(np.mean(np.abs(finite_values - mean_value)))
+
+
+def _safe_abs_ratio(numerator, denominator):
+    numerator = float(numerator)
+    denominator_abs = abs(float(denominator))
+    if not np.isfinite(numerator) or not np.isfinite(denominator_abs) or np.isclose(denominator_abs, 0.0):
+        return np.nan
+    return float(numerator / denominator_abs)
+
+
+def _std_centered_over_range(values):
+    values = np.asarray(values, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        return np.nan
+
+    vmin = float(np.min(finite_values))
+    vmax = float(np.max(finite_values))
+    value_range = float(vmax - vmin)
+    if not np.isfinite(value_range) or np.isclose(value_range, 0.0):
+        return np.nan
+
+    mean_value = float(np.mean(finite_values))
+    centered_scaled = (finite_values - mean_value) / value_range
+    return float(np.std(centered_scaled))
+
+
+def _compute_pooled_metric_values(values):
+    values = np.asarray(values, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        return {
+            "mean_projection": np.nan,
+            "median_projection": np.nan,
+            "std_projection": np.nan,
+            "cv_projection": np.nan,
+            "mad_mean_projection": np.nan,
+            "mad_mean_over_median_projection": np.nan,
+            "std_centered_range_projection": np.nan,
+        }
+
+    mean_value = float(np.mean(finite_values))
+    median_value = float(np.median(finite_values))
+    std_value = float(np.std(finite_values))
+    mad_mean_value = _mean_absolute_deviation(finite_values)
+    _, _, cv_value = _coefficient_of_variation(finite_values)
+    mad_over_median_value = _safe_abs_ratio(mad_mean_value, median_value)
+    std_centered_range = _std_centered_over_range(finite_values)
+
+    return {
+        "mean_projection": mean_value,
+        "median_projection": median_value,
+        "std_projection": std_value,
+        "cv_projection": cv_value,
+        "mad_mean_projection": mad_mean_value,
+        "mad_mean_over_median_projection": mad_over_median_value,
+        "std_centered_range_projection": std_centered_range,
+    }
+
+
 def compute_run_projection_std_over_rms(run_segments):
     rows = []
     for segment in run_segments:
@@ -273,7 +376,7 @@ def _collect_subject_session_pooled_values(
     return pooled, run_counts, subjects, run_set
 
 
-def compute_subject_session_pooled_cv(
+def compute_subject_session_pooled_metrics(
     run_segments,
     session_a=1,
     session_b=2,
@@ -290,9 +393,8 @@ def compute_subject_session_pooled_cv(
     for sub_tag in subjects:
         values_a = pooled.get((sub_tag, int(session_a)), np.array([], dtype=np.float64))
         values_b = pooled.get((sub_tag, int(session_b)), np.array([], dtype=np.float64))
-
-        mean_a, std_a, cv_a = _coefficient_of_variation(values_a)
-        mean_b, std_b, cv_b = _coefficient_of_variation(values_b)
+        metrics_a = _compute_pooled_metric_values(values_a)
+        metrics_b = _compute_pooled_metric_values(values_b)
 
         row = {
             "sub_tag": str(sub_tag),
@@ -303,25 +405,132 @@ def compute_subject_session_pooled_cv(
             "n_runs_session_b": int(run_counts.get((sub_tag, session_b), 0)),
             "n_trials_session_a": int(values_a.size),
             "n_trials_session_b": int(values_b.size),
-            "session_a_mean_projection": mean_a,
-            "session_a_std_projection": std_a,
-            "session_a_cv_projection": cv_a,
-            "session_b_mean_projection": mean_b,
-            "session_b_std_projection": std_b,
-            "session_b_cv_projection": cv_b,
-            "cv_diff_session_b_minus_a": np.nan,
-            "higher_cv_session": pd.NA,
+            "session_a_mean_projection": metrics_a["mean_projection"],
+            "session_b_mean_projection": metrics_b["mean_projection"],
+            "session_a_median_projection": metrics_a["median_projection"],
+            "session_b_median_projection": metrics_b["median_projection"],
+            "session_a_std_projection": metrics_a["std_projection"],
+            "session_b_std_projection": metrics_b["std_projection"],
         }
 
-        if np.isfinite(cv_a) and np.isfinite(cv_b):
-            cv_diff = float(cv_b - cv_a)
-            row["cv_diff_session_b_minus_a"] = cv_diff
-            if np.isclose(cv_diff, 0.0):
-                row["higher_cv_session"] = "tie"
-            elif cv_diff > 0:
-                row["higher_cv_session"] = f"session_{session_b}"
-            else:
-                row["higher_cv_session"] = f"session_{session_a}"
+        for metric_spec in POOLED_METRIC_SPECS:
+            metric_key = metric_spec["key"]
+            value_a = float(metrics_a.get(metric_key, np.nan))
+            value_b = float(metrics_b.get(metric_key, np.nan))
+            diff_key = f"{metric_key}_diff_session_b_minus_a"
+            higher_key = f"higher_{metric_key}_session"
+
+            row[f"session_a_{metric_key}"] = value_a
+            row[f"session_b_{metric_key}"] = value_b
+            row[diff_key] = np.nan
+            row[higher_key] = pd.NA
+
+            if np.isfinite(value_a) and np.isfinite(value_b):
+                diff_value = float(value_b - value_a)
+                row[diff_key] = diff_value
+                if np.isclose(diff_value, 0.0):
+                    row[higher_key] = "tie"
+                elif diff_value > 0:
+                    row[higher_key] = f"session_{session_b}"
+                else:
+                    row[higher_key] = f"session_{session_a}"
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def compute_subject_session_pooled_cv(
+    run_segments,
+    session_a=1,
+    session_b=2,
+    runs=(1, 2),
+):
+    return compute_subject_session_pooled_metrics(
+        run_segments,
+        session_a=session_a,
+        session_b=session_b,
+        runs=runs,
+    )
+
+
+def build_group_level_session_metric_stats(
+    subject_metric_df,
+    session_a=1,
+    session_b=2,
+    metric_specs=POOLED_METRIC_SPECS,
+):
+    rows = []
+    subject_count = 0 if (subject_metric_df is None or subject_metric_df.empty) else int(len(subject_metric_df))
+    runs_label = "1,2"
+
+    for metric_spec in metric_specs:
+        metric_key = str(metric_spec["key"])
+        row = {
+            "metric": metric_key,
+            "metric_label": str(metric_spec["label"]),
+            "metric_formula": str(metric_spec["formula"]),
+            "session_a": int(session_a),
+            "session_b": int(session_b),
+            "runs_pooled": runs_label,
+            "n_subjects_total": subject_count,
+            "n_subjects_paired_finite_metric": 0,
+            "mean_session_a_metric": np.nan,
+            "mean_session_b_metric": np.nan,
+            "median_session_a_metric": np.nan,
+            "median_session_b_metric": np.nan,
+            "ks_statistic": np.nan,
+            "ks_p_two_sided": np.nan,
+            "iqr_session_a_metric": np.nan,
+            "iqr_session_b_metric": np.nan,
+            "iqr_diff_session_b_minus_a": np.nan,
+            "mad_session_a_metric": np.nan,
+            "mad_session_b_metric": np.nan,
+            "mad_diff_session_b_minus_a": np.nan,
+        }
+
+        if subject_metric_df is None or subject_metric_df.empty:
+            rows.append(row)
+            continue
+
+        df = subject_metric_df.copy()
+        col_a = f"session_a_{metric_key}"
+        col_b = f"session_b_{metric_key}"
+        if col_a not in df.columns or col_b not in df.columns:
+            rows.append(row)
+            continue
+
+        metric_a = pd.to_numeric(df[col_a], errors="coerce").to_numpy(dtype=np.float64)
+        metric_b = pd.to_numeric(df[col_b], errors="coerce").to_numpy(dtype=np.float64)
+        paired = np.isfinite(metric_a) & np.isfinite(metric_b)
+        row["n_subjects_paired_finite_metric"] = int(np.count_nonzero(paired))
+        if not np.any(paired):
+            rows.append(row)
+            continue
+
+        values_a = metric_a[paired]
+        values_b = metric_b[paired]
+        row["mean_session_a_metric"] = float(np.mean(values_a))
+        row["mean_session_b_metric"] = float(np.mean(values_b))
+        row["median_session_a_metric"] = float(np.median(values_a))
+        row["median_session_b_metric"] = float(np.median(values_b))
+
+        ks_result = ks_2samp(values_a, values_b, alternative="two-sided", method="auto")
+        row["ks_statistic"] = float(ks_result.statistic)
+        row["ks_p_two_sided"] = float(ks_result.pvalue)
+
+        iqr_a = _iqr(values_a)
+        iqr_b = _iqr(values_b)
+        mad_a = _mad(values_a)
+        mad_b = _mad(values_b)
+        row["iqr_session_a_metric"] = iqr_a
+        row["iqr_session_b_metric"] = iqr_b
+        row["mad_session_a_metric"] = mad_a
+        row["mad_session_b_metric"] = mad_b
+        if np.isfinite(iqr_a) and np.isfinite(iqr_b):
+            row["iqr_diff_session_b_minus_a"] = float(iqr_b - iqr_a)
+        if np.isfinite(mad_a) and np.isfinite(mad_b):
+            row["mad_diff_session_b_minus_a"] = float(mad_b - mad_a)
 
         rows.append(row)
 
@@ -366,66 +575,61 @@ def _ks_2samp_min_sign_flip(values_a, values_b):
 
 
 def build_group_level_session_cv_stats(subject_cv_df, session_a=1, session_b=2):
-    row = {
-        "session_a": int(session_a),
-        "session_b": int(session_b),
-        "runs_pooled": "1,2",
-        "n_subjects_total": 0,
-        "n_subjects_paired_finite_cv": 0,
-        "mean_session_a_cv": np.nan,
-        "mean_session_b_cv": np.nan,
-        "median_session_a_cv": np.nan,
-        "median_session_b_cv": np.nan,
-        "ks_statistic": np.nan,
-        "ks_p_two_sided": np.nan,
-        "iqr_session_a_cv": np.nan,
-        "iqr_session_b_cv": np.nan,
-        "iqr_diff_session_b_minus_a": np.nan,
-        "mad_session_a_cv": np.nan,
-        "mad_session_b_cv": np.nan,
-        "mad_diff_session_b_minus_a": np.nan,
-    }
+    group_metric_df = build_group_level_session_metric_stats(
+        subject_cv_df,
+        session_a=session_a,
+        session_b=session_b,
+        metric_specs=[spec for spec in POOLED_METRIC_SPECS if spec["key"] == "cv_projection"],
+    )
+    if group_metric_df.empty:
+        return pd.DataFrame(
+            [
+                {
+                    "session_a": int(session_a),
+                    "session_b": int(session_b),
+                    "runs_pooled": "1,2",
+                    "n_subjects_total": 0,
+                    "n_subjects_paired_finite_cv": 0,
+                    "mean_session_a_cv": np.nan,
+                    "mean_session_b_cv": np.nan,
+                    "median_session_a_cv": np.nan,
+                    "median_session_b_cv": np.nan,
+                    "ks_statistic": np.nan,
+                    "ks_p_two_sided": np.nan,
+                    "iqr_session_a_cv": np.nan,
+                    "iqr_session_b_cv": np.nan,
+                    "iqr_diff_session_b_minus_a": np.nan,
+                    "mad_session_a_cv": np.nan,
+                    "mad_session_b_cv": np.nan,
+                    "mad_diff_session_b_minus_a": np.nan,
+                }
+            ]
+        )
 
-    if subject_cv_df is None or subject_cv_df.empty:
-        return pd.DataFrame([row])
-
-    df = subject_cv_df.copy()
-    row["n_subjects_total"] = int(len(df))
-
-    cv_a = pd.to_numeric(df["session_a_cv_projection"], errors="coerce").to_numpy(dtype=np.float64)
-    cv_b = pd.to_numeric(df["session_b_cv_projection"], errors="coerce").to_numpy(dtype=np.float64)
-    paired = np.isfinite(cv_a) & np.isfinite(cv_b)
-    row["n_subjects_paired_finite_cv"] = int(np.count_nonzero(paired))
-
-    if not np.any(paired):
-        return pd.DataFrame([row])
-
-    values_a = cv_a[paired]
-    values_b = cv_b[paired]
-
-    row["mean_session_a_cv"] = float(np.mean(values_a))
-    row["mean_session_b_cv"] = float(np.mean(values_b))
-    row["median_session_a_cv"] = float(np.median(values_a))
-    row["median_session_b_cv"] = float(np.median(values_b))
-
-    ks_result = ks_2samp(values_a, values_b, alternative="two-sided", method="auto")
-    row["ks_statistic"] = float(ks_result.statistic)
-    row["ks_p_two_sided"] = float(ks_result.pvalue)
-
-    iqr_a = _iqr(values_a)
-    iqr_b = _iqr(values_b)
-    mad_a = _mad(values_a)
-    mad_b = _mad(values_b)
-    row["iqr_session_a_cv"] = iqr_a
-    row["iqr_session_b_cv"] = iqr_b
-    row["mad_session_a_cv"] = mad_a
-    row["mad_session_b_cv"] = mad_b
-    if np.isfinite(iqr_a) and np.isfinite(iqr_b):
-        row["iqr_diff_session_b_minus_a"] = float(iqr_b - iqr_a)
-    if np.isfinite(mad_a) and np.isfinite(mad_b):
-        row["mad_diff_session_b_minus_a"] = float(mad_b - mad_a)
-
-    return pd.DataFrame([row])
+    src = group_metric_df.iloc[0].to_dict()
+    return pd.DataFrame(
+        [
+            {
+                "session_a": int(src.get("session_a", session_a)),
+                "session_b": int(src.get("session_b", session_b)),
+                "runs_pooled": str(src.get("runs_pooled", "1,2")),
+                "n_subjects_total": int(src.get("n_subjects_total", 0)),
+                "n_subjects_paired_finite_cv": int(src.get("n_subjects_paired_finite_metric", 0)),
+                "mean_session_a_cv": float(src.get("mean_session_a_metric", np.nan)),
+                "mean_session_b_cv": float(src.get("mean_session_b_metric", np.nan)),
+                "median_session_a_cv": float(src.get("median_session_a_metric", np.nan)),
+                "median_session_b_cv": float(src.get("median_session_b_metric", np.nan)),
+                "ks_statistic": float(src.get("ks_statistic", np.nan)),
+                "ks_p_two_sided": float(src.get("ks_p_two_sided", np.nan)),
+                "iqr_session_a_cv": float(src.get("iqr_session_a_metric", np.nan)),
+                "iqr_session_b_cv": float(src.get("iqr_session_b_metric", np.nan)),
+                "iqr_diff_session_b_minus_a": float(src.get("iqr_diff_session_b_minus_a", np.nan)),
+                "mad_session_a_cv": float(src.get("mad_session_a_metric", np.nan)),
+                "mad_session_b_cv": float(src.get("mad_session_b_metric", np.nan)),
+                "mad_diff_session_b_minus_a": float(src.get("mad_diff_session_b_minus_a", np.nan)),
+            }
+        ]
+    )
 
 
 def compute_subject_session_ks(
@@ -951,38 +1155,88 @@ def _plot_subject_session_projection_distribution_grid(
     plt.close(fig)
 
 
-def _plot_session_cv_distribution_summary(subject_cv_df, group_cv_stats_df, out_path):
+def _plot_session_metric_distribution_summary(
+    subject_metric_df,
+    group_metric_stats_df,
+    metric_spec,
+    out_path,
+):
     fig, ax = plt.subplots(1, 1, figsize=(10.5, 6.0))
+    metric_key = str(metric_spec["key"])
+    metric_label = str(metric_spec["label"])
+    col_a = f"session_a_{metric_key}"
+    col_b = f"session_b_{metric_key}"
 
-    if subject_cv_df is None or subject_cv_df.empty:
-        ax.text(0.5, 0.5, "No pooled CV data", ha="center", va="center", transform=ax.transAxes)
+    if subject_metric_df is None or subject_metric_df.empty:
+        ax.text(
+            0.5,
+            0.5,
+            f"No pooled {metric_label} data",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
         ax.set_axis_off()
         fig.savefig(out_path, dpi=200)
         plt.close(fig)
         return
 
-    df = subject_cv_df.copy()
-    cv_a = pd.to_numeric(df["session_a_cv_projection"], errors="coerce").to_numpy(dtype=np.float64)
-    cv_b = pd.to_numeric(df["session_b_cv_projection"], errors="coerce").to_numpy(dtype=np.float64)
-    paired = np.isfinite(cv_a) & np.isfinite(cv_b)
+    df = subject_metric_df.copy()
+    if col_a not in df.columns or col_b not in df.columns:
+        ax.text(
+            0.5,
+            0.5,
+            f"Missing columns for {metric_label}",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
+
+    value_a = pd.to_numeric(df[col_a], errors="coerce").to_numpy(dtype=np.float64)
+    value_b = pd.to_numeric(df[col_b], errors="coerce").to_numpy(dtype=np.float64)
+    paired = np.isfinite(value_a) & np.isfinite(value_b)
 
     if not np.any(paired):
-        ax.text(0.5, 0.5, "No finite pooled CV pairs", ha="center", va="center", transform=ax.transAxes)
+        ax.text(
+            0.5,
+            0.5,
+            f"No finite pooled {metric_label} pairs",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
         ax.set_axis_off()
         fig.savefig(out_path, dpi=200)
         plt.close(fig)
         return
 
-    values_a = cv_a[paired]
-    values_b = cv_b[paired]
+    values_a = value_a[paired]
+    values_b = value_b[paired]
     all_values = np.concatenate([values_a, values_b])
     x = _density_grid(all_values, grid_points=512, fallback_pad=1e-6)
     density_a = _evaluate_density(values_a, x)
     density_b = _evaluate_density(values_b, x)
 
-    ax.plot(x, density_a, color="tab:blue", linewidth=2.0, label="Session 1 pooled CV")
+    ax.plot(
+        x,
+        density_a,
+        color="tab:blue",
+        linewidth=2.0,
+        label=f"Session 1 pooled {metric_label}",
+    )
     ax.fill_between(x, density_a, color="tab:blue", alpha=0.2)
-    ax.plot(x, density_b, color="tab:red", linewidth=2.0, linestyle="--", label="Session 2 pooled CV")
+    ax.plot(
+        x,
+        density_b,
+        color="tab:red",
+        linewidth=2.0,
+        linestyle="--",
+        label=f"Session 2 pooled {metric_label}",
+    )
     ax.fill_between(x, density_b, color="tab:red", alpha=0.15)
 
     median_a = float(np.median(values_a))
@@ -991,16 +1245,18 @@ def _plot_session_cv_distribution_summary(subject_cv_df, group_cv_stats_df, out_
     ax.axvline(median_b, color="tab:red", linestyle=":", linewidth=1.2)
 
     summary = {}
-    if group_cv_stats_df is not None and not group_cv_stats_df.empty:
-        summary = group_cv_stats_df.iloc[0].to_dict()
+    if group_metric_stats_df is not None and not group_metric_stats_df.empty:
+        row_match = group_metric_stats_df[group_metric_stats_df["metric"] == metric_key]
+        if not row_match.empty:
+            summary = row_match.iloc[0].to_dict()
 
     ks_d = float(summary.get("ks_statistic", np.nan))
     ks_p = float(summary.get("ks_p_two_sided", np.nan))
-    iqr_a = float(summary.get("iqr_session_a_cv", np.nan))
-    iqr_b = float(summary.get("iqr_session_b_cv", np.nan))
+    iqr_a = float(summary.get("iqr_session_a_metric", np.nan))
+    iqr_b = float(summary.get("iqr_session_b_metric", np.nan))
     iqr_diff = float(summary.get("iqr_diff_session_b_minus_a", np.nan))
-    mad_a = float(summary.get("mad_session_a_cv", np.nan))
-    mad_b = float(summary.get("mad_session_b_cv", np.nan))
+    mad_a = float(summary.get("mad_session_a_metric", np.nan))
+    mad_b = float(summary.get("mad_session_b_metric", np.nan))
     mad_diff = float(summary.get("mad_diff_session_b_minus_a", np.nan))
 
     stats_text = (
@@ -1020,15 +1276,25 @@ def _plot_session_cv_distribution_summary(subject_cv_df, group_cv_stats_df, out_
         bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.9, "edgecolor": "0.7"},
     )
 
-    ax.set_xlabel("Pooled-trial CV projection (runs 1+2)")
+    ax.set_xlabel(str(metric_spec["x_label"]))
     ax.set_ylabel("Probability density")
-    ax.set_title("Session 1 vs Session 2 pooled-trial CV distribution")
+    ax.set_title(str(metric_spec["title"]))
     ax.legend(loc="upper left", fontsize=8)
     ax.grid(axis="y", alpha=0.2)
 
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
+
+
+def _plot_session_cv_distribution_summary(subject_cv_df, group_cv_stats_df, out_path):
+    cv_spec = next(spec for spec in POOLED_METRIC_SPECS if spec["key"] == "cv_projection")
+    _plot_session_metric_distribution_summary(
+        subject_cv_df,
+        group_cv_stats_df,
+        cv_spec,
+        out_path,
+    )
 
 
 def _plot_metric_by_ses_run(df, value_col, x_label, title, out_path, color):
@@ -1095,11 +1361,117 @@ def _plot_metric_by_ses_run(df, value_col, x_label, title, out_path, color):
     plt.close(fig)
 
 
+def _read_subject_list_file(path):
+    subjects = []
+    with open(path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            tokens = [token.strip() for token in re.split(r"[,\s]+", line) if token.strip()]
+            subjects.extend(tokens)
+    return sorted(set(subjects), key=lambda sub: (_subject_order(sub), str(sub)))
+
+
+def _infer_projection_path_from_subject_list_path(subject_list_path):
+    subject_list_path = os.path.abspath(os.path.expanduser(subject_list_path))
+    base_name = os.path.basename(subject_list_path)
+    stem = os.path.splitext(base_name)[0]
+    directory = os.path.dirname(subject_list_path)
+
+    candidates = []
+    if "_excluded_subjects" in stem:
+        prefix = stem.split("_excluded_subjects", 1)[0]
+        candidates.append(os.path.join(directory, f"{prefix}.npy"))
+    candidates.append(os.path.join(directory, f"{stem}.npy"))
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _load_projection_vector(path):
+    path = os.path.abspath(os.path.expanduser(path))
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".npy":
+        return np.asarray(np.load(path)).ravel()
+
+    # Numeric text support (one value per row or whitespace-delimited)
+    try:
+        return np.asarray(np.loadtxt(path, dtype=np.float64)).ravel()
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load numeric projection from '{path}'.") from exc
+
+
+def _resolve_projection_and_excluded_subjects(projection_path, excluded_subjects_path=None):
+    projection_path = os.path.abspath(os.path.expanduser(projection_path))
+    excluded_subjects = set()
+    resolved_projection_path = projection_path
+    exclusion_sources = []
+
+    if excluded_subjects_path is not None:
+        excluded_subjects_path = os.path.abspath(os.path.expanduser(excluded_subjects_path))
+        explicit_subjects = _read_subject_list_file(excluded_subjects_path)
+        excluded_subjects.update(explicit_subjects)
+        exclusion_sources.append(excluded_subjects_path)
+
+    ext = os.path.splitext(projection_path)[1].lower()
+    if ext == ".txt":
+        try:
+            projection = _load_projection_vector(projection_path)
+        except RuntimeError:
+            inferred_projection_path = _infer_projection_path_from_subject_list_path(projection_path)
+            if inferred_projection_path is None:
+                raise RuntimeError(
+                    "Projection path points to non-numeric text and no matching .npy file was found: "
+                    f"{projection_path}"
+                )
+            projection = _load_projection_vector(inferred_projection_path)
+            resolved_projection_path = inferred_projection_path
+            inferred_subjects = _read_subject_list_file(projection_path)
+            excluded_subjects.update(inferred_subjects)
+            exclusion_sources.append(projection_path)
+    else:
+        projection = _load_projection_vector(projection_path)
+
+    return projection, resolved_projection_path, sorted(excluded_subjects), exclusion_sources
+
+
+def _exclude_subjects_from_segments(run_segments, excluded_subjects):
+    excluded_set = {str(sub) for sub in (excluded_subjects or [])}
+    if not excluded_set:
+        return list(run_segments), 0, []
+
+    filtered_segments = []
+    removed_subjects = set()
+    for segment in run_segments:
+        sub_tag = str(segment["sub_tag"])
+        if sub_tag in excluded_set:
+            removed_subjects.add(sub_tag)
+            continue
+        filtered_segments.append(segment)
+
+    removed_count = int(len(run_segments) - len(filtered_segments))
+    removed_subjects = sorted(removed_subjects, key=lambda sub: (_subject_order(sub), str(sub)))
+    return filtered_segments, removed_count, removed_subjects
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--projection-path",
-        default=('results/behave_vs_bold/projection_voxel_foldavg_sub9_ses1_task0.8_bold0.8_beta0.5_smooth0.2_gamma1_bold_thr90.npy'),
-        help="Path to projection vector (.npy).")
+    parser.add_argument(
+        "--projection-path",
+        default=(
+            "results/behave_vs_bold/"
+            "projection_voxel_foldavg_sub9_ses1_task0.8_bold0.8_beta0.5_smooth0.2_gamma1_bold_thr90.npy"
+        ),
+        help="Path to projection vector (.npy or numeric text). Can also be a subject-list .txt.",
+    )
+    parser.add_argument(
+        "--excluded-subjects-path",
+        default=None,
+        help="Optional path to a text file listing subject tags to exclude.",
+    )
     parser.add_argument(
         "--manifest-path",
         default=DEFAULT_MANIFEST_PATH,
@@ -1113,14 +1485,31 @@ def main():
     parser.add_argument("--out-dir", default=None, help="Output directory.")
     args = parser.parse_args()
 
-    projection_path = os.path.abspath(os.path.expanduser(args.projection_path))
+    projection_input_path = os.path.abspath(os.path.expanduser(args.projection_path))
     manifest_path = os.path.abspath(os.path.expanduser(args.manifest_path))
     trial_keep_root = os.path.abspath(os.path.expanduser(args.trial_keep_root))
+    excluded_subjects_path = (
+        None
+        if args.excluded_subjects_path in {None, ""}
+        else os.path.abspath(os.path.expanduser(args.excluded_subjects_path))
+    )
 
-    projection = np.asarray(np.load(projection_path)).ravel()
+    projection, resolved_projection_path, excluded_subjects, exclusion_sources = (
+        _resolve_projection_and_excluded_subjects(
+            projection_input_path,
+            excluded_subjects_path=excluded_subjects_path,
+        )
+    )
     manifest_df = pd.read_csv(manifest_path, sep="\t")
 
-    run_segments, layout = split_projection_by_run(projection, manifest_df, trial_keep_root)
+    run_segments_all, layout = split_projection_by_run(projection, manifest_df, trial_keep_root)
+    run_segments, removed_segment_count, removed_subjects = _exclude_subjects_from_segments(
+        run_segments_all,
+        excluded_subjects=excluded_subjects,
+    )
+    if len(run_segments) == 0:
+        raise RuntimeError("No run segments remaining after exclusions.")
+
     run_variance_df = compute_run_variances(run_segments)
     run_variance_df["variance_projection"] = (
         run_variance_df["variance_projection"].astype(np.float64) * float(VARIANCE_SCALE)
@@ -1129,11 +1518,11 @@ def main():
 
     out_dir = args.out_dir
     if out_dir is None:
-        out_dir = os.path.dirname(projection_path) or os.getcwd()
+        out_dir = os.path.dirname(projection_input_path) or os.getcwd()
     out_dir = os.path.abspath(os.path.expanduser(out_dir))
     os.makedirs(out_dir, exist_ok=True)
 
-    stem = os.path.splitext(os.path.basename(projection_path))[0]
+    stem = os.path.splitext(os.path.basename(projection_input_path))[0]
     variance_csv_path = os.path.join(out_dir, f"{stem}_sub_ses_run_projection_variability.csv")
     std_rms_csv_path = os.path.join(out_dir, f"{stem}_sub_ses_run_projection_std_over_rms.csv")
     stats_csv_path = os.path.join(
@@ -1141,6 +1530,12 @@ def main():
     )
     ks_subject_csv_path = os.path.join(out_dir, f"{stem}_sub_session12_ks_stats.csv")
     ks_group_csv_path = os.path.join(out_dir, f"{stem}_group_session12_ks_inference.csv")
+    pooled_metrics_subject_csv_path = os.path.join(
+        out_dir, f"{stem}_sub_session12_pooled_metrics_stats.csv"
+    )
+    pooled_metrics_group_csv_path = os.path.join(
+        out_dir, f"{stem}_group_session12_pooled_metrics_stats.csv"
+    )
     pooled_cv_subject_csv_path = os.path.join(out_dir, f"{stem}_sub_session12_pooled_cv_stats.csv")
     pooled_cv_group_csv_path = os.path.join(out_dir, f"{stem}_group_session12_pooled_cv_stats.csv")
     variance_plot_path = os.path.join(
@@ -1153,7 +1548,11 @@ def main():
     ks_subject_grid_plot_path = os.path.join(
         out_dir, f"{stem}_sub_session12_ks_subject_distribution_grid_2x7.png"
     )
-    pooled_cv_plot_path = os.path.join(out_dir, f"{stem}_sub_session12_pooled_cv_summary.png")
+    pooled_metric_plot_paths = {
+        spec["key"]: os.path.join(out_dir, f"{stem}_sub_session12_{spec['file_stub']}_summary.png")
+        for spec in POOLED_METRIC_SPECS
+    }
+    pooled_cv_plot_path = pooled_metric_plot_paths["cv_projection"]
 
     pairwise_stats_df = build_projection_variability_stats_table(run_variance_df)
     subject_ks_df = compute_subject_session_ks(
@@ -1164,14 +1563,20 @@ def main():
         alpha=KS_ALPHA,
     )
     group_ks_df = build_group_level_ks_inference(subject_ks_df, alpha=KS_ALPHA)
-    pooled_cv_subject_df = compute_subject_session_pooled_cv(
+    pooled_metrics_subject_df = compute_subject_session_pooled_metrics(
         run_segments,
         session_a=1,
         session_b=2,
         runs=(1, 2),
     )
+    pooled_metrics_group_df = build_group_level_session_metric_stats(
+        pooled_metrics_subject_df,
+        session_a=1,
+        session_b=2,
+    )
+    pooled_cv_subject_df = pooled_metrics_subject_df.copy()
     pooled_cv_group_df = build_group_level_session_cv_stats(
-        pooled_cv_subject_df,
+        pooled_metrics_subject_df,
         session_a=1,
         session_b=2,
     )
@@ -1181,6 +1586,8 @@ def main():
     pairwise_stats_df.to_csv(stats_csv_path, index=False)
     subject_ks_df.to_csv(ks_subject_csv_path, index=False)
     group_ks_df.to_csv(ks_group_csv_path, index=False)
+    pooled_metrics_subject_df.to_csv(pooled_metrics_subject_csv_path, index=False)
+    pooled_metrics_group_df.to_csv(pooled_metrics_group_csv_path, index=False)
     pooled_cv_subject_df.to_csv(pooled_cv_subject_csv_path, index=False)
     pooled_cv_group_df.to_csv(pooled_cv_group_csv_path, index=False)
 
@@ -1215,23 +1622,35 @@ def main():
         n_rows=2,
         n_cols=7,
     )
-    _plot_session_cv_distribution_summary(
-        pooled_cv_subject_df,
-        pooled_cv_group_df,
-        out_path=pooled_cv_plot_path,
-    )
+    for metric_spec in POOLED_METRIC_SPECS:
+        _plot_session_metric_distribution_summary(
+            pooled_metrics_subject_df,
+            pooled_metrics_group_df,
+            metric_spec=metric_spec,
+            out_path=pooled_metric_plot_paths[metric_spec["key"]],
+        )
 
     print(f"Projection length: {projection.size}")
+    print(f"Projection source path: {resolved_projection_path}")
     print(f"Projection layout: {layout}")
+    print(f"Input run segments: {len(run_segments_all)}")
+    print(f"Run segments after exclusions: {len(run_segments)}")
+    print(f"Excluded segments count: {removed_segment_count}")
+    if exclusion_sources:
+        print(f"Exclusion source files: {', '.join(exclusion_sources)}")
+    if removed_subjects:
+        print(f"Excluded subjects present in data: {', '.join(removed_subjects)}")
     print(f"Rows (variance): {len(run_variance_df)}")
     print(f"Rows (std/rms): {len(run_std_rms_df)}")
     print(f"Rows (subject KS): {len(subject_ks_df)}")
-    print(f"Rows (subject pooled CV): {len(pooled_cv_subject_df)}")
+    print(f"Rows (subject pooled metrics): {len(pooled_metrics_subject_df)}")
     print(f"Saved variance CSV: {variance_csv_path}")
     print(f"Saved std/rms CSV:  {std_rms_csv_path}")
     print(f"Saved stats CSV:    {stats_csv_path}")
     print(f"Saved subject KS CSV: {ks_subject_csv_path}")
     print(f"Saved group KS CSV:   {ks_group_csv_path}")
+    print(f"Saved subject pooled metrics CSV: {pooled_metrics_subject_csv_path}")
+    print(f"Saved group pooled metrics CSV:   {pooled_metrics_group_csv_path}")
     print(f"Saved subject pooled CV CSV: {pooled_cv_subject_csv_path}")
     print(f"Saved group pooled CV CSV:   {pooled_cv_group_csv_path}")
     print(f"Saved variability figure: {variance_plot_path}")
@@ -1239,16 +1658,23 @@ def main():
     print(f"Saved KS figure:         {ks_plot_path}")
     print(f"Saved KS 2x7 grid figure:{ks_subject_grid_plot_path}")
     print(f"Saved pooled CV figure:  {pooled_cv_plot_path}")
+    for metric_spec in POOLED_METRIC_SPECS:
+        metric_key = metric_spec["key"]
+        if metric_key == "cv_projection":
+            continue
+        print(
+            f"Saved pooled {metric_spec['label']} figure: {pooled_metric_plot_paths[metric_key]}"
+        )
     print("\nProjection variability pairwise statistics:")
     print(pairwise_stats_df.to_string(index=False))
     print("\nSubject-level KS statistics (session 1 vs session 2, runs 1+2 pooled):")
     print(subject_ks_df.to_string(index=False))
     print("\nGroup-level KS inference:")
     print(group_ks_df.to_string(index=False))
-    print("\nSubject-level pooled CV statistics (session 1 vs session 2, runs 1+2 pooled):")
-    print(pooled_cv_subject_df.to_string(index=False))
-    print("\nGroup-level pooled CV session comparison:")
-    print(pooled_cv_group_df.to_string(index=False))
+    print("\nSubject-level pooled metric statistics (session 1 vs session 2, runs 1+2 pooled):")
+    print(pooled_metrics_subject_df.to_string(index=False))
+    print("\nGroup-level pooled metric session comparison:")
+    print(pooled_metrics_group_df.to_string(index=False))
 
 
 if __name__ == "__main__":

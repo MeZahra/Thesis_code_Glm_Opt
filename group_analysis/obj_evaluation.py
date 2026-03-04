@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Evaluate obj_param ablation runs from SLURM logs with a composite generalization metric.
+"""Evaluate obj_param ablation runs from SLURM logs with a composite objective.
 
-Metric (per fold f and model m):
-    S = w_test_corr * norm(|corr_test|)
-      + w_corr_stability * (1 - norm(| |corr_train| - |corr_test| |))
-      + w_loss_stability * (1 - norm(|loss_test - loss_train| / (|loss_train| + eps)))
-      + w_complexity * complexity_bonus
+Objective (per fold f and model m):
+    S = -w_test_corr * norm(|corr_test|)
+      + w_corr_stability * norm(| |corr_train| - |corr_test| |)
+      + w_loss_stability * norm(|loss_test - loss_train| / (|loss_train| + eps))
 
-where complexity_bonus is based on the number of non-zero penalty coefficients in the model.
+Lower S is better (strong test correlation with smaller train/test gaps).
 """
 
 from __future__ import annotations
@@ -36,6 +35,8 @@ TRAIN_LOSS_RE = re.compile(r"Total loss \(train objective\):\s*(?P<val>[-+0-9.eE
 TEST_LOSS_RE = re.compile(r"Total loss \(test objective\):\s*(?P<val>[-+0-9.eE]+)")
 TRAIN_CORR_RE = re.compile(r"Train metrics -> corr:\s*(?P<val>[-+0-9.eE]+)")
 TEST_CORR_RE = re.compile(r"Test metrics\s+-> corr:\s*(?P<val>[-+0-9.eE]+)")
+
+PINNED_PARAMS = (0.8, 0.8, 0.5, 0.2)
 
 
 @dataclass(frozen=True)
@@ -177,7 +178,6 @@ def _compute_dataframe(
     w_test_corr: float,
     w_corr_stability: float,
     w_loss_stability: float,
-    w_complexity: float,
     eps: float,
 ) -> pd.DataFrame:
     rows = []
@@ -186,9 +186,6 @@ def _compute_dataframe(
         int((rec.combo.task > 0) + (rec.combo.bold > 0) + (rec.combo.beta > 0) + (rec.combo.smooth > 0))
         for rec in records
     ]
-    k_min = int(min(active_counts)) if active_counts else 1
-    k_max = int(max(active_counts)) if active_counts else 1
-    k_denom = float(max(1, k_max - k_min))
 
     for rec, k in zip(records, active_counts):
         abs_train_corr = abs(rec.train_corr)
@@ -196,7 +193,6 @@ def _compute_dataframe(
         corr_gap = abs(abs_train_corr - abs_test_corr)
         loss_gap = abs(rec.test_loss - rec.train_loss)
         loss_gap_rel = loss_gap / (abs(rec.train_loss) + eps)
-        complexity_bonus = (k - k_min) / k_denom
         log_name = Path(rec.log_file).name
         combo_label = rec.combo.label()
         model_id = f"{log_name} | {combo_label}"
@@ -222,7 +218,6 @@ def _compute_dataframe(
                 "corr_gap": corr_gap,
                 "loss_gap": loss_gap,
                 "loss_gap_rel": loss_gap_rel,
-                "complexity_bonus": complexity_bonus,
             }
         )
 
@@ -234,16 +229,18 @@ def _compute_dataframe(
     df["norm_corr_gap"] = _robust_minmax(df["corr_gap"].to_numpy(), low_pct, high_pct)
     df["norm_loss_gap_rel"] = _robust_minmax(df["loss_gap_rel"].to_numpy(), low_pct, high_pct)
 
-    df["score_component_test_corr"] = w_test_corr * df["norm_test_corr"]
-    df["score_component_corr_stability"] = w_corr_stability * (1.0 - df["norm_corr_gap"])
-    df["score_component_loss_stability"] = w_loss_stability * (1.0 - df["norm_loss_gap_rel"])
-    df["score_component_complexity"] = w_complexity * df["complexity_bonus"]
+    df["term_test_corr"] = -df["norm_test_corr"]
+    df["term_corr_stability"] = df["norm_corr_gap"]
+    df["term_loss_stability"] = df["norm_loss_gap_rel"]
+
+    df["score_component_test_corr"] = w_test_corr * df["term_test_corr"]
+    df["score_component_corr_stability"] = w_corr_stability * df["term_corr_stability"]
+    df["score_component_loss_stability"] = w_loss_stability * df["term_loss_stability"]
 
     df["evaluation_score"] = (
         df["score_component_test_corr"]
         + df["score_component_corr_stability"]
         + df["score_component_loss_stability"]
-        + df["score_component_complexity"]
     )
 
     return df
@@ -270,15 +267,41 @@ def _make_summary(df: pd.DataFrame, group_by: str = "log_combo") -> pd.DataFrame
             train_loss_mean=("train_loss", "mean"),
             test_loss_mean=("test_loss", "mean"),
             active_param_count=("active_param_count", "max"),
+            term_test_corr_mean=("term_test_corr", "mean"),
+            term_corr_stability_mean=("term_corr_stability", "mean"),
+            term_loss_stability_mean=("term_loss_stability", "mean"),
             comp_test_corr_mean=("score_component_test_corr", "mean"),
             comp_corr_stability_mean=("score_component_corr_stability", "mean"),
             comp_loss_stability_mean=("score_component_loss_stability", "mean"),
-            comp_complexity_mean=("score_component_complexity", "mean"),
         )
     )
-    grouped["rank"] = grouped["score_mean"].rank(ascending=False, method="dense").astype(int)
-    grouped = grouped.sort_values(["rank", "score_mean"], ascending=[True, False]).reset_index(drop=True)
+    grouped["rank"] = grouped["score_mean"].rank(ascending=True, method="dense").astype(int)
+    grouped = grouped.sort_values(["rank", "score_mean"], ascending=[True, True]).reset_index(drop=True)
     return grouped
+
+
+def _ordered_labels_with_pinned_first(
+    summary: pd.DataFrame,
+    label_col: str,
+) -> List[str]:
+    if summary.empty:
+        return []
+
+    sorted_summary = summary.sort_values(["score_mean", "rank"], ascending=[True, True]).reset_index(drop=True)
+    labels = sorted_summary[label_col].tolist()
+    pinned_mask = (
+        np.isclose(sorted_summary["task"].to_numpy(), PINNED_PARAMS[0])
+        & np.isclose(sorted_summary["bold"].to_numpy(), PINNED_PARAMS[1])
+        & np.isclose(sorted_summary["beta"].to_numpy(), PINNED_PARAMS[2])
+        & np.isclose(sorted_summary["smooth"].to_numpy(), PINNED_PARAMS[3])
+    )
+    if not np.any(pinned_mask):
+        return labels
+
+    pinned_labels = sorted_summary.loc[pinned_mask, label_col].tolist()
+    pinned_label = pinned_labels[0]
+    remaining = [lbl for lbl in labels if lbl != pinned_label]
+    return [pinned_label] + remaining
 
 
 def _plot_results(
@@ -288,16 +311,7 @@ def _plot_results(
     title: str,
     label_col: str = "model_id",
 ) -> pd.DataFrame:
-    combo_order = summary[label_col].tolist()
-    if combo_order:
-        mean_scores = (
-            df.groupby(label_col, as_index=True)["evaluation_score"]
-            .mean()
-            .sort_values(ascending=False)
-        )
-        first_label = combo_order[0]
-        remaining_sorted = [lbl for lbl in mean_scores.index.tolist() if lbl != first_label]
-        combo_order = [first_label] + remaining_sorted
+    combo_order = _ordered_labels_with_pinned_first(summary, label_col=label_col)
 
     summary_ordered = summary.set_index(label_col).reindex(combo_order).reset_index()
     pos_map = {label: idx for idx, label in enumerate(combo_order)}
@@ -435,24 +449,24 @@ def _plot_results(
 
     ax.set_xticks(np.arange(len(combo_order)))
     ax.set_xticklabels(compact_labels)
-    ax.set_ylabel("Evaluation score")
-    ax.set_title("Fold-level score distribution")
+    ax.set_ylabel("Objective S (lower is better)")
+    ax.set_title("Fold-level objective distribution")
     ax.grid(alpha=0.25, axis="y")
 
     # Right panel: mean score components by model
     ax = axes[1]
     x = np.arange(len(combo_order))
-    width = 0.2
+    width = 0.25
     comp_names = [
-        ("comp_test_corr_mean", "Test corr", "#1b9e77"),
-        ("comp_corr_stability_mean", "Corr stability", "#d95f02"),
-        ("comp_loss_stability_mean", "Loss stability", "#7570b3"),
-        ("comp_complexity_mean", "Complexity bonus", "#e7298a"),
+        ("comp_test_corr_mean", "-w_test_corr * norm(|corr_test|)", "#1b9e77"),
+        ("comp_corr_stability_mean", "w_corr_stability * norm(corr gap)", "#d95f02"),
+        ("comp_loss_stability_mean", "w_loss_stability * norm(loss gap rel)", "#7570b3"),
     ]
 
+    center_offset = (len(comp_names) - 1) / 2.0
     for idx, (col, label, color) in enumerate(comp_names):
         ax.bar(
-            x + (idx - 1.5) * width,
+            x + (idx - center_offset) * width,
             summary_ordered[col].to_numpy(),
             width=width,
             label=label,
@@ -460,19 +474,9 @@ def _plot_results(
             alpha=0.9,
         )
 
-    for row_idx, row in summary_ordered.iterrows():
-        ax.text(
-            row_idx,
-            row["score_mean"] + 0.01,
-            f"rank {int(row['rank'])}",
-            ha="center",
-            va="bottom",
-            fontsize=9,
-        )
-
     ax.set_xticks(x)
     ax.set_xticklabels(compact_labels)
-    ax.set_ylabel("Mean weighted component")
+    ax.set_ylabel("Mean weighted term")
     ax.legend(loc="upper right", frameon=True)
     ax.grid(alpha=0.25, axis="y")
 
@@ -481,6 +485,91 @@ def _plot_results(
     fig.savefig(output_png, dpi=300)
     plt.close(fig)
     return pd.DataFrame(stat_rows)
+
+
+def _plot_term_values(
+    summary: pd.DataFrame,
+    output_png: Path,
+    title: str,
+    label_col: str = "model_id",
+    weighted: bool = False,
+) -> None:
+    combo_order = _ordered_labels_with_pinned_first(summary, label_col=label_col)
+    if not combo_order:
+        return
+    summary_ordered = summary.set_index(label_col).reindex(combo_order).reset_index()
+
+    param_keys = list(
+        zip(
+            summary_ordered["task"],
+            summary_ordered["bold"],
+            summary_ordered["beta"],
+            summary_ordered["smooth"],
+            summary_ordered["gamma"],
+        )
+    )
+    totals_per_param: Dict[Tuple[float, float, float, float, float], int] = {}
+    for key in param_keys:
+        totals_per_param[key] = totals_per_param.get(key, 0) + 1
+    seen_per_param: Dict[Tuple[float, float, float, float, float], int] = {}
+    compact_labels: List[str] = []
+    for _, row in summary_ordered.iterrows():
+        key = (row["task"], row["bold"], row["beta"], row["smooth"], row["gamma"])
+        seen_per_param[key] = seen_per_param.get(key, 0) + 1
+        gamma_text = "" if np.isclose(float(row["gamma"]), 1.0) else f"\ng={row['gamma']:g}"
+        label = (
+            f"t={row['task']:g}\n"
+            f"b={row['bold']:g}\n"
+            f"be={row['beta']:g}\n"
+            f"s={row['smooth']:g}"
+            f"{gamma_text}"
+        )
+        if totals_per_param[key] > 1:
+            label = f"{label}\nrun {seen_per_param[key]}"
+        compact_labels.append(label)
+
+    if weighted:
+        comp_names = [
+            ("comp_test_corr_mean", "-w_test_corr * norm(|corr_test|)", "#1b9e77"),
+            ("comp_corr_stability_mean", "w_corr_stability * norm(corr gap)", "#d95f02"),
+            ("comp_loss_stability_mean", "w_loss_stability * norm(loss gap rel)", "#7570b3"),
+        ]
+        ylabel = "Mean weighted term value"
+    else:
+        comp_names = [
+            ("term_test_corr_mean", "-norm(|corr_test|)", "#1b9e77"),
+            ("term_corr_stability_mean", "norm(corr gap)", "#d95f02"),
+            ("term_loss_stability_mean", "norm(loss gap rel)", "#7570b3"),
+        ]
+        ylabel = "Mean unweighted term value"
+
+    x = np.arange(len(combo_order))
+    width = 0.25
+    center_offset = (len(comp_names) - 1) / 2.0
+    fig, ax = plt.subplots(1, 1, figsize=(14, 7))
+
+    for idx, (col, label, color) in enumerate(comp_names):
+        ax.bar(
+            x + (idx - center_offset) * width,
+            summary_ordered[col].to_numpy(),
+            width=width,
+            label=label,
+            color=color,
+            alpha=0.9,
+        )
+
+    ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(compact_labels)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend(loc="upper right", frameon=True)
+    ax.grid(alpha=0.25, axis="y")
+
+    fig.subplots_adjust(left=0.06, right=0.98, bottom=0.28, top=0.90)
+    output_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_png, dpi=300)
+    plt.close(fig)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -502,7 +591,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--w-test-corr", type=float, default=0.40)
     parser.add_argument("--w-corr-stability", type=float, default=0.20)
     parser.add_argument("--w-loss-stability", type=float, default=0.30)
-    parser.add_argument("--w-complexity", type=float, default=0.10)
 
     parser.add_argument("--eps", type=float, default=1e-6)
     parser.add_argument(
@@ -522,7 +610,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
 
-    weight_sum = args.w_test_corr + args.w_corr_stability + args.w_loss_stability + args.w_complexity
+    weight_sum = args.w_test_corr + args.w_corr_stability + args.w_loss_stability
     if not np.isfinite(weight_sum) or weight_sum <= 0:
         raise ValueError("Score weights must have a positive finite sum.")
 
@@ -550,7 +638,6 @@ def main() -> None:
         w_test_corr=args.w_test_corr,
         w_corr_stability=args.w_corr_stability,
         w_loss_stability=args.w_loss_stability,
-        w_complexity=args.w_complexity,
         eps=args.eps,
     )
     summary = _make_summary(df, group_by=args.group_by)
@@ -563,6 +650,8 @@ def main() -> None:
     summary_csv = out_dir / "obj_evaluation_model_summary.csv"
     summary_combo_csv = out_dir / "obj_evaluation_model_summary_combined_by_combo.csv"
     fig_png = out_dir / "obj_evaluation_metric_comparison.png"
+    terms_raw_png = out_dir / "obj_evaluation_terms_unweighted.png"
+    terms_weighted_png = out_dir / "obj_evaluation_terms_weighted.png"
 
     df.sort_values(["log_name", "combo_label", "fold"]).to_csv(fold_csv, index=False)
     summary.to_csv(summary_csv, index=False)
@@ -572,8 +661,22 @@ def main() -> None:
     stats_csv = out_dir / "obj_evaluation_first_vs_others_stats.csv"
     stats_df = _plot_results(df, summary, fig_png, args.title, label_col=label_col)
     stats_df.to_csv(stats_csv, index=False)
+    _plot_term_values(
+        summary,
+        terms_raw_png,
+        "Mean S terms by model (without coefficients w)",
+        label_col=label_col,
+        weighted=False,
+    )
+    _plot_term_values(
+        summary,
+        terms_weighted_png,
+        "Mean S terms by model (with coefficients w)",
+        label_col=label_col,
+        weighted=True,
+    )
 
-    print("\nTop models by score:")
+    print("\nTop models by objective S (lower is better):")
     show_cols = [
         "rank",
         "model_id" if args.group_by == "log_combo" else "combo_label",
@@ -592,6 +695,8 @@ def main() -> None:
     print(f"  combo summary:      {summary_combo_csv}")
     print(f"  stat tests:         {stats_csv}")
     print(f"  figure:             {fig_png}")
+    print(f"  terms (raw):        {terms_raw_png}")
+    print(f"  terms (weighted):   {terms_weighted_png}")
 
 
 if __name__ == "__main__":
