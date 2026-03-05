@@ -218,6 +218,40 @@ def _parse_args() -> argparse.Namespace:
         help="Time-axis smoothing sigma for wavelet coherence.",
     )
     parser.add_argument(
+        "--respect-temporal-boundaries",
+        action="store_true",
+        help=(
+            "Forwarded to advanced metric runner: compute temporal metrics per manifest run-segment "
+            "and aggregate across runs. Disabled by default to preserve legacy outputs."
+        ),
+    )
+    parser.add_argument(
+        "--temporal-manifest-path",
+        type=Path,
+        default=Path("results/connectivity/tmp/concat_manifest_group.tsv"),
+        help="Manifest TSV path used for temporal segmentation when enabled.",
+    )
+    parser.add_argument(
+        "--temporal-condition-indices-path",
+        type=Path,
+        default=Path("results/connectivity/data/selected_beta_trials_gvs_column_indices.npz"),
+        help="Condition column-index NPZ used for temporal segmentation when enabled.",
+    )
+    parser.add_argument(
+        "--temporal-metrics",
+        default="linear_granger,nonlinear_granger",
+        help=(
+            "Comma-separated metrics to segment temporally when --respect-temporal-boundaries is enabled. "
+            "Use 'none' to disable."
+        ),
+    )
+    parser.add_argument(
+        "--temporal-min-trials",
+        type=int,
+        default=8,
+        help="Minimum trials required per run-segment for temporal metric estimation.",
+    )
+    parser.add_argument(
         "--exclude-rois",
         nargs="+",
         default=[],

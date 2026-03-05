@@ -121,6 +121,46 @@ def _parse_args() -> argparse.Namespace:
         help="Skip interactive HTML connectome output for advanced metrics.",
     )
     parser.add_argument(
+        "--respect-temporal-boundaries",
+        action="store_true",
+        help=(
+            "For temporal metrics, compute per-run matrices using manifest-defined run boundaries "
+            "and aggregate across runs. Disabled by default to preserve legacy behavior."
+        ),
+    )
+    parser.add_argument(
+        "--temporal-manifest-path",
+        type=Path,
+        default=Path("results/connectivity/tmp/concat_manifest_group.tsv"),
+        help="Run-boundary manifest TSV used when --respect-temporal-boundaries is enabled.",
+    )
+    parser.add_argument(
+        "--temporal-condition-indices-path",
+        type=Path,
+        default=Path("results/connectivity/data/selected_beta_trials_gvs_column_indices.npz"),
+        help=(
+            "NPZ with per-condition column indices into selected_beta_trials.npy "
+            "used for run-wise temporal segmentation."
+        ),
+    )
+    parser.add_argument(
+        "--temporal-metrics",
+        default="linear_granger,nonlinear_granger",
+        help=(
+            "Comma-separated metrics to compute with temporal segmentation when "
+            "--respect-temporal-boundaries is enabled. Use 'none' to disable."
+        ),
+    )
+    parser.add_argument(
+        "--temporal-min-trials",
+        type=int,
+        default=8,
+        help=(
+            "Minimum trials required in a run-segment for segmented temporal metric computation. "
+            "Segments below this are skipped."
+        ),
+    )
+    parser.add_argument(
         "--exclude-rois",
         nargs="+",
         default=[],
@@ -271,6 +311,18 @@ def _plot_metric_connectome(
     conn_plot = np.nan_to_num(conn_plot, nan=0.0, posinf=0.0, neginf=0.0)
     np.fill_diagonal(conn_plot, 0.0)
     edge_threshold = f"{float(np.clip(edge_threshold_percentile, 0.0, 100.0)):.1f}%"
+    offdiag = np.abs(conn_plot[~np.eye(conn_plot.shape[0], dtype=bool)])
+    offdiag = offdiag[np.isfinite(offdiag)]
+    if offdiag.size == 0:
+        has_visible_edges = False
+    else:
+        thr_val = float(
+            np.percentile(
+                offdiag,
+                float(np.clip(edge_threshold_percentile, 0.0, 100.0)),
+            )
+        )
+        has_visible_edges = bool(np.any(offdiag > max(thr_val, 0.0)))
 
     plotting.plot_connectome(
         conn_plot,
@@ -283,7 +335,7 @@ def _plot_metric_connectome(
         edge_threshold=edge_threshold,
         edge_kwargs={"linewidth": float(edge_linewidth), "alpha": 0.85},
         node_kwargs={"alpha": 0.95},
-        colorbar=True,
+        colorbar=has_visible_edges,
         title=title,
         output_file=str(out_png),
     )
@@ -297,7 +349,7 @@ def _plot_metric_connectome(
             edge_cmap=str(cmap),
             symmetric_cmap=False,
             linewidth=max(1.5, float(edge_linewidth) * 1.8),
-            colorbar=True,
+            colorbar=has_visible_edges,
             node_size=max(3.0, float(node_size) / 16.0),
             title=title,
         )
@@ -305,7 +357,12 @@ def _plot_metric_connectome(
         html_path = str(out_html)
 
     out_png.with_suffix(".labels.txt").write_text("\n".join(node_labels), encoding="utf-8")
-    return {"matrix_for_connectome": mode, "edge_threshold": edge_threshold, "connectome_html": html_path}
+    return {
+        "matrix_for_connectome": mode,
+        "edge_threshold": edge_threshold,
+        "connectome_has_visible_edges": bool(has_visible_edges),
+        "connectome_html": html_path,
+    }
 
 
 def _resolve_labels(network_dir: Path, requested: str, summary: dict) -> list[str]:
@@ -361,6 +418,209 @@ def _metric_kwargs(metric_name: str, args: argparse.Namespace) -> dict:
     return {}
 
 
+def _parse_temporal_metric_set(metric_arg: str | list[str] | None) -> set[str]:
+    default = {"linear_granger", "nonlinear_granger", "kernel_granger"}
+    if metric_arg is None:
+        return default
+
+    if isinstance(metric_arg, (list, tuple)):
+        requested = [str(v).strip() for v in metric_arg if str(v).strip()]
+    else:
+        text = str(metric_arg).strip()
+        if not text:
+            return default
+        lowered = text.lower()
+        if lowered in {"none", "off", "false", "0"}:
+            return set()
+        if lowered == "all":
+            return set(METRIC_REGISTRY.keys())
+        requested = [item.strip() for item in text.split(",") if item.strip()]
+
+    unknown = [name for name in requested if name not in METRIC_REGISTRY]
+    if unknown:
+        valid = ", ".join(sorted(METRIC_REGISTRY.keys()))
+        raise ValueError(f"Unknown temporal metrics: {unknown}. Valid values include: {valid}")
+    return set(requested)
+
+
+def _load_temporal_manifest(manifest_path: Path) -> pd.DataFrame:
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Temporal manifest not found: {manifest_path}")
+
+    manifest_df = pd.read_csv(manifest_path, sep="\t")
+    required_cols = {"offset_start", "offset_end", "sub_tag", "ses", "run"}
+    missing = required_cols - set(manifest_df.columns)
+    if missing:
+        raise ValueError(
+            f"Temporal manifest missing required columns {sorted(missing)}: {manifest_path}"
+        )
+
+    manifest_df = manifest_df.sort_values("offset_start").reset_index(drop=True)
+    starts = pd.to_numeric(manifest_df["offset_start"], errors="raise").to_numpy(dtype=np.int64)
+    ends = pd.to_numeric(manifest_df["offset_end"], errors="raise").to_numpy(dtype=np.int64)
+
+    if np.any(starts < 0) or np.any(ends < starts):
+        raise ValueError(f"Temporal manifest contains invalid trial offsets: {manifest_path}")
+    if starts.size > 1 and np.any(starts[1:] < ends[:-1]):
+        raise ValueError(f"Temporal manifest has overlapping run segments: {manifest_path}")
+
+    return manifest_df
+
+
+def _load_condition_index_map(index_path: Path) -> dict[str, np.ndarray]:
+    if not index_path.exists():
+        raise FileNotFoundError(f"Condition-index NPZ not found: {index_path}")
+
+    pack = np.load(index_path)
+    mapping: dict[str, np.ndarray] = {}
+    for key in pack.files:
+        cols = np.asarray(pack[key], dtype=np.int64).ravel()
+        if cols.size > 1 and np.any(cols[1:] < cols[:-1]):
+            cols = np.sort(cols)
+        mapping[str(key)] = cols
+
+    if not mapping:
+        raise ValueError(f"Condition-index NPZ has no arrays: {index_path}")
+    return mapping
+
+
+def _resolve_condition_columns(
+    condition_index_map: dict[str, np.ndarray], label: str
+) -> np.ndarray | None:
+    if label in condition_index_map:
+        return condition_index_map[label]
+    label_lower = str(label).strip().lower()
+    for key, values in condition_index_map.items():
+        if str(key).strip().lower() == label_lower:
+            return values
+    return None
+
+
+def _build_condition_segments(
+    manifest_df: pd.DataFrame,
+    condition_cols_global: np.ndarray,
+    n_local_trials: int,
+) -> list[dict]:
+    cols = np.asarray(condition_cols_global, dtype=np.int64).ravel()
+    if cols.size != int(n_local_trials):
+        raise ValueError(
+            f"Condition trial count mismatch between roi_ts ({n_local_trials}) and index map ({cols.size})."
+        )
+    if cols.size > 1 and np.any(cols[1:] < cols[:-1]):
+        raise ValueError("Condition global column indices must be sorted in ascending order.")
+
+    segments: list[dict] = []
+    assigned = 0
+    for row in manifest_df.itertuples(index=False):
+        start = int(row.offset_start)
+        end = int(row.offset_end)
+        if end <= start:
+            continue
+
+        left = int(np.searchsorted(cols, start, side="left"))
+        right = int(np.searchsorted(cols, end, side="left"))
+        if right <= left:
+            continue
+
+        seg_cols = cols[left:right]
+        if int(seg_cols[0]) < start or int(seg_cols[-1]) >= end:
+            raise ValueError(
+                f"Condition columns spill outside manifest run range [{start}, {end})."
+            )
+
+        local_idx = np.arange(left, right, dtype=np.int64)
+        segments.append(
+            {
+                "sub_tag": str(row.sub_tag),
+                "ses": int(row.ses),
+                "run": int(row.run),
+                "offset_start": start,
+                "offset_end": end,
+                "local_idx": local_idx,
+            }
+        )
+        assigned += int(local_idx.size)
+
+    if assigned != int(cols.size):
+        raise ValueError(
+            f"Condition columns were not fully covered by manifest runs ({assigned}/{cols.size})."
+        )
+
+    return segments
+
+
+def _aggregate_temporal_metric_over_segments(
+    metric_name: str,
+    metric_fn,
+    roi_ts: np.ndarray,
+    kwargs: dict,
+    segments: list[dict],
+    min_trials: int,
+) -> tuple[dict | None, dict]:
+    lag = int(max(1, kwargs.get("max_lag", 1)))
+    min_required = int(max(1, min_trials, lag + 5))
+
+    matrices: list[np.ndarray] = []
+    weights: list[float] = []
+    template_result: dict | None = None
+    skipped_short = 0
+
+    n_nodes = int(roi_ts.shape[0])
+    for segment in segments:
+        local_idx = np.asarray(segment["local_idx"], dtype=np.int64)
+        seg_len = int(local_idx.size)
+        if seg_len < min_required:
+            skipped_short += 1
+            continue
+
+        seg_ts = roi_ts[:, local_idx]
+        seg_result = metric_fn(seg_ts, **kwargs)
+        seg_matrix = np.asarray(seg_result.get("matrix"), dtype=np.float64)
+        if seg_matrix.shape != (n_nodes, n_nodes):
+            raise ValueError(
+                f"{metric_name} segment matrix shape {seg_matrix.shape} != {(n_nodes, n_nodes)}"
+            )
+        matrices.append(seg_matrix)
+        weights.append(float(max(seg_len - lag, 1)))
+        if template_result is None:
+            template_result = dict(seg_result)
+
+    info = {
+        "enabled": True,
+        "metric": str(metric_name),
+        "n_segments_total": int(len(segments)),
+        "n_segments_used": int(len(matrices)),
+        "n_segments_skipped_short": int(skipped_short),
+        "min_trials_per_segment": int(min_required),
+        "weighting": "n_trials_minus_max_lag",
+    }
+
+    if not matrices or template_result is None:
+        return None, info
+
+    stacked = np.stack(matrices, axis=0)
+    weight_array = np.asarray(weights, dtype=np.float64)
+    aggregated = np.average(stacked, axis=0, weights=weight_array)
+    template_result["matrix"] = aggregated
+
+    finite = aggregated[np.isfinite(aggregated)]
+    if finite.size:
+        vmin = float(np.min(finite))
+        vmax = float(np.max(finite))
+    else:
+        vmin, vmax = 0.0, 1e-3
+    if not np.isfinite(vmax) or vmax <= vmin:
+        vmax = float(vmin + 1e-3)
+    template_result["vmin"] = vmin
+    template_result["vmax"] = vmax
+    template_result["temporal_aggregation"] = {
+        **info,
+        "total_weight": float(np.sum(weight_array)),
+    }
+
+    return template_result, info
+
+
 def run_metric_pipeline(
     network_dir: Path,
     out_subdir: str,
@@ -385,6 +645,38 @@ def run_metric_pipeline(
     node_labels_from_summary = summary.get("roi_labels")
     node_coords_mm, node_labels_from_nodes = _load_node_geometry(network_dir)
     exclude_patterns = _build_exclude_patterns(getattr(args, "exclude_rois", []))
+    respect_temporal_boundaries = bool(getattr(args, "respect_temporal_boundaries", False))
+    temporal_metric_set = _parse_temporal_metric_set(getattr(args, "temporal_metrics", None))
+    temporal_min_trials = int(max(1, int(getattr(args, "temporal_min_trials", 8))))
+
+    temporal_manifest_df: pd.DataFrame | None = None
+    condition_index_map: dict[str, np.ndarray] | None = None
+    temporal_ready = False
+    temporal_manifest_path = None
+    temporal_index_path = None
+    temporal_load_error = ""
+
+    if respect_temporal_boundaries and temporal_metric_set:
+        temporal_manifest_path = Path(getattr(args, "temporal_manifest_path", "")).expanduser().resolve()
+        temporal_index_path = Path(
+            getattr(args, "temporal_condition_indices_path", "")
+        ).expanduser().resolve()
+        try:
+            temporal_manifest_df = _load_temporal_manifest(temporal_manifest_path)
+            condition_index_map = _load_condition_index_map(temporal_index_path)
+            temporal_ready = True
+            print(
+                "Temporal boundary mode enabled: "
+                f"manifest={temporal_manifest_path}, condition_indices={temporal_index_path}",
+                flush=True,
+            )
+        except Exception as exc:
+            temporal_load_error = str(exc)
+            print(
+                f"Warning: temporal boundary mode requested but unavailable ({exc}). "
+                "Falling back to legacy whole-series metric computation.",
+                flush=True,
+            )
 
     for label in selected_labels:
         ts_path = network_dir / label / f"roi_timeseries_{label}.npy"
@@ -436,6 +728,32 @@ def run_metric_pipeline(
             )
 
         n_nodes = int(roi_ts.shape[0])
+        temporal_segments: list[dict] | None = None
+        temporal_segment_error = ""
+        if temporal_ready and temporal_manifest_df is not None and condition_index_map is not None:
+            try:
+                condition_cols = _resolve_condition_columns(condition_index_map, label)
+                if condition_cols is None:
+                    raise KeyError(
+                        f"Condition label {label!r} not found in {temporal_index_path}"
+                    )
+                temporal_segments = _build_condition_segments(
+                    temporal_manifest_df,
+                    condition_cols_global=condition_cols,
+                    n_local_trials=int(roi_ts.shape[1]),
+                )
+                print(
+                    f"Temporal segments for label={label}: {len(temporal_segments)}",
+                    flush=True,
+                )
+            except Exception as exc:
+                temporal_segment_error = str(exc)
+                temporal_segments = None
+                print(
+                    f"Warning: temporal segmentation unavailable for label={label} ({exc}). "
+                    "Using legacy whole-series computation for this label.",
+                    flush=True,
+                )
 
         cond_out = out_root / label
         cond_out.mkdir(parents=True, exist_ok=True)
@@ -443,7 +761,59 @@ def run_metric_pipeline(
         for metric_name in selected_metrics:
             metric_fn = METRIC_REGISTRY[metric_name]
             kwargs = _metric_kwargs(metric_name, args)
-            result = metric_fn(roi_ts, **kwargs)
+            if (
+                temporal_ready
+                and metric_name in temporal_metric_set
+                and temporal_segments is not None
+            ):
+                result, temporal_info = _aggregate_temporal_metric_over_segments(
+                    metric_name=metric_name,
+                    metric_fn=metric_fn,
+                    roi_ts=roi_ts,
+                    kwargs=kwargs,
+                    segments=temporal_segments,
+                    min_trials=temporal_min_trials,
+                )
+                if result is None:
+                    result = metric_fn(roi_ts, **kwargs)
+                    result["temporal_aggregation"] = {
+                        **temporal_info,
+                        "enabled": False,
+                        "fallback": "legacy_whole_series",
+                    }
+                    print(
+                        f"Temporal aggregation for metric={metric_name} label={label} "
+                        "had no usable segments; used legacy whole-series computation.",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"Temporally aggregated metric={metric_name} label={label}: "
+                        f"used {temporal_info['n_segments_used']}/{temporal_info['n_segments_total']} segments.",
+                        flush=True,
+                    )
+            else:
+                result = metric_fn(roi_ts, **kwargs)
+                if (
+                    respect_temporal_boundaries
+                    and metric_name in temporal_metric_set
+                    and not temporal_ready
+                ):
+                    result["temporal_aggregation"] = {
+                        "enabled": False,
+                        "fallback": "legacy_whole_series",
+                        "reason": temporal_load_error or "temporal mode not available",
+                    }
+                elif (
+                    temporal_ready
+                    and metric_name in temporal_metric_set
+                    and temporal_segments is None
+                ):
+                    result["temporal_aggregation"] = {
+                        "enabled": False,
+                        "fallback": "legacy_whole_series",
+                        "reason": temporal_segment_error or "temporal segmentation unavailable for label",
+                    }
 
             matrix = np.asarray(result.get("matrix"), dtype=np.float64)
             if matrix.shape != (n_nodes, n_nodes):
@@ -557,6 +927,15 @@ def run_metric_pipeline(
         "selected_labels": selected_labels,
         "selected_metrics": selected_metrics,
         "excluded_roi_patterns": exclude_patterns,
+        "temporal_boundary_mode": {
+            "requested": bool(respect_temporal_boundaries),
+            "active": bool(temporal_ready),
+            "temporal_metrics": sorted(temporal_metric_set),
+            "temporal_min_trials": int(temporal_min_trials),
+            "manifest_path": str(temporal_manifest_path) if temporal_manifest_path is not None else "",
+            "condition_indices_path": str(temporal_index_path) if temporal_index_path is not None else "",
+            "load_error": str(temporal_load_error) if temporal_load_error else "",
+        },
         "n_outputs": int(summary_df.shape[0]),
     }
     (out_root / "run_manifest.json").write_text(
