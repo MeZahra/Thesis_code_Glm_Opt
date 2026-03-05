@@ -439,13 +439,6 @@ def _add_relative_rois(
             ["cerebral white matter"],
             None,
         ),
-        (
-            "Ventricular CSF (relative)",
-            "Harvard-Oxford Subcortical (thr25, 2mm)",
-            "sub",
-            ["lateral ventricle"],
-            None,
-        ),
     ]
 
     for roi_name, source, atlas_kind, include, exclude in candidates:

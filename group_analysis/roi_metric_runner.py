@@ -19,6 +19,12 @@ from nilearn import plotting
 
 from roi_metrics import METRIC_REGISTRY, normalize_metric_list
 
+ALWAYS_EXCLUDED_ROI_PATTERNS = (
+    "ventricular csf",
+    "ventrical csf",
+    "lateral ventricle",
+)
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -114,6 +120,16 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip interactive HTML connectome output for advanced metrics.",
     )
+    parser.add_argument(
+        "--exclude-rois",
+        nargs="+",
+        default=[],
+        metavar="NAME",
+        help=(
+            "Extra ROI names (or substrings) to exclude from metric computation (case-insensitive). "
+            "Ventricular CSF is always excluded."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -137,6 +153,16 @@ def _json_safe(obj: Any) -> Any:
 
 def _auto_labels(n_nodes: int) -> list[str]:
     return [f"Node_{idx:03d}" for idx in range(1, n_nodes + 1)]
+
+
+def _build_exclude_patterns(extra: list[str] | None) -> list[str]:
+    return sorted(
+        {
+            str(v).strip().lower()
+            for v in [*ALWAYS_EXCLUDED_ROI_PATTERNS, *((extra or []))]
+            if str(v).strip()
+        }
+    )
 
 
 def _plot_metric_heatmap(
@@ -358,6 +384,7 @@ def run_metric_pipeline(
     summary_rows: list[dict] = []
     node_labels_from_summary = summary.get("roi_labels")
     node_coords_mm, node_labels_from_nodes = _load_node_geometry(network_dir)
+    exclude_patterns = _build_exclude_patterns(getattr(args, "exclude_rois", []))
 
     for label in selected_labels:
         ts_path = network_dir / label / f"roi_timeseries_{label}.npy"
@@ -370,18 +397,45 @@ def run_metric_pipeline(
             print(f"Skipping label={label}: ROI time series is not 2D ({roi_ts.shape})", flush=True)
             continue
 
-        n_nodes = int(roi_ts.shape[0])
+        n_nodes_raw = int(roi_ts.shape[0])
         if (
             isinstance(node_labels_from_nodes, list)
             and node_coords_mm is not None
-            and len(node_labels_from_nodes) == n_nodes
-            and int(node_coords_mm.shape[0]) == n_nodes
+            and len(node_labels_from_nodes) == n_nodes_raw
+            and int(node_coords_mm.shape[0]) == n_nodes_raw
         ):
             node_labels = [str(v) for v in node_labels_from_nodes]
-        elif isinstance(node_labels_from_summary, list) and len(node_labels_from_summary) == n_nodes:
+        elif isinstance(node_labels_from_summary, list) and len(node_labels_from_summary) == n_nodes_raw:
             node_labels = [str(v) for v in node_labels_from_summary]
         else:
-            node_labels = _auto_labels(n_nodes)
+            node_labels = _auto_labels(n_nodes_raw)
+
+        coords_for_label = None
+        if node_coords_mm is not None and int(node_coords_mm.shape[0]) == n_nodes_raw:
+            coords_for_label = node_coords_mm
+
+        keep = np.asarray(
+            [not any(pattern in str(node).lower() for pattern in exclude_patterns) for node in node_labels],
+            dtype=bool,
+        )
+        if not np.all(keep):
+            dropped = int(np.count_nonzero(~keep))
+            if dropped >= len(node_labels):
+                print(
+                    f"Skipping label={label}: all ROI nodes excluded by patterns {exclude_patterns}.",
+                    flush=True,
+                )
+                continue
+            roi_ts = roi_ts[keep, :]
+            node_labels = [node for node, ok in zip(node_labels, keep.tolist()) if ok]
+            if coords_for_label is not None:
+                coords_for_label = coords_for_label[keep]
+            print(
+                f"Filtered label={label}: removed {dropped} excluded ROI node(s).",
+                flush=True,
+            )
+
+        n_nodes = int(roi_ts.shape[0])
 
         cond_out = out_root / label
         cond_out.mkdir(parents=True, exist_ok=True)
@@ -428,10 +482,10 @@ def run_metric_pipeline(
             )
 
             connectome_meta = None
-            if node_coords_mm is not None and int(node_coords_mm.shape[0]) == n_nodes:
+            if coords_for_label is not None and int(coords_for_label.shape[0]) == n_nodes:
                 connectome_meta = _plot_metric_connectome(
                     matrix=matrix,
-                    node_coords_mm=node_coords_mm,
+                    node_coords_mm=coords_for_label,
                     node_labels=node_labels,
                     out_png=metric_out / f"{metric_name}_connectome.png",
                     out_html=None
@@ -502,6 +556,7 @@ def run_metric_pipeline(
         "out_root": str(out_root),
         "selected_labels": selected_labels,
         "selected_metrics": selected_metrics,
+        "excluded_roi_patterns": exclude_patterns,
         "n_outputs": int(summary_df.shape[0]),
     }
     (out_root / "run_manifest.json").write_text(

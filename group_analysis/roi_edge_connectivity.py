@@ -18,6 +18,12 @@ import numpy as np
 import pandas as pd
 from nilearn import plotting
 
+ALWAYS_EXCLUDED_ROI_PATTERNS = (
+    "ventricular csf",
+    "ventrical csf",
+    "lateral ventricle",
+)
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -210,6 +216,16 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=2.0,
         help="Time-axis smoothing sigma for wavelet coherence.",
+    )
+    parser.add_argument(
+        "--exclude-rois",
+        nargs="+",
+        default=[],
+        metavar="NAME",
+        help=(
+            "Extra ROI names (or substrings) to exclude from node building (case-insensitive). "
+            "Ventricular CSF is always excluded."
+        ),
     )
     return parser.parse_args()
 
@@ -420,9 +436,20 @@ def main() -> None:
     node_base_roi_ids: List[int] = []
     node_hemisphere: List[str] = []
 
+    exclude_lower = sorted(
+        {
+            str(e).strip().lower()
+            for e in [*ALWAYS_EXCLUDED_ROI_PATTERNS, *list(args.exclude_rois)]
+            if str(e).strip()
+        }
+    )
+
     for roi_id in kept_roi_ids.tolist():
         base_members = np.flatnonzero(roi_labels_at_selected == roi_id).astype(np.int64, copy=False)
         roi_name = roi_names_lookup.get(int(roi_id), f"ROI_{int(roi_id)}")
+
+        if exclude_lower and any(ex in roi_name.lower() for ex in exclude_lower):
+            continue
 
         if args.split_hemispheres:
             roi_x = selected_x[base_members]
@@ -618,6 +645,7 @@ def main() -> None:
         "node_size": float(args.node_size),
         "edge_linewidth": float(args.edge_linewidth),
         "edge_threshold_percentile": float(args.edge_threshold_percentile),
+        "excluded_roi_patterns": exclude_lower,
         "n_files_processed": int(len(connectivity_vec_labels)),
         "file_labels": connectivity_vec_labels,
         "n_rois": n_rois,

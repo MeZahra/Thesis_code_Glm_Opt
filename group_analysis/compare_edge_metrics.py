@@ -47,6 +47,7 @@ METRIC_LABELS = {
 }
 
 PALETTE = plt.cm.get_cmap("tab10")
+ALWAYS_EXCLUDED_ROI_PATTERNS = ("ventricular csf", "ventrical csf", "lateral ventricle")
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
@@ -60,6 +61,14 @@ def load_labels(metric):
     p = os.path.join(BASE, CONDITIONS[0], metric,
                      f"{metric}_connectome.labels.txt")
     return open(p).read().strip().split("\n")
+
+
+def keep_node_mask(labels):
+    labels_lower = [str(v).strip().lower() for v in labels]
+    return np.asarray(
+        [not any(pattern in label for pattern in ALWAYS_EXCLUDED_ROI_PATTERNS) for label in labels_lower],
+        dtype=bool,
+    )
 
 
 def is_directed(metric):
@@ -106,11 +115,21 @@ DIRECTED = {} # DIRECTED[metric] = bool
 
 for metric in METRICS:
     DIRECTED[metric] = is_directed(metric)
-    LABELS[metric]   = load_labels(metric)
+    labels_raw = load_labels(metric)
+    keep_mask = keep_node_mask(labels_raw)
+    LABELS[metric] = [label for label, keep in zip(labels_raw, keep_mask.tolist()) if keep]
     DATA[metric]     = {}
     for cond in CONDITIONS:
         try:
-            DATA[metric][cond] = load_matrix(cond, metric)
+            mat = load_matrix(cond, metric)
+            if mat.shape[0] == keep_mask.size and mat.shape[1] == keep_mask.size:
+                mat = mat[np.ix_(keep_mask, keep_mask)]
+            elif mat.shape[0] != len(LABELS[metric]) or mat.shape[1] != len(LABELS[metric]):
+                raise ValueError(
+                    f"Unexpected matrix shape for {cond}/{metric}: {mat.shape}, "
+                    f"expected {(keep_mask.size, keep_mask.size)} or {(len(LABELS[metric]), len(LABELS[metric]))}"
+                )
+            DATA[metric][cond] = mat
         except FileNotFoundError:
             print(f"  MISSING: {cond}/{metric}")
 

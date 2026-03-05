@@ -25,6 +25,15 @@ os.makedirs(IND, exist_ok=True)
 
 CONDITIONS = ["sham", "GVS1", "GVS2", "GVS3", "GVS4", "GVS5", "GVS6", "GVS7", "GVS8"]
 GVS_CONDS  = [c for c in CONDITIONS if c != "sham"]
+ALWAYS_EXCLUDED_ROI_PATTERNS = ("ventricular csf", "ventrical csf", "lateral ventricle")
+
+
+def keep_node_mask(labels):
+    labels_lower = [str(v).strip().lower() for v in labels]
+    return np.asarray(
+        [not any(pattern in label for pattern in ALWAYS_EXCLUDED_ROI_PATTERNS) for label in labels_lower],
+        dtype=bool,
+    )
 
 # ── Load data ──────────────────────────────────────────────────────────────────
 print("Loading matrices …")
@@ -33,6 +42,17 @@ for cond in CONDITIONS:
     DATA[cond] = np.load(f"{BASE}/{cond}/{METRIC}/{METRIC}.npy")
 
 LABELS = open(f"{BASE}/{CONDITIONS[0]}/{METRIC}/{METRIC}_connectome.labels.txt").read().strip().split("\n")
+KEEP = keep_node_mask(LABELS)
+LABELS = [label for label, keep in zip(LABELS, KEEP.tolist()) if keep]
+for cond in CONDITIONS:
+    mat = DATA[cond]
+    if mat.shape[0] == KEEP.size and mat.shape[1] == KEEP.size:
+        DATA[cond] = mat[np.ix_(KEEP, KEEP)]
+    elif mat.shape[0] != len(LABELS) or mat.shape[1] != len(LABELS):
+        raise ValueError(
+            f"Unexpected matrix shape for {cond}/{METRIC}: {mat.shape}, "
+            f"expected {(KEEP.size, KEEP.size)} or {(len(LABELS), len(LABELS))}"
+        )
 N = len(LABELS)
 
 # Directed metric — use full off-diagonal
