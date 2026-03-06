@@ -18,9 +18,11 @@ Outputs:
 11) Subject distribution grid figure (2x7): session 1 vs 2 projected-signal densities.
 12) Pooled-trial CV paired box plot with subject-wise lines (session 1 vs 2).
 13) Consecutive-trial scatter plots for all paired subjects (left=session 1, right=session 2).
+14) Per-subject pooled-trial normalized RMSSD (J) CSV and bar plot (session 1 vs 2).
 """
 
 import argparse
+import hashlib
 import os
 import re
 
@@ -45,6 +47,9 @@ from motor_brain_com import (
 VARIANCE_SCALE = 1e7
 PAIRWISE_ALPHA = 0.05
 KS_ALPHA = 0.05
+J_BOOTSTRAP_ALPHA = 0.05
+J_BOOTSTRAP_SAMPLES = 2000
+J_BOOTSTRAP_BLOCK_LENGTH = 8
 
 POOLED_METRIC_SPECS = [
     {
@@ -260,6 +265,82 @@ def _std_centered_over_range(values):
     return float(np.std(centered_scaled))
 
 
+def _normalized_rmssd(values):
+    values = np.asarray(values, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size < 2:
+        return np.nan
+
+    diffs = np.diff(finite_values)
+    rmssd = float(np.sqrt(np.mean(diffs**2)))
+    std_value = float(np.std(finite_values))
+    if not np.isfinite(std_value) or np.isclose(std_value, 0.0):
+        return np.nan
+    return float(rmssd / std_value)
+
+
+def _circular_block_bootstrap(values, block_length, rng):
+    values = np.asarray(values, dtype=np.float64)
+    n = int(values.size)
+    if n == 0:
+        return np.array([], dtype=np.float64)
+    if n == 1:
+        return values.copy()
+
+    block_length = max(1, int(block_length))
+    n_blocks = int(np.ceil(n / block_length))
+    starts = rng.integers(0, n, size=n_blocks)
+    offsets = np.arange(block_length, dtype=np.int64)
+    idx = (starts[:, None] + offsets[None, :]) % n
+    return values[idx.ravel()[:n]]
+
+
+def _bootstrap_j_delta_stats(
+    values_a,
+    values_b,
+    n_boot=J_BOOTSTRAP_SAMPLES,
+    block_length=J_BOOTSTRAP_BLOCK_LENGTH,
+    alpha=J_BOOTSTRAP_ALPHA,
+    seed=0,
+):
+    values_a = np.asarray(values_a, dtype=np.float64)
+    values_b = np.asarray(values_b, dtype=np.float64)
+    values_a = values_a[np.isfinite(values_a)]
+    values_b = values_b[np.isfinite(values_b)]
+
+    if values_a.size < 2 or values_b.size < 2:
+        return np.nan, np.nan, np.nan, 0, pd.NA
+
+    rng = np.random.default_rng(int(seed))
+    deltas = []
+    n_boot = max(1, int(n_boot))
+    for _ in range(n_boot):
+        sample_a = _circular_block_bootstrap(values_a, block_length=block_length, rng=rng)
+        sample_b = _circular_block_bootstrap(values_b, block_length=block_length, rng=rng)
+        j_a = _normalized_rmssd(sample_a)
+        j_b = _normalized_rmssd(sample_b)
+        if np.isfinite(j_a) and np.isfinite(j_b):
+            deltas.append(float(j_b - j_a))
+
+    if len(deltas) == 0:
+        return np.nan, np.nan, np.nan, 0, pd.NA
+
+    deltas = np.asarray(deltas, dtype=np.float64)
+    p_pos = float(np.mean(deltas >= 0.0))
+    p_neg = float(np.mean(deltas <= 0.0))
+    p_two_sided = min(1.0, 2.0 * min(p_pos, p_neg))
+    tail = 100.0 * (float(alpha) / 2.0)
+    ci_low, ci_high = np.percentile(deltas, [tail, 100.0 - tail])
+    is_significant = bool(np.isfinite(p_two_sided) and p_two_sided < float(alpha))
+    return (
+        float(p_two_sided),
+        float(ci_low),
+        float(ci_high),
+        int(deltas.size),
+        is_significant,
+    )
+
+
 def _compute_pooled_metric_values(values):
     values = np.asarray(values, dtype=np.float64)
     finite_values = values[np.isfinite(values)]
@@ -437,6 +518,86 @@ def compute_subject_session_pooled_metrics(
                     row[higher_key] = f"session_{session_b}"
                 else:
                     row[higher_key] = f"session_{session_a}"
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def compute_subject_session_pooled_j(
+    run_segments,
+    session_a=1,
+    session_b=2,
+    runs=(1, 2),
+):
+    pooled, run_counts, subjects, run_set = _collect_subject_session_pooled_values(
+        run_segments,
+        session_a=session_a,
+        session_b=session_b,
+        runs=runs,
+    )
+
+    rows = []
+    for sub_tag in subjects:
+        values_a = pooled.get((sub_tag, int(session_a)), np.array([], dtype=np.float64))
+        values_b = pooled.get((sub_tag, int(session_b)), np.array([], dtype=np.float64))
+        j_a = _normalized_rmssd(values_a)
+        j_b = _normalized_rmssd(values_b)
+
+        row = {
+            "sub_tag": str(sub_tag),
+            "session_a": session_a,
+            "session_b": session_b,
+            "runs_pooled": ",".join(str(run) for run in sorted(run_set)),
+            "n_runs_session_a": int(run_counts.get((sub_tag, session_a), 0)),
+            "n_runs_session_b": int(run_counts.get((sub_tag, session_b), 0)),
+            "n_trials_session_a": int(values_a.size),
+            "n_trials_session_b": int(values_b.size),
+            "session_a_j_projection": float(j_a),
+            "session_b_j_projection": float(j_b),
+            "j_projection_diff_session_b_minus_a": np.nan,
+            "higher_j_projection_session": pd.NA,
+            "j_projection_bootstrap_p_two_sided": np.nan,
+            "j_projection_bootstrap_ci95_low": np.nan,
+            "j_projection_bootstrap_ci95_high": np.nan,
+            "j_projection_bootstrap_n_resamples": 0,
+            f"j_projection_significant_bootstrap_alpha_{float(J_BOOTSTRAP_ALPHA):g}": pd.NA,
+        }
+
+        if np.isfinite(j_a) and np.isfinite(j_b):
+            j_diff = float(j_b - j_a)
+            row["j_projection_diff_session_b_minus_a"] = j_diff
+            if np.isclose(j_diff, 0.0):
+                row["higher_j_projection_session"] = "tie"
+            elif j_diff > 0:
+                row["higher_j_projection_session"] = f"session_{session_b}"
+            else:
+                row["higher_j_projection_session"] = f"session_{session_a}"
+
+            seed_input = f"{sub_tag}|{session_a}|{session_b}|j_bootstrap"
+            seed_hash = hashlib.sha256(seed_input.encode("utf-8")).hexdigest()
+            seed = int(seed_hash[:16], 16) % (2**32)
+            (
+                p_two_sided,
+                ci_low,
+                ci_high,
+                n_resamples,
+                is_significant,
+            ) = _bootstrap_j_delta_stats(
+                values_a,
+                values_b,
+                n_boot=J_BOOTSTRAP_SAMPLES,
+                block_length=J_BOOTSTRAP_BLOCK_LENGTH,
+                alpha=J_BOOTSTRAP_ALPHA,
+                seed=seed,
+            )
+            row["j_projection_bootstrap_p_two_sided"] = p_two_sided
+            row["j_projection_bootstrap_ci95_low"] = ci_low
+            row["j_projection_bootstrap_ci95_high"] = ci_high
+            row["j_projection_bootstrap_n_resamples"] = int(n_resamples)
+            row[f"j_projection_significant_bootstrap_alpha_{float(J_BOOTSTRAP_ALPHA):g}"] = (
+                is_significant if n_resamples > 0 else pd.NA
+            )
 
         rows.append(row)
 
@@ -1521,6 +1682,160 @@ def _plot_subject_consecutive_trial_scatter(
     return selected_subjects, output_paths
 
 
+def _plot_subject_session_j_barplot(subject_j_df, out_path, session_a=1, session_b=2):
+    fig, ax = plt.subplots(1, 1, figsize=(15.2, 6.0))
+
+    if subject_j_df is None or subject_j_df.empty:
+        ax.text(0.5, 0.5, "No pooled J data", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
+
+    df = subject_j_df.copy()
+    df["sub_tag"] = df["sub_tag"].astype(str)
+    df["_order"] = df["sub_tag"].map(_subject_order)
+    df = df.sort_values(["_order", "sub_tag"]).reset_index(drop=True)
+
+    if "session_a_j_projection" not in df.columns or "session_b_j_projection" not in df.columns:
+        ax.text(0.5, 0.5, "Missing pooled J columns", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
+
+    value_a = pd.to_numeric(df["session_a_j_projection"], errors="coerce").to_numpy(dtype=np.float64)
+    value_b = pd.to_numeric(df["session_b_j_projection"], errors="coerce").to_numpy(dtype=np.float64)
+    finite_pair = np.isfinite(value_a) & np.isfinite(value_b)
+    finite_any = np.isfinite(value_a) | np.isfinite(value_b)
+
+    if not np.any(finite_any):
+        ax.text(0.5, 0.5, "No finite pooled J values", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
+
+    x = np.arange(len(df), dtype=np.float64)
+    width = 0.38
+
+    finite_a = np.isfinite(value_a)
+    finite_b = np.isfinite(value_b)
+    bars_a = ax.bar(
+        x[finite_a] - (width / 2.0),
+        value_a[finite_a],
+        width=width,
+        color="tab:blue",
+        alpha=0.88,
+        edgecolor="black",
+        linewidth=0.3,
+        label=f"Session {int(session_a)}",
+    )
+    bars_b = ax.bar(
+        x[finite_b] + (width / 2.0),
+        value_b[finite_b],
+        width=width,
+        color="tab:red",
+        alpha=0.82,
+        edgecolor="black",
+        linewidth=0.3,
+        label=f"Session {int(session_b)}",
+    )
+
+    finite_vals = np.concatenate([value_a[finite_a], value_b[finite_b]]).astype(np.float64, copy=False)
+    min_y = float(np.min(finite_vals))
+    max_y = float(np.max(finite_vals))
+    y_span = max_y - min_y
+    if y_span > 0:
+        bottom_lim = min_y - (0.18 * y_span)
+        top_lim = max_y + (0.28 * y_span)
+        ax.set_ylim(bottom_lim, top_lim)
+
+    def _label_bars(bar_container):
+        for bar in bar_container:
+            h = float(bar.get_height())
+            if not np.isfinite(h):
+                continue
+            ax.text(
+                float(bar.get_x() + (bar.get_width() / 2.0)),
+                h,
+                f"{h:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=6,
+                rotation=90,
+                color="0.25",
+            )
+
+    _label_bars(bars_a)
+    _label_bars(bars_b)
+
+    if np.any(finite_pair):
+        for x_i, y_a, y_b in zip(x[finite_pair], value_a[finite_pair], value_b[finite_pair]):
+            ax.plot(
+                [float(x_i - (width / 2.0)), float(x_i + (width / 2.0))],
+                [float(y_a), float(y_b)],
+                color="0.45",
+                linewidth=0.7,
+                alpha=0.8,
+                zorder=2,
+            )
+
+    sig_col = f"j_projection_significant_bootstrap_alpha_{float(J_BOOTSTRAP_ALPHA):g}"
+    sig_mask = np.zeros(len(df), dtype=bool)
+    if sig_col in df.columns:
+        raw_sig = df[sig_col].to_numpy()
+        sig_mask = np.array(
+            [bool(v) if isinstance(v, (bool, np.bool_)) else False for v in raw_sig],
+            dtype=bool,
+        )
+
+    sig_pair_mask = sig_mask & finite_pair
+    if np.any(sig_pair_mask):
+        y_pad = max(0.01, 0.06 * (max_y - min_y if max_y > min_y else 1.0))
+        for idx in np.flatnonzero(sig_pair_mask):
+            star_y = max(float(value_a[idx]), float(value_b[idx])) + y_pad
+            ax.text(
+                float(x[idx]),
+                star_y,
+                "*",
+                ha="center",
+                va="bottom",
+                fontsize=14,
+                color="black",
+                fontweight="bold",
+                zorder=4,
+            )
+        top_lim = max_y + (4.0 * y_pad)
+        bottom_lim = min_y - (0.18 * (max_y - min_y if max_y > min_y else 1.0))
+        ax.set_ylim(bottom_lim, top_lim)
+
+    labels = df["sub_tag"].tolist()
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_ylabel("J = RMSSD(x(i+1)-x(i)) / std(x)")
+    ax.set_title("Subject-wise pooled-trial J by session (runs 1+2)")
+    ax.grid(axis="y", alpha=0.2)
+    legend_handles, legend_labels = ax.get_legend_handles_labels()
+    if np.any(sig_pair_mask):
+        legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="*",
+                color="black",
+                linestyle="None",
+                markersize=10,
+                label=f"Subject-wise bootstrap p < {float(J_BOOTSTRAP_ALPHA):g}",
+            )
+        )
+        legend_labels.append(f"Subject-wise bootstrap p < {float(J_BOOTSTRAP_ALPHA):g}")
+    ax.legend(legend_handles, legend_labels, loc="upper right")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
 def _plot_metric_by_ses_run(df, value_col, x_label, title, out_path, color):
     combos = [(1, 1), (1, 2), (2, 1), (2, 2)]
     fig, axes = plt.subplots(2, 2, figsize=(16, 10), sharey=True)
@@ -1762,6 +2077,7 @@ def main():
     )
     pooled_cv_subject_csv_path = os.path.join(out_dir, f"{stem}_sub_session12_pooled_cv_stats.csv")
     pooled_cv_group_csv_path = os.path.join(out_dir, f"{stem}_group_session12_pooled_cv_stats.csv")
+    pooled_j_subject_csv_path = os.path.join(out_dir, f"{stem}_sub_session12_pooled_j_stats.csv")
     variance_plot_path = os.path.join(
         out_dir, f"{stem}_sub_ses_run_projection_variability_subject_comp.png"
     )
@@ -1778,6 +2094,7 @@ def main():
     }
     pooled_cv_plot_path = os.path.join(out_dir, f"{stem}_sub_session12_pooled_cv_boxplot_summary.png")
     pooled_metric_plot_paths["cv_projection"] = pooled_cv_plot_path
+    pooled_j_plot_path = os.path.join(out_dir, f"{stem}_sub_session12_pooled_j_subject_barplot.png")
     consecutive_trial_scatter_dir = os.path.join(
         out_dir,
         f"{stem}_sub_session12_consecutive_trial_scatter_random_subjects",
@@ -1809,6 +2126,12 @@ def main():
         session_a=1,
         session_b=2,
     )
+    pooled_j_subject_df = compute_subject_session_pooled_j(
+        run_segments,
+        session_a=1,
+        session_b=2,
+        runs=(1, 2),
+    )
 
     run_variance_df.to_csv(variance_csv_path, index=False)
     run_std_rms_df.to_csv(std_rms_csv_path, index=False)
@@ -1819,6 +2142,7 @@ def main():
     pooled_metrics_group_df.to_csv(pooled_metrics_group_csv_path, index=False)
     pooled_cv_subject_df.to_csv(pooled_cv_subject_csv_path, index=False)
     pooled_cv_group_df.to_csv(pooled_cv_group_csv_path, index=False)
+    pooled_j_subject_df.to_csv(pooled_j_subject_csv_path, index=False)
 
     _plot_metric_by_ses_run(
         run_variance_df,
@@ -1874,6 +2198,12 @@ def main():
         session_b=2,
         runs=(1, 2),
     )
+    _plot_subject_session_j_barplot(
+        pooled_j_subject_df,
+        out_path=pooled_j_plot_path,
+        session_a=1,
+        session_b=2,
+    )
 
     print(f"Projection length: {projection.size}")
     print(f"Projection source path: {resolved_projection_path}")
@@ -1889,6 +2219,7 @@ def main():
     print(f"Rows (std/rms): {len(run_std_rms_df)}")
     print(f"Rows (subject KS): {len(subject_ks_df)}")
     print(f"Rows (subject pooled metrics): {len(pooled_metrics_subject_df)}")
+    print(f"Rows (subject pooled J): {len(pooled_j_subject_df)}")
     print(f"Saved variance CSV: {variance_csv_path}")
     print(f"Saved std/rms CSV:  {std_rms_csv_path}")
     print(f"Saved stats CSV:    {stats_csv_path}")
@@ -1898,11 +2229,13 @@ def main():
     print(f"Saved group pooled metrics CSV:   {pooled_metrics_group_csv_path}")
     print(f"Saved subject pooled CV CSV: {pooled_cv_subject_csv_path}")
     print(f"Saved group pooled CV CSV:   {pooled_cv_group_csv_path}")
+    print(f"Saved subject pooled J CSV:  {pooled_j_subject_csv_path}")
     print(f"Saved variability figure: {variance_plot_path}")
     print(f"Saved std/rms figure:    {std_rms_plot_path}")
     print(f"Saved KS figure:         {ks_plot_path}")
     print(f"Saved KS 2x7 grid figure:{ks_subject_grid_plot_path}")
     print(f"Saved pooled CV box-plot figure:  {pooled_cv_plot_path}")
+    print(f"Saved pooled J subject bar-plot figure: {pooled_j_plot_path}")
     print(
         "Saved consecutive-trial scatter directory: "
         f"{consecutive_trial_scatter_dir}"
