@@ -14,8 +14,10 @@ Outputs:
 7) KS summary figure (3x1): KS statistic, IQR diff, MAD diff.
 8) Per-subject pooled-trial metric CSV (session 1 vs 2, runs 1+2 pooled).
 9) Group-level pooled-trial metric session comparison stats CSV.
-10) Pooled-trial metric overlay figures with KS/IQR/MAD summary text.
+10) Pooled-trial metric overlay figures with KS/IQR/MAD summary text (non-CV metrics).
 11) Subject distribution grid figure (2x7): session 1 vs 2 projected-signal densities.
+12) Pooled-trial CV paired box plot with subject-wise lines (session 1 vs 2).
+13) Consecutive-trial scatter plots for all paired subjects (left=session 1, right=session 2).
 """
 
 import argparse
@@ -27,6 +29,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.ticker import MaxNLocator
 import numpy as np
 import pandas as pd
 from scipy.stats import gaussian_kde
@@ -1288,13 +1291,234 @@ def _plot_session_metric_distribution_summary(
 
 
 def _plot_session_cv_distribution_summary(subject_cv_df, group_cv_stats_df, out_path):
-    cv_spec = next(spec for spec in POOLED_METRIC_SPECS if spec["key"] == "cv_projection")
-    _plot_session_metric_distribution_summary(
-        subject_cv_df,
-        group_cv_stats_df,
-        cv_spec,
-        out_path,
+    fig, ax = plt.subplots(1, 1, figsize=(9.0, 6.2))
+
+    if subject_cv_df is None or subject_cv_df.empty:
+        ax.text(
+            0.5,
+            0.5,
+            "No pooled CV data",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
+
+    df = subject_cv_df.copy()
+    if "session_a_cv_projection" not in df.columns or "session_b_cv_projection" not in df.columns:
+        ax.text(
+            0.5,
+            0.5,
+            "Missing pooled CV columns",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
+
+    if "sub_tag" in df.columns:
+        df["sub_tag"] = df["sub_tag"].astype(str)
+        df["_order"] = df["sub_tag"].map(_subject_order)
+        df = df.sort_values(["_order", "sub_tag"])
+
+    value_a = pd.to_numeric(df["session_a_cv_projection"], errors="coerce").to_numpy(dtype=np.float64)
+    value_b = pd.to_numeric(df["session_b_cv_projection"], errors="coerce").to_numpy(dtype=np.float64)
+    paired = np.isfinite(value_a) & np.isfinite(value_b)
+
+    if not np.any(paired):
+        ax.text(
+            0.5,
+            0.5,
+            "No finite pooled CV pairs",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
+
+    values_a = value_a[paired]
+    values_b = value_b[paired]
+    rng = np.random.default_rng(0)
+    jitter_a = rng.uniform(-0.035, 0.035, size=values_a.size)
+    jitter_b = rng.uniform(-0.035, 0.035, size=values_b.size)
+
+    box = ax.boxplot(
+        [values_a, values_b],
+        positions=[1.0, 2.0],
+        widths=0.45,
+        patch_artist=True,
+        boxprops={"linewidth": 1.1, "edgecolor": "black"},
+        medianprops={"linewidth": 1.5, "color": "black"},
+        whiskerprops={"linewidth": 1.0, "color": "0.3"},
+        capprops={"linewidth": 1.0, "color": "0.3"},
     )
+    box["boxes"][0].set_facecolor("tab:blue")
+    box["boxes"][0].set_alpha(0.25)
+    box["boxes"][1].set_facecolor("tab:red")
+    box["boxes"][1].set_alpha(0.25)
+
+    for cv_a, cv_b in zip(values_a, values_b):
+        ax.plot([1.0, 2.0], [cv_a, cv_b], color="0.65", linewidth=0.8, alpha=0.75, zorder=1)
+
+    ax.scatter(
+        np.full(values_a.shape, 1.0) + jitter_a,
+        values_a,
+        color="tab:blue",
+        s=22,
+        alpha=0.88,
+        zorder=2,
+        label="Session 1 subjects",
+    )
+    ax.scatter(
+        np.full(values_b.shape, 2.0) + jitter_b,
+        values_b,
+        color="tab:red",
+        s=22,
+        alpha=0.88,
+        zorder=2,
+        label="Session 2 subjects",
+    )
+
+    summary = {}
+    if group_cv_stats_df is not None and not group_cv_stats_df.empty:
+        summary = group_cv_stats_df.iloc[0].to_dict()
+
+    ks_d = float(summary.get("ks_statistic", np.nan))
+    ks_p = float(summary.get("ks_p_two_sided", np.nan))
+    iqr_a = float(summary.get("iqr_session_a_cv", np.nan))
+    iqr_b = float(summary.get("iqr_session_b_cv", np.nan))
+    iqr_diff = float(summary.get("iqr_diff_session_b_minus_a", np.nan))
+    mad_a = float(summary.get("mad_session_a_cv", np.nan))
+    mad_b = float(summary.get("mad_session_b_cv", np.nan))
+    mad_diff = float(summary.get("mad_diff_session_b_minus_a", np.nan))
+
+    stats_text = (
+        f"n paired subjects = {int(np.count_nonzero(paired))}\n"
+        f"KS: D={ks_d:.3g}, p={ks_p:.3g}\n"
+        f"IQR: s1={iqr_a:.3g}, s2={iqr_b:.3g}, s2-s1={iqr_diff:.3g}\n"
+        f"MAD: s1={mad_a:.3g}, s2={mad_b:.3g}, s2-s1={mad_diff:.3g}"
+    )
+    ax.text(
+        0.98,
+        0.98,
+        stats_text,
+        transform=ax.transAxes,
+        va="top",
+        ha="right",
+        fontsize=9,
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.9, "edgecolor": "0.7"},
+    )
+
+    ax.set_xticks([1.0, 2.0])
+    ax.set_xticklabels(["Session 1", "Session 2"])
+    ax.set_ylabel("Pooled-trial CV projection (runs 1+2)")
+    ax.set_title("Session 1 vs Session 2 pooled-trial CV by subject")
+    ax.grid(axis="y", alpha=0.2)
+    ax.legend(loc="upper left", fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+def _plot_subject_consecutive_trial_scatter(
+    run_segments,
+    out_dir,
+    file_stem,
+    session_a=1,
+    session_b=2,
+    runs=(1, 2),
+):
+    pooled, _, subjects, _ = _collect_subject_session_pooled_values(
+        run_segments,
+        session_a=session_a,
+        session_b=session_b,
+        runs=runs,
+    )
+    paired_subjects = [
+        sub_tag
+        for sub_tag in subjects
+        if pooled.get((sub_tag, int(session_a)), np.array([], dtype=np.float64)).size >= 2
+        and pooled.get((sub_tag, int(session_b)), np.array([], dtype=np.float64)).size >= 2
+    ]
+    if len(paired_subjects) == 0:
+        return [], []
+
+    selected_subjects = [str(sub_tag) for sub_tag in paired_subjects]
+
+    os.makedirs(out_dir, exist_ok=True)
+    output_paths = []
+    for sub_tag in selected_subjects:
+        values_a = pooled.get((sub_tag, int(session_a)), np.array([], dtype=np.float64))
+        values_b = pooled.get((sub_tag, int(session_b)), np.array([], dtype=np.float64))
+
+        x_a = values_a[:-1]
+        y_a = values_a[1:]
+        x_b = values_b[:-1]
+        y_b = values_b[1:]
+
+        combined = np.concatenate([values_a, values_b]).astype(np.float64, copy=False)
+        finite_combined = combined[np.isfinite(combined)]
+        if finite_combined.size > 0:
+            vmin = float(np.min(finite_combined))
+            vmax = float(np.max(finite_combined))
+            vrange = vmax - vmin
+            pad = (0.08 * vrange) if vrange > 0 else max(1e-6, 0.08 * max(abs(vmin), 1.0))
+            lims = (vmin - pad, vmax + pad)
+        else:
+            lims = (-1.0, 1.0)
+
+        fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.8), sharex=True, sharey=True)
+        session_specs = [
+            (axes[0], x_a, y_a, int(session_a), "tab:blue"),
+            (axes[1], x_b, y_b, int(session_b), "tab:red"),
+        ]
+
+        for ax, x_vals, y_vals, ses, color in session_specs:
+            pair_idx = np.arange(x_vals.size, dtype=np.float64)
+            if x_vals.size > 0:
+                ax.scatter(
+                    x_vals,
+                    y_vals,
+                    c=pair_idx,
+                    cmap="viridis",
+                    s=20,
+                    alpha=0.9,
+                    edgecolors="none",
+                )
+            ax.plot(lims, lims, linestyle="--", color=color, linewidth=1.0, alpha=0.85)
+            ax.set_xlim(lims)
+            ax.set_ylim(lims)
+            ax.set_title(f"Session {ses} (n pairs={x_vals.size})")
+            ax.set_xlabel("trial(i)")
+            ax.set_ylabel("tria(i+1)")
+            ax.xaxis.set_major_locator(MaxNLocator(nbins=5))
+            ax.ticklabel_format(axis="x", style="sci", scilimits=(-2, 2), useMathText=True)
+            ax.tick_params(axis="x", labelsize=8)
+            ax.grid(alpha=0.2)
+
+        fig.suptitle(f"{sub_tag}: Consecutive-trial Y scatter (runs 1+2 pooled)")
+        fig.tight_layout(rect=[0, 0, 1, 0.93])
+
+        safe_sub = re.sub(r"[^A-Za-z0-9._-]+", "_", str(sub_tag))
+        out_path = os.path.join(
+            out_dir,
+            f"{file_stem}_sub_{safe_sub}_session12_consecutive_trial_scatter.png",
+        )
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        output_paths.append(out_path)
+
+    return selected_subjects, output_paths
 
 
 def _plot_metric_by_ses_run(df, value_col, x_label, title, out_path, color):
@@ -1552,7 +1776,12 @@ def main():
         spec["key"]: os.path.join(out_dir, f"{stem}_sub_session12_{spec['file_stub']}_summary.png")
         for spec in POOLED_METRIC_SPECS
     }
-    pooled_cv_plot_path = pooled_metric_plot_paths["cv_projection"]
+    pooled_cv_plot_path = os.path.join(out_dir, f"{stem}_sub_session12_pooled_cv_boxplot_summary.png")
+    pooled_metric_plot_paths["cv_projection"] = pooled_cv_plot_path
+    consecutive_trial_scatter_dir = os.path.join(
+        out_dir,
+        f"{stem}_sub_session12_consecutive_trial_scatter_random_subjects",
+    )
 
     pairwise_stats_df = build_projection_variability_stats_table(run_variance_df)
     subject_ks_df = compute_subject_session_ks(
@@ -1623,12 +1852,28 @@ def main():
         n_cols=7,
     )
     for metric_spec in POOLED_METRIC_SPECS:
+        metric_key = str(metric_spec["key"])
+        if metric_key == "cv_projection":
+            _plot_session_cv_distribution_summary(
+                pooled_cv_subject_df,
+                pooled_cv_group_df,
+                out_path=pooled_metric_plot_paths[metric_key],
+            )
+            continue
         _plot_session_metric_distribution_summary(
             pooled_metrics_subject_df,
             pooled_metrics_group_df,
             metric_spec=metric_spec,
-            out_path=pooled_metric_plot_paths[metric_spec["key"]],
+            out_path=pooled_metric_plot_paths[metric_key],
         )
+    selected_subjects, consecutive_trial_scatter_paths = _plot_subject_consecutive_trial_scatter(
+        run_segments,
+        out_dir=consecutive_trial_scatter_dir,
+        file_stem=stem,
+        session_a=1,
+        session_b=2,
+        runs=(1, 2),
+    )
 
     print(f"Projection length: {projection.size}")
     print(f"Projection source path: {resolved_projection_path}")
@@ -1657,7 +1902,18 @@ def main():
     print(f"Saved std/rms figure:    {std_rms_plot_path}")
     print(f"Saved KS figure:         {ks_plot_path}")
     print(f"Saved KS 2x7 grid figure:{ks_subject_grid_plot_path}")
-    print(f"Saved pooled CV figure:  {pooled_cv_plot_path}")
+    print(f"Saved pooled CV box-plot figure:  {pooled_cv_plot_path}")
+    print(
+        "Saved consecutive-trial scatter directory: "
+        f"{consecutive_trial_scatter_dir}"
+    )
+    if selected_subjects:
+        print(
+            "Subjects with paired session data for consecutive-trial scatter: "
+            f"{', '.join(selected_subjects)}"
+        )
+    for scatter_path in consecutive_trial_scatter_paths:
+        print(f"Saved consecutive-trial scatter figure: {scatter_path}")
     for metric_spec in POOLED_METRIC_SPECS:
         metric_key = metric_spec["key"]
         if metric_key == "cv_projection":

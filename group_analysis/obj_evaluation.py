@@ -458,16 +458,20 @@ def _plot_results(
     x = np.arange(len(combo_order))
     width = 0.25
     comp_names = [
-        ("comp_test_corr_mean", "-w_test_corr * norm(|corr_test|)", "#1b9e77"),
+        ("comp_test_corr_mean", "w_test_corr * norm(|corr_test|)", "#1b9e77"),
         ("comp_corr_stability_mean", "w_corr_stability * norm(corr gap)", "#d95f02"),
         ("comp_loss_stability_mean", "w_loss_stability * norm(loss gap rel)", "#7570b3"),
     ]
 
     center_offset = (len(comp_names) - 1) / 2.0
     for idx, (col, label, color) in enumerate(comp_names):
+        y_vals = summary_ordered[col].to_numpy()
+        if col == "comp_test_corr_mean":
+            # Display correlation contribution magnitude as positive in plots.
+            y_vals = -y_vals
         ax.bar(
             x + (idx - center_offset) * width,
-            summary_ordered[col].to_numpy(),
+            y_vals,
             width=width,
             label=label,
             color=color,
@@ -530,14 +534,14 @@ def _plot_term_values(
 
     if weighted:
         comp_names = [
-            ("comp_test_corr_mean", "-w_test_corr * norm(|corr_test|)", "#1b9e77"),
+            ("comp_test_corr_mean", "w_test_corr * norm(|corr_test|)", "#1b9e77"),
             ("comp_corr_stability_mean", "w_corr_stability * norm(corr gap)", "#d95f02"),
             ("comp_loss_stability_mean", "w_loss_stability * norm(loss gap rel)", "#7570b3"),
         ]
         ylabel = "Mean weighted term value"
     else:
         comp_names = [
-            ("term_test_corr_mean", "-norm(|corr_test|)", "#1b9e77"),
+            ("term_test_corr_mean", "norm(|corr_test|)", "#1b9e77"),
             ("term_corr_stability_mean", "norm(corr gap)", "#d95f02"),
             ("term_loss_stability_mean", "norm(loss gap rel)", "#7570b3"),
         ]
@@ -549,9 +553,13 @@ def _plot_term_values(
     fig, ax = plt.subplots(1, 1, figsize=(14, 7))
 
     for idx, (col, label, color) in enumerate(comp_names):
+        y_vals = summary_ordered[col].to_numpy()
+        if col in ("comp_test_corr_mean", "term_test_corr_mean"):
+            # Display correlation contribution magnitude as positive in plots.
+            y_vals = -y_vals
         ax.bar(
             x + (idx - center_offset) * width,
-            summary_ordered[col].to_numpy(),
+            y_vals,
             width=width,
             label=label,
             color=color,

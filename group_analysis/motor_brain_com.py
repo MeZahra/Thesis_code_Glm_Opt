@@ -33,6 +33,22 @@ METRIC_SPECS = [
         "file_stub": "cv",
     },
     {
+        "key": "qcd",
+        "label": "QCD",
+        "projection_col": "qcd_projection",
+        "behavior_col": "qcd_behavior_col2",
+        "projection_plot_scale": 1.0,
+        "file_stub": "qcd",
+    },
+    {
+        "key": "adjacent_diff_ratio_sum",
+        "label": "sum((x_i-x_(i+1))^2/(x_i^2+x_(i+1)^2))",
+        "projection_col": "adjacent_diff_ratio_sum_projection",
+        "behavior_col": "adjacent_diff_ratio_sum_behavior_col2",
+        "projection_plot_scale": 1.0,
+        "file_stub": "adjacent_diff_ratio_sum",
+    },
+    {
         "key": "mad_mean",
         "label": "MAD(mean)",
         "projection_col": "mad_mean_projection",
@@ -60,6 +76,8 @@ METRIC_SPECS = [
 
 RUN_OUTLIER_METRIC_KEYS = [
     "cv",
+    "qcd",
+    "adjacent_diff_ratio_sum",
     "mad_mean",
     "mad_mean_over_median",
     "std_centered_range",
@@ -98,6 +116,16 @@ def _load_behavior_column(path, behavior_column):
     return behavior[:, int(behavior_column)]
 
 
+def _demean_finite(values):
+    values = np.asarray(values, dtype=np.float64)
+    centered = values.astype(np.float64, copy=True)
+    finite_mask = np.isfinite(centered)
+    if not np.any(finite_mask):
+        return centered
+    centered[finite_mask] = centered[finite_mask] - float(np.mean(centered[finite_mask]))
+    return centered
+
+
 def _load_run_kept_projection_behavior(segment, behavior_root, behavior_column):
     behavior_path = _resolve_behavior_path(segment["sub_tag"], segment["ses"], segment["run"], behavior_root)
     behavior_column_values = _load_behavior_column(behavior_path, behavior_column)
@@ -106,8 +134,8 @@ def _load_run_kept_projection_behavior(segment, behavior_root, behavior_column):
         behavior_column_values = behavior_column_values[:n_trials_source]
     keep_mask = np.asarray(segment["keep_mask"], dtype=bool)
 
-    kept_behavior = behavior_column_values[keep_mask]
-    kept_projection = np.asarray(segment["values"])
+    kept_behavior = _demean_finite(behavior_column_values[keep_mask])
+    kept_projection = _demean_finite(np.asarray(segment["values"], dtype=np.float64))
     return kept_projection, kept_behavior, behavior_path
 
 
@@ -204,6 +232,35 @@ def _std_centered_over_range(values):
     return float(np.std(centered_scaled))
 
 
+def _quartile_coefficient_of_dispersion(values):
+    values = np.asarray(values, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        return np.nan
+
+    q1, q3 = np.percentile(finite_values, [25.0, 75.0])
+    iqr = float(q3 - q1)
+    return _safe_abs_ratio(iqr, float(q3 + q1))
+
+
+def _adjacent_diff_ratio_sum(values):
+    values = np.asarray(values, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size < 2:
+        return np.nan
+
+    x_i = finite_values[:-1]
+    x_next = finite_values[1:]
+    denom = (x_i ** 2) + (x_next ** 2)
+    valid_mask = np.isfinite(denom) & (~np.isclose(denom, 0.0))
+    if not np.any(valid_mask):
+        return np.nan
+
+    numerator = (x_i - x_next) ** 2
+    terms = numerator[valid_mask] / denom[valid_mask]
+    return float(np.sum(terms))
+
+
 def _compute_variability_summary(values):
     values = np.asarray(values, dtype=np.float64)
     finite_values = values[np.isfinite(values)]
@@ -214,6 +271,8 @@ def _compute_variability_summary(values):
             "std": np.nan,
             "variance": np.nan,
             "cv": np.nan,
+            "qcd": np.nan,
+            "adjacent_diff_ratio_sum": np.nan,
             "mad_mean": np.nan,
             "mad_mean_over_median": np.nan,
             "std_centered_range": np.nan,
@@ -224,6 +283,8 @@ def _compute_variability_summary(values):
     std_value = float(np.std(finite_values))
     variance_value = float(np.var(finite_values))
     _, _, cv_value = _coefficient_of_variation(finite_values)
+    qcd_value = _quartile_coefficient_of_dispersion(finite_values)
+    adjacent_diff_ratio_sum_value = _adjacent_diff_ratio_sum(finite_values)
     mad_mean_value = _mean_absolute_deviation(finite_values)
     mad_mean_over_median_value = _safe_abs_ratio(mad_mean_value, median_value)
     std_centered_range_value = _std_centered_over_range(finite_values)
@@ -233,6 +294,8 @@ def _compute_variability_summary(values):
         "std": std_value,
         "variance": variance_value,
         "cv": cv_value,
+        "qcd": qcd_value,
+        "adjacent_diff_ratio_sum": adjacent_diff_ratio_sum_value,
         "mad_mean": mad_mean_value,
         "mad_mean_over_median": mad_mean_over_median_value,
         "std_centered_range": std_centered_range_value,
@@ -299,6 +362,8 @@ def compute_run_behavior_tables(run_segments, behavior_root, behavior_column):
                 "std_projection": proj_stats["std"],
                 "variance_projection": proj_stats["variance"],
                 "cv_projection": proj_stats["cv"],
+                "qcd_projection": proj_stats["qcd"],
+                "adjacent_diff_ratio_sum_projection": proj_stats["adjacent_diff_ratio_sum"],
                 "mad_mean_projection": proj_stats["mad_mean"],
                 "mad_mean_over_median_projection": proj_stats["mad_mean_over_median"],
                 "std_centered_range_projection": proj_stats["std_centered_range"],
@@ -307,6 +372,8 @@ def compute_run_behavior_tables(run_segments, behavior_root, behavior_column):
                 "std_behavior_col2": beh_stats["std"],
                 "variance_behavior_col2": beh_stats["variance"],
                 "cv_behavior_col2": beh_stats["cv"],
+                "qcd_behavior_col2": beh_stats["qcd"],
+                "adjacent_diff_ratio_sum_behavior_col2": beh_stats["adjacent_diff_ratio_sum"],
                 "mad_mean_behavior_col2": beh_stats["mad_mean"],
                 "mad_mean_over_median_behavior_col2": beh_stats["mad_mean_over_median"],
                 "std_centered_range_behavior_col2": beh_stats["std_centered_range"]})
@@ -408,6 +475,10 @@ def add_subject_median_normalized_variance_features(comparison_df):
 
 
 def _iqr_outlier_mask(values, iqr_multiplier=3.0):
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return np.zeros(values.shape, dtype=bool)
+
     q1, q3 = np.percentile(values, [25.0, 75.0])
     iqr = float(q3 - q1)
     lower = float(q1 - (float(iqr_multiplier) * iqr))
@@ -435,6 +506,9 @@ def _build_pair_labels(metric_df):
 
 
 def _paired_outlier_filtered(values_a, values_b, labels=None, iqr_multiplier=3.0):
+    values_a = np.asarray(values_a, dtype=np.float64)
+    values_b = np.asarray(values_b, dtype=np.float64)
+
     if labels is None:
         labels = np.arange(values_a.size).astype(str)
     else:
@@ -445,7 +519,9 @@ def _paired_outlier_filtered(values_a, values_b, labels=None, iqr_multiplier=3.0
     paired_b = values_b[paired_mask]
     paired_labels = labels[paired_mask]
 
-    if iqr_multiplier is None:
+    if paired_a.size == 0:
+        out_any = np.zeros(paired_a.shape, dtype=bool)
+    elif iqr_multiplier is None:
         out_any = np.zeros(paired_a.shape, dtype=bool)
     else:
         out_a = _iqr_outlier_mask(paired_a, iqr_multiplier=iqr_multiplier)
@@ -583,6 +659,8 @@ def compute_subject_projection_behavior_metrics(run_segments, behavior_root,beha
                 "variance_projection": proj_stats["variance"],
                 "std_projection": proj_stats["std"],
                 "cv_projection": proj_stats["cv"],
+                "qcd_projection": proj_stats["qcd"],
+                "adjacent_diff_ratio_sum_projection": proj_stats["adjacent_diff_ratio_sum"],
                 "mad_mean_projection": proj_stats["mad_mean"],
                 "mad_mean_over_median_projection": proj_stats["mad_mean_over_median"],
                 "std_centered_range_projection": proj_stats["std_centered_range"],
@@ -591,6 +669,8 @@ def compute_subject_projection_behavior_metrics(run_segments, behavior_root,beha
                 "variance_behavior_col2": beh_stats["variance"],
                 "std_behavior_col2": beh_stats["std"],
                 "cv_behavior_col2": beh_stats["cv"],
+                "qcd_behavior_col2": beh_stats["qcd"],
+                "adjacent_diff_ratio_sum_behavior_col2": beh_stats["adjacent_diff_ratio_sum"],
                 "mad_mean_behavior_col2": beh_stats["mad_mean"],
                 "mad_mean_over_median_behavior_col2": beh_stats["mad_mean_over_median"],
                 "std_centered_range_behavior_col2": beh_stats["std_centered_range"],
@@ -602,6 +682,19 @@ def compute_subject_projection_behavior_metrics(run_segments, behavior_root,beha
                 "d_cv_projection_minus_behavior": (
                     float(proj_stats["cv"] - beh_stats["cv"])
                     if np.isfinite(proj_stats["cv"]) and np.isfinite(beh_stats["cv"])
+                    else np.nan
+                ),
+                "d_qcd_projection_minus_behavior": (
+                    float(proj_stats["qcd"] - beh_stats["qcd"])
+                    if np.isfinite(proj_stats["qcd"]) and np.isfinite(beh_stats["qcd"])
+                    else np.nan
+                ),
+                "d_adjacent_diff_ratio_sum_projection_minus_behavior": (
+                    float(proj_stats["adjacent_diff_ratio_sum"] - beh_stats["adjacent_diff_ratio_sum"])
+                    if (
+                        np.isfinite(proj_stats["adjacent_diff_ratio_sum"])
+                        and np.isfinite(beh_stats["adjacent_diff_ratio_sum"])
+                    )
                     else np.nan
                 ),
                 "d_mad_mean_projection_minus_behavior": (
@@ -923,7 +1016,12 @@ def _metric_z_column_title(metric_spec):
 
 
 def _metric_raw_column_title(metric_spec):
-    return f"Raw {str(metric_spec['label'])}"
+    label = str(metric_spec["label"])
+    if label == "MAD(mean)":
+        return "MAD"
+    if label == "MAD(mean)/|median|":
+        return "MAD/|median|"
+    return label
 
 
 def _validate_metric_df(metric_df, metric_specs=None):
@@ -963,7 +1061,11 @@ def _build_metric_column_dfs(metric_df, metric_specs=None, use_zscore=False):
                 behavior_col=str(spec["behavior_col"]),
             )
             column_title = _metric_raw_column_title(spec)
+        if paired_df.empty:
+            continue
         column_defs.append((column_title, paired_df, spec))
+    if len(column_defs) == 0:
+        raise RuntimeError("No metrics with finite paired values are available for plotting.")
     return column_defs
 
 
@@ -982,6 +1084,14 @@ def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
     row_defs = [("sub_tag", "Subject colors", "Subject"),
         ("ses", "Session colors", "Session"),
         ("run", "Run colors", "Run")]
+
+    column_ttests = []
+    for _, metric_col_df, _ in column_defs:
+        tests = _paired_tests_two_sided(
+            metric_col_df["projection_raw"].to_numpy(dtype=np.float64),
+            metric_col_df["behavior_raw"].to_numpy(dtype=np.float64),
+        )
+        column_ttests.append(tests)
 
     column_limits = []
     for _, metric_col_df, _ in column_defs:
@@ -1020,6 +1130,25 @@ def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
             total_clipped += int(clipped_here)
             ax.set_ylim(column_limits[col_idx])
             ax.set_title(f"{column_title}", fontsize=11.0)
+            if row_idx == 0:
+                test_row = column_ttests[col_idx]
+                if np.isfinite(test_row["ttest_p_two_sided"]) and np.isfinite(test_row["ttest_stat"]):
+                    ttest_text = (
+                        f"paired t (BOLD-Behavior)\n"
+                        f"p={test_row['ttest_p_two_sided']:.3g}, t={test_row['ttest_stat']:.3g}, n={int(test_row['n_pairs'])}"
+                    )
+                else:
+                    ttest_text = f"paired t (BOLD-Behavior)\ninsufficient pairs (n={int(test_row['n_pairs'])})"
+                ax.text(
+                    0.02,
+                    0.98,
+                    ttest_text,
+                    transform=ax.transAxes,
+                    ha="left",
+                    va="top",
+                    fontsize=8.3,
+                    bbox={"boxstyle": "round,pad=0.22", "facecolor": "white", "alpha": 0.8, "edgecolor": "0.75"},
+                )
             if col_idx == 0:
                 ax.set_ylabel("Variability")
             if col_idx == (n_cols - 1):
@@ -1032,7 +1161,7 @@ def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
                     loc=legend_loc,
                 )
 
-    fig.suptitle("Behavior vs BOLD variability (raw values, no z-score)", fontsize=13.0)
+    fig.suptitle("Behavior vs BOLD variability (no z-score)", fontsize=13.0)
     tight_bottom = 0.0
     fig.tight_layout(rect=(0.0, tight_bottom, 0.995, 0.965))
     fig.savefig(out_path, dpi=220)
@@ -1084,7 +1213,7 @@ def plot_cv_subject_session_run_raw_3x1(metric_df, out_path):
                     title=legend_title,
                 )
 
-    fig.suptitle("Behavior vs BOLD variability (raw values, no z-score)", fontsize=13.0)
+    fig.suptitle("Behavior vs BOLD variability (no z-score)", fontsize=13.0)
     fig.tight_layout(rect=(0.0, 0.0, 0.995, 0.975))
     fig.savefig(out_path, dpi=220)
     plt.close(fig)
@@ -1726,7 +1855,7 @@ def plot_whisker_outlier_counts_behavior_vs_bold_cv_raw(
             bbox_to_anchor=(0.5, 0.995),
         )
     fig.suptitle(
-        "Whisker outlier counts for raw metrics (below / near / above): Behavior vs BOLD",
+        "Whisker outlier counts for metrics (below / near / above): Behavior vs BOLD",
         fontsize=14.0,
         y=1.01,
     )
@@ -1838,9 +1967,9 @@ def _plot_subject_metric_comparison(
         label=f"Behavior {metric_label}",
     )
     ax2.fill_between(x_raw, beh_raw_density, alpha=0.15, color="tab:orange")
-    ax2.set_xlabel(f"Raw {metric_label}")
+    ax2.set_xlabel(f"{metric_label}")
     ax2.set_ylabel("Probability density")
-    ax2.set_title(f"3) Raw {metric_label} + paired tests")
+    ax2.set_title(f"3) {metric_label} + paired tests")
     ax2.legend(fontsize=8, loc="upper right")
 
     removed_labels = paired_table.loc[paired_table["removed_outlier"], "pair_label"].astype(str).tolist()
@@ -1886,7 +2015,7 @@ def _plot_subject_metric_comparison(
         ax3.set_ylim(line_min, line_max)
         ax3.set_xlabel(f"Behavior {metric_label}")
         ax3.set_ylabel(f"Projection {metric_label}")
-        ax3.set_title(f"4) Raw {metric_label} scatter")
+        ax3.set_title(f"4) {metric_label} scatter")
 
         text_projection_col = z_text_projection_col or projection_col
         text_behavior_col = z_text_behavior_col or behavior_col
@@ -2185,6 +2314,13 @@ def analyze_subject_cv_difference(
     )
 
 
+def _has_finite_metric_pairs(metric_df, projection_col, behavior_col):
+    projection = np.asarray(metric_df[projection_col], dtype=np.float64)
+    behavior = np.asarray(metric_df[behavior_col], dtype=np.float64)
+    paired_mask = np.isfinite(projection) & np.isfinite(behavior)
+    return bool(np.any(paired_mask))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--projection-path", default="results/behave_vs_bold/projection_voxel_foldavg_sub9_ses1_task0.8_bold0.8_beta0.5_smooth0.2_gamma1_bold_thr90.npy",
@@ -2261,10 +2397,21 @@ def main():
     excluded_run_keys = set()
     run_outlier_specs = _metric_specs_from_keys(RUN_OUTLIER_METRIC_KEYS)
     for metric_spec in run_outlier_specs:
+        metric_projection_col = str(metric_spec["projection_col"])
+        metric_behavior_col = str(metric_spec["behavior_col"])
+        if not _has_finite_metric_pairs(
+            run_metric_df,
+            projection_col=metric_projection_col,
+            behavior_col=metric_behavior_col,
+        ):
+            print(
+                f"Skipping run outlier detection for {metric_spec['label']} (no finite paired values)."
+            )
+            continue
         metric_outlier_keys, metric_pair_outlier_df = identify_run_outliers(
             run_metric_df,
-            projection_col=str(metric_spec["projection_col"]),
-            behavior_col=str(metric_spec["behavior_col"]),
+            projection_col=metric_projection_col,
+            behavior_col=metric_behavior_col,
             outlier_iqr_multiplier=float(args.outlier_iqr_multiplier),
         )
         metric_pair_outlier_df = metric_pair_outlier_df.copy()
@@ -2450,12 +2597,23 @@ def main():
     ds_stats_rows = []
     for metric_spec in METRIC_SPECS:
         metric_key = str(metric_spec["key"])
+        metric_projection_col = str(metric_spec["projection_col"])
+        metric_behavior_col = str(metric_spec["behavior_col"])
+        if not _has_finite_metric_pairs(
+            run_metric_df,
+            projection_col=metric_projection_col,
+            behavior_col=metric_behavior_col,
+        ):
+            print(
+                f"Skipping metric {metric_spec['label']} (no finite paired values after preprocessing)."
+            )
+            continue
         metric_paths = metric_path_map[metric_key]
 
         summary_row, metric_pairs_df = _plot_subject_metric_comparison(
             subject_metrics_df=run_metric_df,
-            projection_col=str(metric_spec["projection_col"]),
-            behavior_col=str(metric_spec["behavior_col"]),
+            projection_col=metric_projection_col,
+            behavior_col=metric_behavior_col,
             metric_label=str(metric_spec["label"]),
             out_path=metric_paths["comparison_plot"],
             outlier_iqr_multiplier=float(args.outlier_iqr_multiplier),
@@ -2469,8 +2627,8 @@ def main():
 
         ds_stats_row, ds_pairs_df = analyze_subject_metric_difference(
             metric_df=run_metric_df,
-            projection_col=str(metric_spec["projection_col"]),
-            behavior_col=str(metric_spec["behavior_col"]),
+            projection_col=metric_projection_col,
+            behavior_col=metric_behavior_col,
             metric_label=str(metric_spec["label"]),
             out_path=metric_paths["ds_plot"],
             outlier_iqr_multiplier=float(args.outlier_iqr_multiplier),
