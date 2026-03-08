@@ -19,6 +19,8 @@ Outputs:
 12) Pooled-trial CV paired box plot with subject-wise lines (session 1 vs 2).
 13) Consecutive-trial scatter plots for all paired subjects (left=session 1, right=session 2).
 14) Per-subject pooled-trial normalized RMSSD (J) CSV and bar plot (session 1 vs 2).
+15) Per-subject consecutive-trial metrics CSV (MAD error, RMSE error, lag-1 correlation).
+16) Group-level consecutive-trial Wilcoxon summary CSV with rank-biserial effect size and 95% CI.
 """
 
 import argparse
@@ -35,7 +37,7 @@ from matplotlib.ticker import MaxNLocator
 import numpy as np
 import pandas as pd
 from scipy.stats import gaussian_kde
-from scipy.stats import combine_pvalues, ks_2samp, ttest_rel, wilcoxon
+from scipy.stats import combine_pvalues, ks_2samp, rankdata, ttest_rel, wilcoxon
 
 from motor_brain_com import (
     DEFAULT_MANIFEST_PATH,
@@ -50,6 +52,8 @@ KS_ALPHA = 0.05
 J_BOOTSTRAP_ALPHA = 0.05
 J_BOOTSTRAP_SAMPLES = 2000
 J_BOOTSTRAP_BLOCK_LENGTH = 8
+WILCOXON_CI_ALPHA = 0.05
+WILCOXON_CI_BOOTSTRAP_SAMPLES = 5000
 
 POOLED_METRIC_SPECS = [
     {
@@ -83,6 +87,24 @@ POOLED_METRIC_SPECS = [
         "file_stub": "pooled_std_centered_range",
         "x_label": "Pooled-trial std((X-mean)/(max-min)) projection (runs 1+2)",
         "title": "Session 1 vs Session 2 pooled-trial centered-range-normalized std",
+    },
+]
+
+CONSECUTIVE_METRIC_SPECS = [
+    {
+        "key": "consecutive_mad_error",
+        "label": "MAD(lag-1 error)",
+        "formula": "MAD(x(i+1) - x(i))",
+    },
+    {
+        "key": "consecutive_rmse_error",
+        "label": "RMSE(lag-1 error)",
+        "formula": "sqrt(mean((x(i+1) - x(i))^2))",
+    },
+    {
+        "key": "consecutive_lag1_corr",
+        "label": "Lag-1 correlation",
+        "formula": "corr(x(i), x(i+1))",
     },
 ]
 
@@ -277,6 +299,99 @@ def _normalized_rmssd(values):
     if not np.isfinite(std_value) or np.isclose(std_value, 0.0):
         return np.nan
     return float(rmssd / std_value)
+
+
+def _lag1_pairs(values):
+    values = np.asarray(values, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size < 2:
+        return (
+            np.array([], dtype=np.float64),
+            np.array([], dtype=np.float64),
+        )
+    return finite_values[:-1], finite_values[1:]
+
+
+def _compute_consecutive_metric_values(values):
+    x_prev, x_next = _lag1_pairs(values)
+    if x_prev.size == 0:
+        return {
+            "consecutive_mad_error": np.nan,
+            "consecutive_rmse_error": np.nan,
+            "consecutive_lag1_corr": np.nan,
+            "n_consecutive_pairs": 0,
+        }
+
+    lag1_error = x_next - x_prev
+    rmse_error = float(np.sqrt(np.mean(lag1_error**2))) if lag1_error.size > 0 else np.nan
+    mad_error = _mad(lag1_error)
+
+    lag1_corr = np.nan
+    if x_prev.size >= 2:
+        std_prev = float(np.std(x_prev))
+        std_next = float(np.std(x_next))
+        if (
+            np.isfinite(std_prev)
+            and np.isfinite(std_next)
+            and not np.isclose(std_prev, 0.0)
+            and not np.isclose(std_next, 0.0)
+        ):
+            corr_matrix = np.corrcoef(x_prev, x_next)
+            lag1_corr = float(corr_matrix[0, 1]) if corr_matrix.shape == (2, 2) else np.nan
+            if not np.isfinite(lag1_corr):
+                lag1_corr = np.nan
+
+    return {
+        "consecutive_mad_error": float(mad_error),
+        "consecutive_rmse_error": rmse_error,
+        "consecutive_lag1_corr": lag1_corr,
+        "n_consecutive_pairs": int(x_prev.size),
+    }
+
+
+def _rank_biserial_from_paired_diff(diff_values):
+    diff_values = np.asarray(diff_values, dtype=np.float64)
+    diff_values = diff_values[np.isfinite(diff_values)]
+    if diff_values.size == 0:
+        return np.nan, 0, np.nan, np.nan
+
+    nonzero = diff_values[~np.isclose(diff_values, 0.0)]
+    if nonzero.size == 0:
+        return 0.0, 0, 0.0, 0.0
+
+    ranks = rankdata(np.abs(nonzero), method="average")
+    pos_mask = nonzero > 0.0
+    neg_mask = nonzero < 0.0
+    rank_sum_pos = float(np.sum(ranks[pos_mask])) if np.any(pos_mask) else 0.0
+    rank_sum_neg = float(np.sum(ranks[neg_mask])) if np.any(neg_mask) else 0.0
+    rank_total = float(rank_sum_pos + rank_sum_neg)
+    if rank_total <= 0.0:
+        return np.nan, int(nonzero.size), rank_sum_pos, rank_sum_neg
+
+    rank_biserial = float((rank_sum_pos - rank_sum_neg) / rank_total)
+    return rank_biserial, int(nonzero.size), rank_sum_pos, rank_sum_neg
+
+
+def _bootstrap_paired_median_diff_ci(
+    diff_values,
+    n_boot=WILCOXON_CI_BOOTSTRAP_SAMPLES,
+    alpha=WILCOXON_CI_ALPHA,
+    seed=0,
+):
+    diff_values = np.asarray(diff_values, dtype=np.float64)
+    diff_values = diff_values[np.isfinite(diff_values)]
+    if diff_values.size == 0:
+        return np.nan, np.nan, 0
+
+    n_boot = max(1, int(n_boot))
+    rng = np.random.default_rng(int(seed))
+    sample_idx = rng.integers(0, diff_values.size, size=(n_boot, diff_values.size))
+    bootstrap_samples = diff_values[sample_idx]
+    bootstrap_medians = np.median(bootstrap_samples, axis=1)
+
+    tail = 100.0 * (float(alpha) / 2.0)
+    ci_low, ci_high = np.percentile(bootstrap_medians, [tail, 100.0 - tail])
+    return float(ci_low), float(ci_high), int(n_boot)
 
 
 def _circular_block_bootstrap(values, block_length, rng):
@@ -598,6 +713,184 @@ def compute_subject_session_pooled_j(
             row[f"j_projection_significant_bootstrap_alpha_{float(J_BOOTSTRAP_ALPHA):g}"] = (
                 is_significant if n_resamples > 0 else pd.NA
             )
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def compute_subject_session_consecutive_metrics(
+    run_segments,
+    session_a=1,
+    session_b=2,
+    runs=(1, 2),
+):
+    pooled, run_counts, subjects, run_set = _collect_subject_session_pooled_values(
+        run_segments,
+        session_a=session_a,
+        session_b=session_b,
+        runs=runs,
+    )
+
+    rows = []
+    for sub_tag in subjects:
+        values_a = pooled.get((sub_tag, int(session_a)), np.array([], dtype=np.float64))
+        values_b = pooled.get((sub_tag, int(session_b)), np.array([], dtype=np.float64))
+        metrics_a = _compute_consecutive_metric_values(values_a)
+        metrics_b = _compute_consecutive_metric_values(values_b)
+
+        row = {
+            "sub_tag": str(sub_tag),
+            "session_a": session_a,
+            "session_b": session_b,
+            "runs_pooled": ",".join(str(run) for run in sorted(run_set)),
+            "n_runs_session_a": int(run_counts.get((sub_tag, session_a), 0)),
+            "n_runs_session_b": int(run_counts.get((sub_tag, session_b), 0)),
+            "n_trials_session_a": int(values_a.size),
+            "n_trials_session_b": int(values_b.size),
+            "n_consecutive_pairs_session_a": int(metrics_a["n_consecutive_pairs"]),
+            "n_consecutive_pairs_session_b": int(metrics_b["n_consecutive_pairs"]),
+        }
+
+        for metric_spec in CONSECUTIVE_METRIC_SPECS:
+            metric_key = str(metric_spec["key"])
+            value_a = float(metrics_a.get(metric_key, np.nan))
+            value_b = float(metrics_b.get(metric_key, np.nan))
+            diff_key = f"{metric_key}_diff_session_b_minus_a"
+            higher_key = f"higher_{metric_key}_session"
+
+            row[f"session_a_{metric_key}"] = value_a
+            row[f"session_b_{metric_key}"] = value_b
+            row[diff_key] = np.nan
+            row[higher_key] = pd.NA
+
+            if np.isfinite(value_a) and np.isfinite(value_b):
+                diff_value = float(value_b - value_a)
+                row[diff_key] = diff_value
+                if np.isclose(diff_value, 0.0):
+                    row[higher_key] = "tie"
+                elif diff_value > 0:
+                    row[higher_key] = f"session_{session_b}"
+                else:
+                    row[higher_key] = f"session_{session_a}"
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def build_group_level_consecutive_metric_stats(
+    subject_consecutive_df,
+    session_a=1,
+    session_b=2,
+    metric_specs=CONSECUTIVE_METRIC_SPECS,
+):
+    rows = []
+    subject_count = (
+        0 if (subject_consecutive_df is None or subject_consecutive_df.empty) else int(len(subject_consecutive_df))
+    )
+    runs_label = "1,2"
+    if (
+        subject_consecutive_df is not None
+        and not subject_consecutive_df.empty
+        and "runs_pooled" in subject_consecutive_df.columns
+    ):
+        runs_label = str(subject_consecutive_df["runs_pooled"].iloc[0])
+
+    for metric_spec in metric_specs:
+        metric_key = str(metric_spec["key"])
+        row = {
+            "metric": metric_key,
+            "metric_label": str(metric_spec["label"]),
+            "metric_formula": str(metric_spec["formula"]),
+            "session_a": int(session_a),
+            "session_b": int(session_b),
+            "runs_pooled": runs_label,
+            "n_subjects_total": subject_count,
+            "n_subjects_paired_finite_metric": 0,
+            "mean_session_a_metric": np.nan,
+            "mean_session_b_metric": np.nan,
+            "median_session_a_metric": np.nan,
+            "median_session_b_metric": np.nan,
+            "mean_diff_session_b_minus_a": np.nan,
+            "median_diff_session_b_minus_a": np.nan,
+            "wilcoxon_statistic": np.nan,
+            "wilcoxon_p_two_sided": np.nan,
+            "rank_biserial_correlation": np.nan,
+            "n_nonzero_diff_wilcoxon": 0,
+            "wilcoxon_rank_sum_positive": np.nan,
+            "wilcoxon_rank_sum_negative": np.nan,
+            "median_diff_ci95_low": np.nan,
+            "median_diff_ci95_high": np.nan,
+            "median_diff_ci_method": "paired_bootstrap_percentile",
+            "median_diff_ci_bootstrap_samples": 0,
+        }
+
+        if subject_consecutive_df is None or subject_consecutive_df.empty:
+            rows.append(row)
+            continue
+
+        df = subject_consecutive_df.copy()
+        col_a = f"session_a_{metric_key}"
+        col_b = f"session_b_{metric_key}"
+        if col_a not in df.columns or col_b not in df.columns:
+            rows.append(row)
+            continue
+
+        metric_a = pd.to_numeric(df[col_a], errors="coerce").to_numpy(dtype=np.float64)
+        metric_b = pd.to_numeric(df[col_b], errors="coerce").to_numpy(dtype=np.float64)
+        paired = np.isfinite(metric_a) & np.isfinite(metric_b)
+        n_pairs = int(np.count_nonzero(paired))
+        row["n_subjects_paired_finite_metric"] = n_pairs
+        if n_pairs == 0:
+            rows.append(row)
+            continue
+
+        values_a = metric_a[paired]
+        values_b = metric_b[paired]
+        diff_values = values_b - values_a
+        row["mean_session_a_metric"] = float(np.mean(values_a))
+        row["mean_session_b_metric"] = float(np.mean(values_b))
+        row["median_session_a_metric"] = float(np.median(values_a))
+        row["median_session_b_metric"] = float(np.median(values_b))
+        row["mean_diff_session_b_minus_a"] = float(np.mean(diff_values))
+        row["median_diff_session_b_minus_a"] = float(np.median(diff_values))
+
+        rank_biserial, n_nonzero, rank_sum_pos, rank_sum_neg = _rank_biserial_from_paired_diff(diff_values)
+        row["rank_biserial_correlation"] = rank_biserial
+        row["n_nonzero_diff_wilcoxon"] = int(n_nonzero)
+        row["wilcoxon_rank_sum_positive"] = rank_sum_pos
+        row["wilcoxon_rank_sum_negative"] = rank_sum_neg
+
+        if n_nonzero == 0:
+            row["wilcoxon_statistic"] = 0.0
+            row["wilcoxon_p_two_sided"] = 1.0
+        else:
+            try:
+                w_result = wilcoxon(
+                    values_a,
+                    values_b,
+                    alternative="two-sided",
+                    zero_method="wilcox",
+                    method="auto",
+                )
+                row["wilcoxon_statistic"] = float(w_result.statistic)
+                row["wilcoxon_p_two_sided"] = float(w_result.pvalue)
+            except ValueError:
+                pass
+
+        seed_input = f"{metric_key}|{session_a}|{session_b}|paired_median_ci"
+        seed_hash = hashlib.sha256(seed_input.encode("utf-8")).hexdigest()
+        seed = int(seed_hash[:16], 16) % (2**32)
+        ci_low, ci_high, n_boot = _bootstrap_paired_median_diff_ci(
+            diff_values,
+            n_boot=WILCOXON_CI_BOOTSTRAP_SAMPLES,
+            alpha=WILCOXON_CI_ALPHA,
+            seed=seed,
+        )
+        row["median_diff_ci95_low"] = ci_low
+        row["median_diff_ci95_high"] = ci_high
+        row["median_diff_ci_bootstrap_samples"] = int(n_boot)
 
         rows.append(row)
 
@@ -1836,6 +2129,244 @@ def _plot_subject_session_j_barplot(subject_j_df, out_path, session_a=1, session
     plt.close(fig)
 
 
+def _plot_subject_consecutive_metric_pairs(
+    subject_consecutive_df,
+    out_path,
+    session_a=1,
+    session_b=2,
+    metric_specs=CONSECUTIVE_METRIC_SPECS,
+):
+    n_metrics = max(1, int(len(metric_specs)))
+    fig, axes = plt.subplots(n_metrics, 1, figsize=(15.5, 4.0 * n_metrics), sharex=True)
+    axes = np.atleast_1d(axes)
+
+    if subject_consecutive_df is None or subject_consecutive_df.empty:
+        for ax in axes:
+            ax.text(0.5, 0.5, "No consecutive-trial metric data", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
+
+    df = subject_consecutive_df.copy()
+    if "sub_tag" in df.columns:
+        df["sub_tag"] = df["sub_tag"].astype(str)
+        df["_order"] = df["sub_tag"].map(_subject_order)
+        df = df.sort_values(["_order", "sub_tag"]).reset_index(drop=True)
+        labels = df["sub_tag"].tolist()
+    else:
+        labels = [str(idx) for idx in range(len(df))]
+
+    x = np.arange(len(df), dtype=np.float64)
+    x_a = x - 0.12
+    x_b = x + 0.12
+
+    for ax, metric_spec in zip(axes, metric_specs):
+        metric_key = str(metric_spec["key"])
+        metric_label = str(metric_spec["label"])
+        col_a = f"session_a_{metric_key}"
+        col_b = f"session_b_{metric_key}"
+        if col_a not in df.columns or col_b not in df.columns:
+            ax.text(
+                0.5,
+                0.5,
+                f"Missing columns for {metric_label}",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.set_axis_off()
+            continue
+
+        value_a = pd.to_numeric(df[col_a], errors="coerce").to_numpy(dtype=np.float64)
+        value_b = pd.to_numeric(df[col_b], errors="coerce").to_numpy(dtype=np.float64)
+        finite_a = np.isfinite(value_a)
+        finite_b = np.isfinite(value_b)
+        finite_pair = finite_a & finite_b
+
+        if not np.any(finite_a | finite_b):
+            ax.text(
+                0.5,
+                0.5,
+                f"No finite values for {metric_label}",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            ax.set_axis_off()
+            continue
+
+        if np.any(finite_pair):
+            for x_i, y_a, y_b in zip(x[finite_pair], value_a[finite_pair], value_b[finite_pair]):
+                ax.plot(
+                    [float(x_i - 0.12), float(x_i + 0.12)],
+                    [float(y_a), float(y_b)],
+                    color="0.65",
+                    linewidth=0.75,
+                    alpha=0.8,
+                    zorder=1,
+                )
+
+        ax.scatter(
+            x_a[finite_a],
+            value_a[finite_a],
+            s=22,
+            color="tab:blue",
+            alpha=0.9,
+            edgecolors="none",
+            label=f"Session {int(session_a)}",
+            zorder=2,
+        )
+        ax.scatter(
+            x_b[finite_b],
+            value_b[finite_b],
+            s=22,
+            color="tab:red",
+            alpha=0.9,
+            edgecolors="none",
+            label=f"Session {int(session_b)}",
+            zorder=2,
+        )
+
+        diff = value_b[finite_pair] - value_a[finite_pair]
+        n_up = int(np.count_nonzero(diff > 0.0))
+        n_down = int(np.count_nonzero(diff < 0.0))
+        n_tie = int(np.count_nonzero(np.isclose(diff, 0.0)))
+        median_diff = float(np.median(diff)) if diff.size else np.nan
+        stats_text = (
+            f"n paired={int(np.count_nonzero(finite_pair))}\n"
+            f"s2>s1: {n_up}, s1>s2: {n_down}, ties: {n_tie}\n"
+            f"median(s2-s1)={median_diff:.3g}"
+        )
+        ax.text(
+            0.99,
+            0.98,
+            stats_text,
+            transform=ax.transAxes,
+            ha="right",
+            va="top",
+            fontsize=8,
+            bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.88, "edgecolor": "0.75"},
+        )
+
+        ax.set_ylabel(metric_label)
+        ax.set_title(f"{metric_label} by subject (session {int(session_a)} vs {int(session_b)})")
+        ax.grid(axis="y", alpha=0.2)
+
+    if labels:
+        axes[-1].set_xticks(x)
+        axes[-1].set_xticklabels(labels, rotation=45, ha="right")
+    axes[-1].set_xlabel("Subject")
+
+    legend_handles = [
+        Line2D([0], [0], marker="o", color="tab:blue", linestyle="None", markersize=6, label=f"Session {int(session_a)}"),
+        Line2D([0], [0], marker="o", color="tab:red", linestyle="None", markersize=6, label=f"Session {int(session_b)}"),
+    ]
+    fig.legend(handles=legend_handles, loc="upper right", bbox_to_anchor=(0.995, 0.995), frameon=True)
+    fig.suptitle("Subject-level consecutive-trial metrics (runs 1+2 pooled)")
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+def _plot_group_consecutive_metric_wilcoxon_summary(
+    group_consecutive_df,
+    out_path,
+    session_a=1,
+    session_b=2,
+    metric_specs=CONSECUTIVE_METRIC_SPECS,
+):
+    fig, ax = plt.subplots(1, 1, figsize=(12.5, 5.4))
+
+    if group_consecutive_df is None or group_consecutive_df.empty:
+        ax.text(
+            0.5,
+            0.5,
+            "No group-level consecutive-trial Wilcoxon data",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
+
+    order_map = {str(spec["key"]): idx for idx, spec in enumerate(metric_specs)}
+    label_map = {str(spec["key"]): str(spec["label"]) for spec in metric_specs}
+
+    df = group_consecutive_df.copy()
+    if "metric" in df.columns:
+        df["metric"] = df["metric"].astype(str)
+        df["_order"] = df["metric"].map(lambda key: order_map.get(key, int(1e9)))
+        df = df.sort_values(["_order", "metric"]).reset_index(drop=True)
+    else:
+        df["metric"] = [f"metric_{idx}" for idx in range(len(df))]
+
+    y = np.arange(len(df), dtype=np.float64)
+    median_diff = pd.to_numeric(df.get("median_diff_session_b_minus_a", np.nan), errors="coerce").to_numpy(dtype=np.float64)
+    ci_low = pd.to_numeric(df.get("median_diff_ci95_low", np.nan), errors="coerce").to_numpy(dtype=np.float64)
+    ci_high = pd.to_numeric(df.get("median_diff_ci95_high", np.nan), errors="coerce").to_numpy(dtype=np.float64)
+    p_values = pd.to_numeric(df.get("wilcoxon_p_two_sided", np.nan), errors="coerce").to_numpy(dtype=np.float64)
+    rbc = pd.to_numeric(df.get("rank_biserial_correlation", np.nan), errors="coerce").to_numpy(dtype=np.float64)
+    n_pairs = pd.to_numeric(df.get("n_subjects_paired_finite_metric", np.nan), errors="coerce").to_numpy(dtype=np.float64)
+
+    finite_ci = np.isfinite(median_diff) & np.isfinite(ci_low) & np.isfinite(ci_high)
+    if np.any(finite_ci):
+        x_min = float(np.min(ci_low[finite_ci]))
+        x_max = float(np.max(ci_high[finite_ci]))
+        span = x_max - x_min
+        pad = (0.15 * span) if span > 0 else max(1e-6, 0.15 * max(abs(x_min), 1.0))
+        ax.set_xlim(x_min - pad, x_max + pad)
+
+    ax.axvline(0.0, color="black", linestyle="--", linewidth=1.0, alpha=0.85)
+
+    for idx in range(len(df)):
+        if finite_ci[idx]:
+            left_err = float(max(median_diff[idx] - ci_low[idx], 0.0))
+            right_err = float(max(ci_high[idx] - median_diff[idx], 0.0))
+            color = "tab:red" if median_diff[idx] >= 0 else "tab:blue"
+            ax.errorbar(
+                [median_diff[idx]],
+                [y[idx]],
+                xerr=[[left_err], [right_err]],
+                fmt="o",
+                color=color,
+                ecolor=color,
+                elinewidth=2.0,
+                capsize=4,
+                markersize=6,
+            )
+        label_text = (
+            f"n={int(n_pairs[idx]) if np.isfinite(n_pairs[idx]) else 0}, "
+            f"p={p_values[idx]:.3g}, r_rb={rbc[idx]:.3g}"
+        )
+        ax.text(
+            1.01,
+            y[idx],
+            label_text,
+            transform=ax.get_yaxis_transform(),
+            ha="left",
+            va="center",
+            fontsize=9,
+        )
+
+    y_labels = [label_map.get(str(metric), str(metric)) for metric in df["metric"].tolist()]
+    ax.set_yticks(y)
+    ax.set_yticklabels(y_labels)
+    ax.invert_yaxis()
+    ax.grid(axis="x", alpha=0.2)
+    ax.set_xlabel(f"Median difference (session {int(session_b)} - session {int(session_a)}) with 95% CI")
+    ax.set_title(
+        "Group-level consecutive-trial metric comparison (Wilcoxon signed-rank, rank-biserial effect)"
+    )
+    fig.tight_layout(rect=[0, 0, 0.88, 1])
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
 def _plot_metric_by_ses_run(df, value_col, x_label, title, out_path, color):
     combos = [(1, 1), (1, 2), (2, 1), (2, 2)]
     fig, axes = plt.subplots(2, 2, figsize=(16, 10), sharey=True)
@@ -2078,6 +2609,12 @@ def main():
     pooled_cv_subject_csv_path = os.path.join(out_dir, f"{stem}_sub_session12_pooled_cv_stats.csv")
     pooled_cv_group_csv_path = os.path.join(out_dir, f"{stem}_group_session12_pooled_cv_stats.csv")
     pooled_j_subject_csv_path = os.path.join(out_dir, f"{stem}_sub_session12_pooled_j_stats.csv")
+    consecutive_metrics_subject_csv_path = os.path.join(
+        out_dir, f"{stem}_sub_session12_consecutive_trial_metrics.csv"
+    )
+    consecutive_metrics_group_csv_path = os.path.join(
+        out_dir, f"{stem}_group_session12_consecutive_trial_metrics_wilcoxon.csv"
+    )
     variance_plot_path = os.path.join(
         out_dir, f"{stem}_sub_ses_run_projection_variability_subject_comp.png"
     )
@@ -2095,6 +2632,12 @@ def main():
     pooled_cv_plot_path = os.path.join(out_dir, f"{stem}_sub_session12_pooled_cv_boxplot_summary.png")
     pooled_metric_plot_paths["cv_projection"] = pooled_cv_plot_path
     pooled_j_plot_path = os.path.join(out_dir, f"{stem}_sub_session12_pooled_j_subject_barplot.png")
+    consecutive_metrics_subject_plot_path = os.path.join(
+        out_dir, f"{stem}_sub_session12_consecutive_trial_metrics_subject_pairs.png"
+    )
+    consecutive_metrics_group_plot_path = os.path.join(
+        out_dir, f"{stem}_group_session12_consecutive_trial_metrics_wilcoxon_summary.png"
+    )
     consecutive_trial_scatter_dir = os.path.join(
         out_dir,
         f"{stem}_sub_session12_consecutive_trial_scatter_random_subjects",
@@ -2132,6 +2675,17 @@ def main():
         session_b=2,
         runs=(1, 2),
     )
+    consecutive_metrics_subject_df = compute_subject_session_consecutive_metrics(
+        run_segments,
+        session_a=1,
+        session_b=2,
+        runs=(1, 2),
+    )
+    consecutive_metrics_group_df = build_group_level_consecutive_metric_stats(
+        consecutive_metrics_subject_df,
+        session_a=1,
+        session_b=2,
+    )
 
     run_variance_df.to_csv(variance_csv_path, index=False)
     run_std_rms_df.to_csv(std_rms_csv_path, index=False)
@@ -2143,6 +2697,8 @@ def main():
     pooled_cv_subject_df.to_csv(pooled_cv_subject_csv_path, index=False)
     pooled_cv_group_df.to_csv(pooled_cv_group_csv_path, index=False)
     pooled_j_subject_df.to_csv(pooled_j_subject_csv_path, index=False)
+    consecutive_metrics_subject_df.to_csv(consecutive_metrics_subject_csv_path, index=False)
+    consecutive_metrics_group_df.to_csv(consecutive_metrics_group_csv_path, index=False)
 
     _plot_metric_by_ses_run(
         run_variance_df,
@@ -2204,6 +2760,18 @@ def main():
         session_a=1,
         session_b=2,
     )
+    _plot_subject_consecutive_metric_pairs(
+        consecutive_metrics_subject_df,
+        out_path=consecutive_metrics_subject_plot_path,
+        session_a=1,
+        session_b=2,
+    )
+    _plot_group_consecutive_metric_wilcoxon_summary(
+        consecutive_metrics_group_df,
+        out_path=consecutive_metrics_group_plot_path,
+        session_a=1,
+        session_b=2,
+    )
 
     print(f"Projection length: {projection.size}")
     print(f"Projection source path: {resolved_projection_path}")
@@ -2220,6 +2788,8 @@ def main():
     print(f"Rows (subject KS): {len(subject_ks_df)}")
     print(f"Rows (subject pooled metrics): {len(pooled_metrics_subject_df)}")
     print(f"Rows (subject pooled J): {len(pooled_j_subject_df)}")
+    print(f"Rows (subject consecutive metrics): {len(consecutive_metrics_subject_df)}")
+    print(f"Rows (group consecutive metric tests): {len(consecutive_metrics_group_df)}")
     print(f"Saved variance CSV: {variance_csv_path}")
     print(f"Saved std/rms CSV:  {std_rms_csv_path}")
     print(f"Saved stats CSV:    {stats_csv_path}")
@@ -2230,12 +2800,16 @@ def main():
     print(f"Saved subject pooled CV CSV: {pooled_cv_subject_csv_path}")
     print(f"Saved group pooled CV CSV:   {pooled_cv_group_csv_path}")
     print(f"Saved subject pooled J CSV:  {pooled_j_subject_csv_path}")
+    print(f"Saved subject consecutive-metric CSV: {consecutive_metrics_subject_csv_path}")
+    print(f"Saved group consecutive-metric Wilcoxon CSV: {consecutive_metrics_group_csv_path}")
     print(f"Saved variability figure: {variance_plot_path}")
     print(f"Saved std/rms figure:    {std_rms_plot_path}")
     print(f"Saved KS figure:         {ks_plot_path}")
     print(f"Saved KS 2x7 grid figure:{ks_subject_grid_plot_path}")
     print(f"Saved pooled CV box-plot figure:  {pooled_cv_plot_path}")
     print(f"Saved pooled J subject bar-plot figure: {pooled_j_plot_path}")
+    print(f"Saved subject consecutive-metric figure: {consecutive_metrics_subject_plot_path}")
+    print(f"Saved group consecutive-metric Wilcoxon figure: {consecutive_metrics_group_plot_path}")
     print(
         "Saved consecutive-trial scatter directory: "
         f"{consecutive_trial_scatter_dir}"
@@ -2264,6 +2838,10 @@ def main():
     print(pooled_metrics_subject_df.to_string(index=False))
     print("\nGroup-level pooled metric session comparison:")
     print(pooled_metrics_group_df.to_string(index=False))
+    print("\nSubject-level consecutive-trial metrics (session 1 vs session 2, runs 1+2 pooled):")
+    print(consecutive_metrics_subject_df.to_string(index=False))
+    print("\nGroup-level consecutive-trial Wilcoxon comparison:")
+    print(consecutive_metrics_group_df.to_string(index=False))
 
 
 if __name__ == "__main__":
