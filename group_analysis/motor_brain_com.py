@@ -1,6 +1,7 @@
 import argparse
 import os
 import re
+import warnings
 
 import matplotlib
 
@@ -10,6 +11,7 @@ from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 from scipy.stats import gaussian_kde, ttest_rel, wilcoxon
+import statsmodels.formula.api as smf
 
 DEFAULT_MANIFEST_PATH = "/Data/zahra/results_beta_preprocessed/group_concat/concat_manifest_group.tsv"
 DEFAULT_TRIAL_KEEP_ROOT = "/Data/zahra/results_glm"
@@ -571,6 +573,100 @@ def _paired_tests_two_sided(values_a, values_b):
     return row
 
 
+def _mixedlm_projection_effect(
+    paired_df,
+    behavior_value_col="behavior_raw",
+    projection_value_col="projection_raw",
+    subject_col="sub_tag",
+):
+    required_cols = {subject_col, behavior_value_col, projection_value_col}
+    missing_cols = required_cols.difference(paired_df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns for mixed-effects model: {sorted(missing_cols)}"
+        )
+
+    model_df = paired_df.loc[
+        :,
+        [subject_col, behavior_value_col, projection_value_col],
+    ].copy()
+    model_df = model_df.rename(
+        columns={
+            subject_col: "subject_id",
+            behavior_value_col: "behavior_value",
+            projection_value_col: "projection_value",
+        }
+    )
+    model_df["subject_id"] = model_df["subject_id"].astype(str)
+    model_df = model_df.loc[
+        np.isfinite(model_df["behavior_value"]) & np.isfinite(model_df["projection_value"])
+    ].reset_index(drop=True)
+
+    row = {
+        "n_runs": int(model_df.shape[0]),
+        "n_subjects": int(model_df["subject_id"].nunique()),
+        "mean_diff_projection_minus_behavior": np.nan,
+        "median_diff_projection_minus_behavior": np.nan,
+        "lme_coef_projection_minus_behavior": np.nan,
+        "lme_se_projection_minus_behavior": np.nan,
+        "lme_z_projection_minus_behavior": np.nan,
+        "lme_p_two_sided": np.nan,
+    }
+    if model_df.empty:
+        return row
+
+    diff = (
+        model_df["projection_value"].to_numpy(dtype=np.float64)
+        - model_df["behavior_value"].to_numpy(dtype=np.float64)
+    )
+    row["mean_diff_projection_minus_behavior"] = float(np.mean(diff))
+    row["median_diff_projection_minus_behavior"] = float(np.median(diff))
+
+    if row["n_subjects"] < 2 or row["n_runs"] < 2:
+        return row
+
+    behavior_long = model_df.loc[:, ["subject_id", "behavior_value"]].copy()
+    behavior_long["signal"] = "Behaviour"
+    behavior_long["value"] = behavior_long.pop("behavior_value")
+
+    projection_long = model_df.loc[:, ["subject_id", "projection_value"]].copy()
+    projection_long["signal"] = "Projection"
+    projection_long["value"] = projection_long.pop("projection_value")
+
+    long_df = pd.concat([behavior_long, projection_long], axis=0, ignore_index=True)
+    long_df["signal"] = pd.Categorical(
+        long_df["signal"],
+        categories=["Behaviour", "Projection"],
+        ordered=True,
+    )
+
+    fit = None
+    for method in ("lbfgs", "powell", "bfgs", "cg", "nm"):
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                fit = smf.mixedlm(
+                    "value ~ signal",
+                    data=long_df,
+                    groups=long_df["subject_id"],
+                    re_formula="1",
+                ).fit(reml=False, method=method, disp=False)
+            break
+        except Exception:
+            fit = None
+
+    if fit is None:
+        return row
+
+    coef_name = "signal[T.Projection]"
+    row["lme_coef_projection_minus_behavior"] = float(fit.params.get(coef_name, np.nan))
+    row["lme_se_projection_minus_behavior"] = float(fit.bse.get(coef_name, np.nan))
+    row["lme_z_projection_minus_behavior"] = float(fit.tvalues.get(coef_name, np.nan))
+    row["lme_p_two_sided"] = float(fit.pvalues.get(coef_name, np.nan))
+
+    return row
+
+
 def _bootstrap_ci(values, statistic="mean", n_bootstrap=10000, ci_percent=95.0, random_seed=0):
     values = np.asarray(values, dtype=np.float64)
     values = values[np.isfinite(values)]
@@ -1085,13 +1181,15 @@ def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
         ("ses", "Session colors", "Session"),
         ("run", "Run colors", "Run")]
 
-    column_ttests = []
+    column_lme_stats = []
     for _, metric_col_df, _ in column_defs:
-        tests = _paired_tests_two_sided(
-            metric_col_df["projection_raw"].to_numpy(dtype=np.float64),
-            metric_col_df["behavior_raw"].to_numpy(dtype=np.float64),
+        lme_stats = _mixedlm_projection_effect(
+            metric_col_df,
+            behavior_value_col="behavior_raw",
+            projection_value_col="projection_raw",
+            subject_col="sub_tag",
         )
-        column_ttests.append(tests)
+        column_lme_stats.append(lme_stats)
 
     column_limits = []
     for _, metric_col_df, _ in column_defs:
@@ -1131,14 +1229,22 @@ def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
             ax.set_ylim(column_limits[col_idx])
             ax.set_title(f"{column_title}", fontsize=11.0)
             if row_idx == 0:
-                test_row = column_ttests[col_idx]
-                if np.isfinite(test_row["ttest_p_two_sided"]) and np.isfinite(test_row["ttest_stat"]):
+                test_row = column_lme_stats[col_idx]
+                if np.isfinite(test_row["lme_p_two_sided"]) and np.isfinite(
+                    test_row["lme_z_projection_minus_behavior"]
+                ):
                     ttest_text = (
-                        f"paired t (BOLD-Behavior)\n"
-                        f"p={test_row['ttest_p_two_sided']:.3g}, t={test_row['ttest_stat']:.3g}, n={int(test_row['n_pairs'])}"
+                        f"LME (Projection-Behaviour)\n"
+                        f"p={test_row['lme_p_two_sided']:.3g}, "
+                        f"z={test_row['lme_z_projection_minus_behavior']:.3g}, "
+                        f"beta={test_row['lme_coef_projection_minus_behavior']:.3g}\n"
+                        f"subjects={int(test_row['n_subjects'])}, runs={int(test_row['n_runs'])}"
                     )
                 else:
-                    ttest_text = f"paired t (BOLD-Behavior)\ninsufficient pairs (n={int(test_row['n_pairs'])})"
+                    ttest_text = (
+                        "LME (Projection-Behaviour)\n"
+                        "fit unavailable"
+                    )
                 ax.text(
                     0.02,
                     0.98,
@@ -1165,6 +1271,135 @@ def plot_variance_cv_subject_session_run_3x2(metric_df, out_path):
     tight_bottom = 0.0
     fig.tight_layout(rect=(0.0, tight_bottom, 0.995, 0.965))
     fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def plot_metric_grid_first_row_second_column(metric_df, out_path):
+    column_defs = _build_metric_column_dfs(
+        metric_df=metric_df,
+        metric_specs=METRIC_SPECS[1:],
+        use_zscore=False,
+    )
+    if len(column_defs) < 2:
+        raise RuntimeError(
+            "The metric grid does not have a second column to export as a standalone figure."
+        )
+    column_title, metric_col_df, metric_spec = column_defs[1]
+    metric_col_df = metric_col_df.loc[
+        metric_col_df["sub_tag"].astype(str).map(lambda value: int(_extract_subject_digits(value))) != 17
+    ].reset_index(drop=True)
+    if metric_col_df.empty:
+        raise RuntimeError("No rows remain for the standalone panel after excluding subject 17.")
+
+    combined_values = np.concatenate(
+        [metric_col_df["behavior_raw"], metric_col_df["projection_raw"]]
+    )
+    finite_values = combined_values[np.isfinite(combined_values)]
+    if finite_values.size == 0:
+        y_limits = (-1.0, 1.0)
+    else:
+        q_low = float(np.percentile(finite_values, 2.0))
+        q_high = float(np.percentile(finite_values, 98.0))
+        q_span = q_high - q_low
+        pad = 0.18 * q_span if q_span > 0 else 0.55
+        y_limits = (q_low - pad, q_high + pad)
+
+    color_map, category_values = _build_category_color_map(
+        metric_col_df["sub_tag"].tolist(),
+        category_name="sub_tag",
+    )
+    lme_stats = _mixedlm_projection_effect(
+        metric_col_df,
+        behavior_value_col="behavior_raw",
+        projection_value_col="projection_raw",
+        subject_col="sub_tag",
+    )
+
+    if str(metric_spec["key"]) == "adjacent_diff_ratio_sum":
+        panel_title = "Behavior vs BOLD adjacent-trial change ratio across runs"
+        x_tick_labels = (
+            "Behaviour",
+            "Projection",
+        )
+    else:
+        panel_title = f"Behavior vs BOLD {column_title} across runs, colored by subject"
+        x_tick_labels = (
+            "Behaviour",
+            "Projection",
+        )
+
+    fig, ax = plt.subplots(figsize=(9.2, 4.8))
+    _plot_paired_box_with_connections(
+        ax=ax,
+        paired_df=metric_col_df,
+        group_col="sub_tag",
+        color_map=color_map,
+        jitter_seed=140,
+        y_limits=y_limits,
+        behavior_value_col="behavior_raw",
+        projection_value_col="projection_raw",
+        x_tick_labels=x_tick_labels,
+    )
+    ax.set_ylim(y_limits)
+    ax.set_ylabel("Variability")
+    ax.set_title("")
+
+    if np.isfinite(lme_stats["lme_p_two_sided"]) and np.isfinite(
+        lme_stats["lme_z_projection_minus_behavior"]
+    ):
+        ttest_text = (
+            "LME (Projection-Behaviour)\n"
+            f"p={lme_stats['lme_p_two_sided']:.3g}, "
+            f"z={lme_stats['lme_z_projection_minus_behavior']:.3g}, "
+            f"beta={lme_stats['lme_coef_projection_minus_behavior']:.3g}"
+        )
+    else:
+        ttest_text = "LME (Projection-Behaviour)\nfit unavailable"
+    ax.text(
+        0.70,
+        0.98,
+        ttest_text,
+        transform=ax.transAxes,
+        ha="center",
+        va="top",
+        fontsize=8.3,
+        bbox={
+            "boxstyle": "round,pad=0.22",
+            "facecolor": "white",
+            "alpha": 0.8,
+            "edgecolor": "0.75",
+        },
+    )
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="",
+            markerfacecolor=color_map[value],
+            markeredgecolor="0.25",
+            markersize=5.5,
+            label=str(value),
+        )
+        for value in category_values
+    ]
+    ax.legend(
+        handles=handles,
+        title="Subject",
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.42),
+        fontsize=7.5,
+        title_fontsize=8.5,
+        frameon=True,
+        ncol=2,
+        borderaxespad=0.4,
+        handletextpad=0.35,
+        columnspacing=0.8,
+        labelspacing=0.25,
+    )
+
+    fig.tight_layout(rect=(0.0, 0.0, 0.74, 1.0))
+    fig.savefig(out_path, dpi=220, bbox_inches="tight", pad_inches=0.04)
     plt.close(fig)
 
 
@@ -2488,6 +2723,9 @@ def main():
         "metric_grid_plot": os.path.join(
             out_dir, f"{stem}_projection_behavior_all_metrics_raw_grid.png"
         ),
+        "metric_grid_first_row_second_col_plot": os.path.join(
+            out_dir, f"{stem}_projection_behavior_grid_row1_col2.png"
+        ),
         "outside_box_counts_csv": os.path.join(
             out_dir,
             f"{stem}_all_metrics_outside_box_counts_behavior_vs_bold_all_categories.csv",
@@ -2568,6 +2806,10 @@ def main():
     plot_variance_cv_subject_session_run_3x2(
         comparison_df,
         output_paths["metric_grid_plot"],
+    )
+    plot_metric_grid_first_row_second_column(
+        comparison_df,
+        output_paths["metric_grid_first_row_second_col_plot"],
     )
     plot_outside_box_counts_behavior_vs_bold_3x2(
         comparison_df,
