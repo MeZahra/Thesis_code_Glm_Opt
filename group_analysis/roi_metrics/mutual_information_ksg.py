@@ -4,13 +4,13 @@ import numpy as np
 from scipy.spatial import cKDTree
 from scipy.special import digamma
 
-from .common import ensure_2d_roi_ts, impute_nan_by_row_median, robust_positive_vmax
+from .common import ensure_2d_roi_ts, impute_nan_by_row_median
 
 
 METRIC_NAME = "mutual_information_ksg"
 METRIC_DESCRIPTION = (
     "Pairwise continuous mutual information using the Kraskov-Stogbauer-Grassberger "
-    "kNN estimator (KSG, estimator I)."
+    "kNN estimator (KSG, estimator I), without non-negativity clipping."
 )
 
 
@@ -61,7 +61,7 @@ def _ksg_mi_pairwise(x: np.ndarray, y: np.ndarray, k: int, jitter: float, rng: n
     mi = float(digamma(k) + digamma(n_samples) - np.mean(digamma(nx + 1) + digamma(ny + 1)))
     if not np.isfinite(mi):
         return np.nan
-    return float(max(0.0, mi))
+    return mi
 
 
 def compute_metric(roi_ts: np.ndarray, k: int = 3, jitter: float = 1e-10) -> dict:
@@ -79,13 +79,30 @@ def compute_metric(roi_ts: np.ndarray, k: int = 3, jitter: float = 1e-10) -> dic
             mat[j, i] = val
 
     mat = np.nan_to_num(mat, nan=0.0, posinf=0.0, neginf=0.0)
-    mat = np.clip(mat, 0.0, None)
     np.fill_diagonal(mat, 0.0)
 
-    vmax = robust_positive_vmax(mat, percentile=99.0, fallback=1e-3)
+    finite = mat[np.isfinite(mat)]
+    if finite.size == 0:
+        vmin = -1e-3
+        vmax = 1e-3
+    else:
+        vmin = float(np.min(finite))
+        vmax = float(np.max(finite))
+        if not np.isfinite(vmin):
+            vmin = -1e-3
+        if not np.isfinite(vmax):
+            vmax = 1e-3
+        if vmax <= vmin:
+            if abs(vmax) <= 1e-12:
+                vmin = -1e-3
+                vmax = 1e-3
+            else:
+                delta = max(1e-6, 0.05 * abs(vmax))
+                vmin -= delta
+                vmax += delta
     return {
         "matrix": mat,
-        "vmin": 0.0,
+        "vmin": float(vmin),
         "vmax": float(vmax),
         "cmap": "jet",
         "directed": False,
