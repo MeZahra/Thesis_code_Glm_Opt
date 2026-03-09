@@ -98,6 +98,36 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--wavelet-smooth-scale-sigma", type=float, default=1.0)
     parser.add_argument("--wavelet-smooth-time-sigma", type=float, default=2.0)
     parser.add_argument(
+        "--wavelet-fmin-hz",
+        type=float,
+        default=0.01,
+        help="Lower frequency bound for wavelet coherence; <=0 disables the lower bound.",
+    )
+    parser.add_argument(
+        "--wavelet-fmax-hz",
+        type=float,
+        default=0.1,
+        help="Upper frequency bound for wavelet coherence; <=0 disables the upper bound.",
+    )
+    parser.add_argument(
+        "--wavelet-mask-coi",
+        action="store_true",
+        default=True,
+        help="Mask the cone of influence for wavelet coherence (default: enabled).",
+    )
+    parser.add_argument(
+        "--wavelet-no-mask-coi",
+        dest="wavelet_mask_coi",
+        action="store_false",
+        help="Disable cone-of-influence masking for wavelet coherence.",
+    )
+    parser.add_argument(
+        "--wavelet-coi-factor",
+        type=float,
+        default=float(np.sqrt(2.0)),
+        help="Cone-of-influence half-width factor used when COI masking is enabled.",
+    )
+    parser.add_argument(
         "--connectome-edge-threshold-percentile",
         type=float,
         default=85.0,
@@ -408,12 +438,18 @@ def _metric_kwargs(metric_name: str, args: argparse.Namespace) -> dict:
             "alpha": float(getattr(args, "kernel_granger_alpha", 0.05)),
         }
     if metric_name == "wavelet_transform_coherence":
+        fmin_hz = float(getattr(args, "wavelet_fmin_hz", 0.01))
+        fmax_hz = float(getattr(args, "wavelet_fmax_hz", 0.1))
         return {
             "min_scale": int(args.wavelet_min_scale),
             "max_scale": int(args.wavelet_max_scale),
             "omega0": float(args.wavelet_omega0),
             "smooth_scale_sigma": float(args.wavelet_smooth_scale_sigma),
             "smooth_time_sigma": float(args.wavelet_smooth_time_sigma),
+            "fmin_hz": None if fmin_hz <= 0.0 else fmin_hz,
+            "fmax_hz": None if fmax_hz <= 0.0 else fmax_hz,
+            "mask_coi": bool(getattr(args, "wavelet_mask_coi", True)),
+            "coi_factor": float(getattr(args, "wavelet_coi_factor", np.sqrt(2.0))),
         }
     return {}
 

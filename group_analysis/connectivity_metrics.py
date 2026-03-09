@@ -419,24 +419,10 @@ def _add_relative_rois(
             None,
         ),
         (
-            "Brain-Stem (relative)",
-            "Harvard-Oxford Subcortical (thr25, 2mm)",
-            "sub",
-            ["brain-stem"],
-            None,
-        ),
-        (
             "Other Cerebral Cortex (relative)",
             "Harvard-Oxford Subcortical (thr25, 2mm)",
             "sub",
             ["cerebral cortex"],
-            None,
-        ),
-        (
-            "Cerebral White Matter (relative)",
-            "Harvard-Oxford Subcortical (thr25, 2mm)",
-            "sub",
-            ["cerebral white matter"],
             None,
         ),
     ]
@@ -567,21 +553,10 @@ def _plot_roi_figure(
         colorbar=False,
         figure=fig,
         axes=ax_brain,
-        title="Created ROI Atlas (requested + relative ROIs)",
     )
 
     ax_text.axis("off")
-    ax_text.text(
-        0.0,
-        1.0,
-        "ROI legend (active voxels):",
-        fontsize=11,
-        weight="bold",
-        va="top",
-        transform=ax_text.transAxes,
-    )
-
-    y = 0.955
+    y = 0.99
     line_step = min(0.082, 0.90 / max(n_rois, 1))
     font_size = 8 if n_rois > 12 else 9
     for row in rows:
@@ -597,10 +572,7 @@ def _plot_roi_figure(
                 clip_on=False,
             )
         )
-        text = (
-            f"{row['roi_id']:>2}. {row['roi_name']} | "
-            f"active={row['n_active_voxels']} ({row['active_coverage'] * 100:.1f}%)"
-        )
+        text = f"{row['roi_name']} ({row['n_active_voxels']} active voxels)"
         ax_text.text(0.035, y, text, fontsize=font_size, va="top", transform=ax_text.transAxes)
         y -= line_step
 

@@ -62,6 +62,16 @@ def _parse_args() -> argparse.Namespace:
         help="NPZ with selected_ijk or selected_flat_indices for selected beta rows.",
     )
     parser.add_argument(
+        "--voxel-weight-img",
+        type=Path,
+        default=None,
+        help=(
+            "Optional NIfTI image with one weight per voxel in the same space as the ROI image. "
+            "When provided, each beta row is multiplied by the corresponding selected-voxel weight "
+            "before ROI aggregation."
+        ),
+    )
+    parser.add_argument(
         "--out-dir",
         type=Path,
         default=Path("results/connectivity/roi_edge_network"),
@@ -218,6 +228,36 @@ def _parse_args() -> argparse.Namespace:
         help="Time-axis smoothing sigma for wavelet coherence.",
     )
     parser.add_argument(
+        "--wavelet-fmin-hz",
+        type=float,
+        default=0.01,
+        help="Lower frequency bound for wavelet coherence; <=0 disables the lower bound.",
+    )
+    parser.add_argument(
+        "--wavelet-fmax-hz",
+        type=float,
+        default=0.1,
+        help="Upper frequency bound for wavelet coherence; <=0 disables the upper bound.",
+    )
+    parser.add_argument(
+        "--wavelet-mask-coi",
+        action="store_true",
+        default=True,
+        help="Mask the cone of influence for wavelet coherence (default: enabled).",
+    )
+    parser.add_argument(
+        "--wavelet-no-mask-coi",
+        dest="wavelet_mask_coi",
+        action="store_false",
+        help="Disable cone-of-influence masking for wavelet coherence.",
+    )
+    parser.add_argument(
+        "--wavelet-coi-factor",
+        type=float,
+        default=float(np.sqrt(2.0)),
+        help="Cone-of-influence half-width factor used when COI masking is enabled.",
+    )
+    parser.add_argument(
         "--respect-temporal-boundaries",
         action="store_true",
         help=(
@@ -313,6 +353,34 @@ def _load_selected_ijk(path: Path, volume_shape: Tuple[int, int, int]) -> np.nda
         print(f"Warning: dropping {dropped} out-of-bounds selected voxels from metadata.", flush=True)
         ijk = ijk[valid]
     return ijk
+
+
+def _load_selected_voxel_weights(
+    weight_img_path: Path | None,
+    selected_ijk: np.ndarray,
+    volume_shape: Tuple[int, int, int],
+    reference_affine: np.ndarray,
+) -> np.ndarray | None:
+    if weight_img_path is None:
+        return None
+
+    weight_img = nib.load(str(weight_img_path))
+    weight_data = np.asarray(weight_img.get_fdata(), dtype=np.float64)
+    if weight_data.shape != volume_shape:
+        raise ValueError(
+            f"Voxel-weight image shape {weight_data.shape} does not match expected volume shape {volume_shape}: "
+            f"{weight_img_path}"
+        )
+    if not np.allclose(weight_img.affine, reference_affine):
+        print(
+            f"Warning: voxel-weight image affine differs from ROI image affine: {weight_img_path}",
+            flush=True,
+        )
+
+    x, y, z = selected_ijk.T
+    weights = weight_data[x, y, z].astype(np.float64, copy=False)
+    weights = np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    return weights
 
 
 def _load_roi_names(summary_path: Path) -> Dict[int, str]:
@@ -441,6 +509,9 @@ def main() -> None:
     roi_img_path = args.roi_img.expanduser().resolve()
     roi_summary_path = args.roi_summary.expanduser().resolve()
     voxel_indices_path = args.voxel_indices_path.expanduser().resolve()
+    voxel_weight_img_path = (
+        args.voxel_weight_img.expanduser().resolve() if args.voxel_weight_img is not None else None
+    )
     out_dir = args.out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -449,6 +520,12 @@ def main() -> None:
     roi_data = roi_img.get_fdata().astype(np.int32)
 
     selected_ijk = _load_selected_ijk(voxel_indices_path, roi_data.shape)
+    selected_voxel_weights = _load_selected_voxel_weights(
+        voxel_weight_img_path,
+        selected_ijk,
+        roi_data.shape,
+        roi_img.affine,
+    )
     n_selected = selected_ijk.shape[0]
     x, y, z = selected_ijk.T
     roi_labels_at_selected = roi_data[x, y, z]
@@ -562,9 +639,13 @@ def main() -> None:
             )
             continue
 
+        beta_data = np.asarray(beta, dtype=np.float64)
+        if selected_voxel_weights is not None:
+            beta_data = beta_data * selected_voxel_weights[:, None]
+
         roi_ts = np.full((n_rois, beta.shape[1]), np.nan, dtype=np.float64)
         for idx, members in enumerate(roi_member_indices):
-            roi_ts[idx] = np.nanmean(np.asarray(beta[members, :], dtype=np.float64), axis=0)
+            roi_ts[idx] = np.nanmean(beta_data[members, :], axis=0)
 
         node_conn = _safe_corrcoef_rows(roi_ts)
         node_conn = np.clip(node_conn, -1.0, 1.0, out=node_conn)
@@ -611,7 +692,8 @@ def main() -> None:
 
         per_file_summary.append({"label": label, "beta_file": str(beta_path), "n_trials": int(beta.shape[1]), "n_rois": n_rois, "n_edges": int(len(edge_pairs)),
              "roi_ts_finite_fraction": float(np.mean(np.isfinite(roi_ts))), "conn_finite_fraction": float(np.mean(np.isfinite(node_conn))),
-             "edge_corr_finite_fraction": float(np.mean(np.isfinite(edge_corr)))})
+             "edge_corr_finite_fraction": float(np.mean(np.isfinite(edge_corr))),
+             "voxel_weighting_applied": bool(selected_voxel_weights is not None)})
         print(f"Processed {label}: trials={beta.shape[1]}, rois={n_rois}, edges={len(edge_pairs)}", flush=True)
 
     if not connectivity_vec_rows:
@@ -672,6 +754,18 @@ def main() -> None:
         "data_dir": str(data_dir),
         "roi_img": str(roi_img_path),
         "voxel_indices_path": str(voxel_indices_path),
+        "voxel_weight_img": str(voxel_weight_img_path) if voxel_weight_img_path is not None else None,
+        "voxel_weighting_applied": bool(selected_voxel_weights is not None),
+        "voxel_weight_summary": (
+            {
+                "min": float(np.min(selected_voxel_weights)),
+                "max": float(np.max(selected_voxel_weights)),
+                "mean": float(np.mean(selected_voxel_weights)),
+                "nonzero": int(np.count_nonzero(selected_voxel_weights)),
+            }
+            if selected_voxel_weights is not None
+            else None
+        ),
         "beta_pattern": args.beta_pattern,
         "min_roi_voxels": int(args.min_roi_voxels),
         "split_hemispheres": bool(args.split_hemispheres),
