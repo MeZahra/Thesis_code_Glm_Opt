@@ -34,6 +34,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.ticker import MaxNLocator
+import nibabel as nib
 import numpy as np
 import pandas as pd
 from scipy.stats import gaussian_kde
@@ -54,6 +55,10 @@ J_BOOTSTRAP_SAMPLES = 2000
 J_BOOTSTRAP_BLOCK_LENGTH = 8
 WILCOXON_CI_ALPHA = 0.05
 WILCOXON_CI_BOOTSTRAP_SAMPLES = 5000
+DEFAULT_GROUP_CONCAT_DIR = "/Data/zahra/results_beta_preprocessed/group_concat"
+DEFAULT_BETA_PATH = os.path.join(DEFAULT_GROUP_CONCAT_DIR, "beta_volume_filter_group.npy")
+DEFAULT_ACTIVE_COORDS_PATH = os.path.join(DEFAULT_GROUP_CONCAT_DIR, "active_coords_group.npy")
+DEFAULT_NIFTI_WEIGHT_SCALE = 1000.0
 
 POOLED_METRIC_SPECS = [
     {
@@ -2474,6 +2479,104 @@ def _load_projection_vector(path):
         raise RuntimeError(f"Failed to load numeric projection from '{path}'.") from exc
 
 
+def _path_stem(path):
+    base_name = os.path.basename(str(path))
+    if base_name.endswith(".nii.gz"):
+        return base_name[: -len(".nii.gz")]
+    return os.path.splitext(base_name)[0]
+
+
+def _load_active_coords(path):
+    coords = np.load(path, allow_pickle=True)
+    coord_arrays = tuple(np.asarray(axis, dtype=int).ravel() for axis in coords)
+    if len(coord_arrays) != 3:
+        raise ValueError(f"active_coords must contain 3 axes, got {len(coord_arrays)} from '{path}'.")
+    n_voxels = int(coord_arrays[0].size)
+    if not all(axis.size == n_voxels for axis in coord_arrays):
+        raise ValueError(f"active_coords axes have inconsistent lengths in '{path}'.")
+    return coord_arrays
+
+
+def _load_weight_vector(weights_path, active_coords_path, nifti_weight_scale):
+    weights_path = os.path.abspath(os.path.expanduser(weights_path))
+    active_coords_path = os.path.abspath(os.path.expanduser(active_coords_path))
+    lower_path = weights_path.lower()
+
+    if lower_path.endswith(".nii") or lower_path.endswith(".nii.gz"):
+        active_coords = _load_active_coords(active_coords_path)
+        weight_volume = np.asarray(nib.load(weights_path).get_fdata(), dtype=np.float64)
+        weight_vector = np.asarray(weight_volume[active_coords], dtype=np.float64).ravel()
+        scale = float(nifti_weight_scale)
+        if not np.isfinite(scale) or np.isclose(scale, 0.0):
+            raise ValueError(f"Invalid NIfTI weight scale: {nifti_weight_scale}")
+        return weight_vector / scale
+
+    return _load_projection_vector(weights_path).astype(np.float64, copy=False)
+
+
+def _compute_projection_from_beta(weights, beta_matrix):
+    weights = np.asarray(weights, dtype=np.float64).ravel()
+    beta_matrix = np.asarray(beta_matrix, dtype=np.float64)
+    if beta_matrix.ndim != 2:
+        beta_matrix = beta_matrix.reshape(beta_matrix.shape[0], -1)
+    if beta_matrix.shape[0] != weights.size:
+        raise ValueError(
+            f"Weight length ({weights.size}) does not match beta voxel count ({beta_matrix.shape[0]})."
+        )
+
+    finite_mask = np.isfinite(beta_matrix)
+    beta_filled = np.nan_to_num(beta_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+    projection = np.asarray(weights @ beta_filled, dtype=np.float64).ravel()
+    invalid_trials = ~np.any(finite_mask, axis=0)
+    if np.any(invalid_trials):
+        projection[invalid_trials] = np.nan
+    return projection
+
+
+def _resolve_projection_source(
+    projection_path,
+    excluded_subjects_path=None,
+    weights_path=None,
+    beta_path=None,
+    active_coords_path=None,
+    nifti_weight_scale=DEFAULT_NIFTI_WEIGHT_SCALE,
+):
+    excluded_subjects = set()
+    exclusion_sources = []
+
+    if excluded_subjects_path is not None:
+        excluded_subjects_path = os.path.abspath(os.path.expanduser(excluded_subjects_path))
+        explicit_subjects = _read_subject_list_file(excluded_subjects_path)
+        excluded_subjects.update(explicit_subjects)
+        exclusion_sources.append(excluded_subjects_path)
+
+    if weights_path not in {None, ""}:
+        weights_path = os.path.abspath(os.path.expanduser(weights_path))
+        beta_path = os.path.abspath(os.path.expanduser(beta_path))
+        active_coords_path = os.path.abspath(os.path.expanduser(active_coords_path))
+        weights = _load_weight_vector(
+            weights_path,
+            active_coords_path=active_coords_path,
+            nifti_weight_scale=nifti_weight_scale,
+        )
+        beta_matrix = np.load(beta_path, mmap_mode="r")
+        projection = _compute_projection_from_beta(weights, beta_matrix)
+        resolved_projection_path = f"{weights_path} @ {beta_path}"
+        default_stem = _path_stem(weights_path)
+        if default_stem.startswith("voxel_weights_mean_"):
+            default_stem = default_stem.replace("voxel_weights_mean_", "projection_voxel_", 1)
+        return projection, resolved_projection_path, sorted(excluded_subjects), exclusion_sources, default_stem
+
+    projection, resolved_projection_path, excluded_subjects, exclusion_sources = (
+        _resolve_projection_and_excluded_subjects(
+            projection_path,
+            excluded_subjects_path=excluded_subjects_path,
+        )
+    )
+    default_stem = _path_stem(projection_path)
+    return projection, resolved_projection_path, excluded_subjects, exclusion_sources, default_stem
+
+
 def _resolve_projection_and_excluded_subjects(projection_path, excluded_subjects_path=None):
     projection_path = os.path.abspath(os.path.expanduser(projection_path))
     excluded_subjects = set()
@@ -2548,6 +2651,27 @@ def main():
         help="Path to concat manifest TSV.",
     )
     parser.add_argument(
+        "--weights-path",
+        default=None,
+        help="Optional weight vector (.npy/.txt) or NIfTI weight map. If set, projection is computed as weights @ beta.",
+    )
+    parser.add_argument(
+        "--beta-path",
+        default=DEFAULT_BETA_PATH,
+        help="Path to group beta matrix with shape (voxels, trials). Used with --weights-path.",
+    )
+    parser.add_argument(
+        "--active-coords-path",
+        default=DEFAULT_ACTIVE_COORDS_PATH,
+        help="Path to active voxel coordinates. Required when --weights-path points to a NIfTI map.",
+    )
+    parser.add_argument(
+        "--nifti-weight-scale",
+        type=float,
+        default=DEFAULT_NIFTI_WEIGHT_SCALE,
+        help="Scale factor used when reading NIfTI weight maps saved for visualization (default: 1000).",
+    )
+    parser.add_argument(
         "--trial-keep-root",
         default=DEFAULT_TRIAL_KEEP_ROOT,
         help="Root containing trial_keep_run*.npy files.",
@@ -2557,6 +2681,9 @@ def main():
 
     projection_input_path = os.path.abspath(os.path.expanduser(args.projection_path))
     manifest_path = os.path.abspath(os.path.expanduser(args.manifest_path))
+    weights_path = None if args.weights_path in {None, ""} else os.path.abspath(os.path.expanduser(args.weights_path))
+    beta_path = os.path.abspath(os.path.expanduser(args.beta_path))
+    active_coords_path = os.path.abspath(os.path.expanduser(args.active_coords_path))
     trial_keep_root = os.path.abspath(os.path.expanduser(args.trial_keep_root))
     excluded_subjects_path = (
         None
@@ -2564,10 +2691,14 @@ def main():
         else os.path.abspath(os.path.expanduser(args.excluded_subjects_path))
     )
 
-    projection, resolved_projection_path, excluded_subjects, exclusion_sources = (
-        _resolve_projection_and_excluded_subjects(
+    projection, resolved_projection_path, excluded_subjects, exclusion_sources, output_stem = (
+        _resolve_projection_source(
             projection_input_path,
             excluded_subjects_path=excluded_subjects_path,
+            weights_path=weights_path,
+            beta_path=beta_path,
+            active_coords_path=active_coords_path,
+            nifti_weight_scale=args.nifti_weight_scale,
         )
     )
     manifest_df = pd.read_csv(manifest_path, sep="\t")
@@ -2588,11 +2719,12 @@ def main():
 
     out_dir = args.out_dir
     if out_dir is None:
-        out_dir = os.path.dirname(projection_input_path) or os.getcwd()
+        source_dir = os.path.dirname(weights_path) if weights_path is not None else os.path.dirname(projection_input_path)
+        out_dir = source_dir or os.getcwd()
     out_dir = os.path.abspath(os.path.expanduser(out_dir))
     os.makedirs(out_dir, exist_ok=True)
 
-    stem = os.path.splitext(os.path.basename(projection_input_path))[0]
+    stem = output_stem
     variance_csv_path = os.path.join(out_dir, f"{stem}_sub_ses_run_projection_variability.csv")
     std_rms_csv_path = os.path.join(out_dir, f"{stem}_sub_ses_run_projection_std_over_rms.csv")
     stats_csv_path = os.path.join(

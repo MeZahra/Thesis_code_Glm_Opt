@@ -1209,11 +1209,17 @@ def evaluate_projection_corr(data, weights):
     return metrics
 
 def _compute_projection(weights, mat):
+    weights = np.asarray(weights, dtype=np.float64).ravel()
     if mat.ndim != 2:
         mat = mat.reshape(mat.shape[0], -1)
+    if mat.shape[0] != weights.size:
+        raise ValueError(
+            f"Weight length ({weights.size}) does not match matrix voxel count ({mat.shape[0]})."
+        )
     finite_mask = np.isfinite(mat)
-    weighted = mat * weights[:, None]
-    projection = np.where(np.any(finite_mask, axis=0), np.nansum(weighted, axis=0), np.nan)
+    mat_filled = np.nan_to_num(mat, nan=0.0, posinf=0.0, neginf=0.0)
+    projection = np.asarray(weights @ mat_filled, dtype=np.float64).ravel()
+    projection[~np.any(finite_mask, axis=0)] = np.nan
     return projection
 
 def _compute_bold_projection(voxel_weights, data):
