@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""Compare group-level NIfTI network maps across parameter sets.
+
+The script shows how similar the extracted networks are by computing pairwise
+Dice overlap, Cohen's kappa, Hausdorff distance, and median minimal distance,
+then saving the matrices and a combined heatmap figure.
+"""
+
 import argparse
 import csv
 import re
