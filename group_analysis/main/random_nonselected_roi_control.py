@@ -368,10 +368,11 @@ def _build_control_candidate_pool(
 
     selected_flat = _load_selected_flat_indices(selected_voxel_indices_path, roi_data.shape)
     selected_count = int(selected_flat.size)
-    flat_mask = (roi_data.ravel() > 0) & np.isfinite(brain_data.ravel()) & (brain_data.ravel() != 0)
-    flat_mask[selected_flat] = False
-
-    candidate_flat = np.flatnonzero(flat_mask).astype(np.int64, copy=False)
+    brain_mask = np.isfinite(brain_data.ravel()) & (brain_data.ravel() != 0)
+    brain_flat = np.flatnonzero(brain_mask)
+    candidate_flat = np.setdiff1d(brain_flat, selected_flat, assume_unique=False).astype(np.int64, copy=False)
+    if candidate_flat.size == 0:
+        raise RuntimeError("No non-selected brain voxels remain after removing selected_flat indices.")
     candidate_ijk = np.column_stack(np.unravel_index(candidate_flat, roi_data.shape)).astype(np.int32, copy=False)
     candidate_coords_mm = nib.affines.apply_affine(roi_img.affine, candidate_ijk)
     candidate_x_mm = candidate_coords_mm[:, 0]
@@ -1082,7 +1083,8 @@ def main() -> None:
         "comparison_note": (
             "Observed selected-network metrics are recomputed from the saved selected ROI-average time series "
             "using the same retained ROI node set as the random non-selected controls. Random controls are "
-            "sampled from non-selected voxels in the same atlas nodes and averaged within node before metric computation."
+            "sampled from brain voxels with selected voxels removed, then assigned into control ROIs and "
+            "averaged within node before metric computation."
         ),
         "args": _json_safe(vars(args)),
         "n_control_voxels_per_draw": int(n_control_voxels),

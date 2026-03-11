@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare selected voxels against anatomical non-selected voxels."""
+"""Compare selected voxels against motor-area non-selected voxels."""
 
 from __future__ import annotations
 
@@ -23,6 +23,22 @@ from scipy.stats import gaussian_kde
 SELECTED_COLOR = "#e74c5b"
 NONSELECTED_COLOR = "#4c84a6"
 NULL_COLOR = "#b8dfe3"
+FSL_CEREBELLUM_MAXPROB_2MM = Path("/usr/local/fsl/data/atlases/Cerebellum/Cerebellum-MNIfnirt-maxprob-thr25-2mm.nii.gz")
+DEFAULT_MOTOR_LABEL_PATTERNS = [
+    "precentral gyrus",
+    "juxtapositional lobule cortex",
+    "supplementary motor",
+    "precentral",
+    "postcentral gyrus",
+    "frontal medial cortex",
+    "paracentral lobule",
+    "thalamus",
+    "caudate nucleus",
+    "putamen",
+    "globus pallidus",
+    "pallidum",
+    "cerebellum",
+]
 
 
 @dataclass
@@ -35,8 +51,8 @@ class ManifestRow:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Test whether selected voxels have lower mean absolute consecutive-trial beta "
-            "difference than anatomical non-selected voxels using the full per-run cleaned beta volumes."
+            "Test whether selected voxels differ from motor-area non-selected voxels in two metrics: "
+            "mean absolute consecutive-trial beta difference and within-voxel trial-to-trial variance."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -55,8 +71,29 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--anat-path",
         type=Path,
-        default=Path("results/connectivity/data/MNI152_T1_2mm_brain.nii.gz"),
-        help="MNI anatomy used to define the anatomical brain voxel pool.",
+        default=Path("results/connectivity/tmp/data/MNI152_T1_2mm_brain.nii.gz"),
+        help="MNI anatomy used to define the brain/motor voxel pool.",
+    )
+    parser.add_argument(
+        "--motor-mask-path",
+        type=Path,
+        default=None,
+        help=(
+            "Optional NIfTI mask for motor areas. Non-zero values define candidate non-selected voxels. "
+            "If not provided, a mask is built from Harvard-Oxford cortical and subcortical atlases."
+        ),
+    )
+    parser.add_argument(
+        "--motor-label-patterns",
+        type=str,
+        default=",".join(DEFAULT_MOTOR_LABEL_PATTERNS),
+        help="Comma-separated motor-region label substrings used when building atlas-based motor mask.",
+    )
+    parser.add_argument(
+        "--motor-atlas-cache-dir",
+        type=Path,
+        default=Path("results/connectivity/atlas_cache"),
+        help="Cache directory for Harvard-Oxford atlas downloads (if needed).",
     )
     parser.add_argument(
         "--manifest-path",
@@ -117,6 +154,208 @@ def _load_brain_flat_indices(anat_path: Path) -> tuple[np.ndarray, tuple[int, in
     if brain_flat.size == 0:
         raise ValueError(f"No non-zero voxels found in {anat_path}")
     return brain_flat, tuple(int(dim) for dim in anat_img.shape[:3])
+
+
+def _normalize_labels(labels) -> list[str]:
+    out: list[str] = []
+    for value in list(labels):
+        if isinstance(value, bytes):
+            out.append(value.decode("utf-8", errors="replace"))
+        else:
+            out.append(str(value))
+    return out
+
+
+def _split_csv_patterns(raw: str | None) -> list[str]:
+    if raw is None:
+        return []
+    parts = []
+    for item in str(raw).split(","):
+        item = item.strip()
+        if item:
+            parts.append(item.lower())
+    return parts
+
+
+def _select_label_ids(labels: list[str], include: list[str], exclude: list[str] | None = None) -> tuple[list[int], list[str]]:
+    include_lower = [item.lower() for item in include]
+    exclude_lower = [item.lower() for item in (exclude or [])]
+    selected_ids: list[int] = []
+    selected_names: list[str] = []
+
+    for idx, raw_label in enumerate(labels):
+        if idx == 0:
+            continue
+        label = raw_label.lower()
+        if not any(p in label for p in include_lower):
+            continue
+        if any(p in label for p in exclude_lower):
+            continue
+        selected_ids.append(idx)
+        selected_names.append(raw_label)
+
+    return selected_ids, selected_names
+
+
+def _load_motor_mask_from_atlas(
+    anat_path: Path,
+    label_patterns: list[str],
+    atlas_cache_dir: Path,
+) -> tuple[np.ndarray, list[str], list[int], list[str]]:
+    try:
+        from nilearn import datasets, image
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "Cannot build motor atlas: nilearn is required when --motor-mask-path is not set. "
+            "Either install nilearn or pass --motor-mask-path directly."
+        ) from exc
+
+    anat_img = nib.load(str(anat_path))
+    cortex = datasets.fetch_atlas_harvard_oxford(
+        "cort-maxprob-thr25-2mm",
+        data_dir=str(atlas_cache_dir),
+    )
+    subcortex = datasets.fetch_atlas_harvard_oxford(
+        "sub-maxprob-thr25-2mm",
+        data_dir=str(atlas_cache_dir),
+    )
+
+    cortical_img = cortex.maps if hasattr(cortex.maps, "get_fdata") else nib.load(cortex.maps)
+    subcortical_img = subcortex.maps if hasattr(subcortex.maps, "get_fdata") else nib.load(subcortex.maps)
+    cortical_data = image.resample_to_img(cortical_img, anat_img, interpolation="nearest", force_resample=True).get_fdata()
+    subcortical_data = image.resample_to_img(subcortical_img, anat_img, interpolation="nearest", force_resample=True).get_fdata()
+    cortical_data = np.rint(cortical_data).astype(np.int32, copy=False)
+    subcortical_data = np.rint(subcortical_data).astype(np.int32, copy=False)
+
+    cortical_labels = _normalize_labels(cortex.labels)
+    subcortical_labels = _normalize_labels(subcortex.labels)
+
+    include_patterns = [p for p in (label_patterns or []) if p]
+    include_lower = [p.lower() for p in include_patterns]
+
+    cortical_ids, cortical_names = _select_label_ids(cortical_labels, include_lower)
+    subcortical_ids, subcortical_names = _select_label_ids(subcortical_labels, include_lower)
+
+    region_names: list[str] = []
+    region_counts: list[int] = []
+    motor_mask = np.zeros(anat_img.shape[:3], dtype=bool)
+
+    if cortical_ids:
+        for lid, name in zip(cortical_ids, cortical_names):
+            region = cortical_data == int(lid)
+            region_count = int(np.count_nonzero(region))
+            if region_count == 0:
+                continue
+            motor_mask |= region
+            region_names.append(f"Cortical: {name}")
+            region_counts.append(region_count)
+
+    if subcortical_ids:
+        for lid, name in zip(subcortical_ids, subcortical_names):
+            region = subcortical_data == int(lid)
+            region_count = int(np.count_nonzero(region))
+            if region_count == 0:
+                continue
+            motor_mask |= region
+            region_names.append(f"Subcortical: {name}")
+            region_counts.append(region_count)
+
+    if any("cerebellum" in item for item in include_lower) and FSL_CEREBELLUM_MAXPROB_2MM.exists():
+        cereb_img = nib.load(str(FSL_CEREBELLUM_MAXPROB_2MM))
+        cereb_data = image.resample_to_img(cereb_img, anat_img, interpolation="nearest", force_resample=True).get_fdata()
+        region = np.asarray(cereb_data > 0, dtype=bool)
+        region_count = int(np.count_nonzero(region))
+        if region_count > 0:
+            motor_mask |= region
+            region_names.append("Cerebellum (FSL maxprob)")
+            region_counts.append(region_count)
+
+    if not np.any(motor_mask):
+        raise ValueError("Motor atlas mask has no voxels. Try widening --motor-label-patterns or use --motor-mask-path.")
+
+    flat_region_counts = np.array(region_counts, dtype=np.int64)
+    return (
+        np.flatnonzero(motor_mask),
+        region_names,
+        flat_region_counts.tolist(),
+        sorted(set(include_lower)),
+    )
+
+
+def _load_motor_flat_indices(
+    motor_mask_path: Path | None,
+    anat_path: Path,
+    label_patterns: list[str],
+    atlas_cache_dir: Path,
+) -> tuple[np.ndarray, list[str], list[int], list[str]]:
+    anat_img = nib.load(str(anat_path))
+    anat_shape = anat_img.shape[:3]
+
+    if motor_mask_path is not None:
+        mask_img = nib.load(str(motor_mask_path))
+        if tuple(mask_img.shape[:3]) != anat_shape or not np.allclose(mask_img.affine, anat_img.affine):
+            try:
+                from nilearn import image as nilearn_image
+            except ImportError as exc:  # pragma: no cover
+                raise RuntimeError(
+                    "--motor-mask-path shape differs from anatomy and nilearn is not installed for resampling. "
+                    "Install nilearn or regenerate the motor mask in the same space as anatomy."
+                ) from exc
+            mask_img = nilearn_image.resample_to_img(mask_img, anat_img, interpolation="nearest", force_resample=True)
+
+        mask_data = np.asarray(mask_img.get_fdata(), dtype=np.float32)
+        motor_mask = np.isfinite(mask_data) & (np.abs(mask_data) > 0)
+        motor_flat = np.flatnonzero(motor_mask.ravel())
+        if motor_flat.size == 0:
+            raise ValueError(f"No non-zero voxels in --motor-mask-path: {motor_mask_path}")
+        return (
+            motor_flat.astype(np.int64, copy=False),
+            ["Provided motor mask: non-zero voxels"],
+            [int(np.count_nonzero(motor_mask))],
+            ["custom"],
+        )
+
+    motor_flat, region_names, region_counts, resolved_patterns = _load_motor_mask_from_atlas(
+        anat_path=anat_path,
+        label_patterns=label_patterns,
+        atlas_cache_dir=atlas_cache_dir,
+    )
+    return motor_flat, region_names, region_counts, resolved_patterns
+
+
+def _save_motor_region_figure(
+    figure_path: Path,
+    region_names: list[str],
+    region_counts: list[int],
+    selected_patterns: list[str],
+) -> None:
+    if len(region_names) == 0:
+        fig, ax = plt.subplots(figsize=(8, 2))
+        ax.text(0.02, 0.6, "No motor regions matched selected patterns", fontsize=12)
+        ax.set_axis_off()
+        fig.savefig(figure_path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    order = np.argsort(region_counts)[::-1]
+    names = [region_names[i] for i in order]
+    counts = [int(region_counts[i]) for i in order]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.barh(names, counts, color="#4c84a6", edgecolor="white")
+    ax.set_xlabel("Voxel count")
+    if selected_patterns:
+        title = "Motor regions selected by atlas patterns\n" + \
+            f"patterns: {', '.join(selected_patterns)}"
+    else:
+        title = "Motor regions selected by atlas patterns"
+    ax.set_title(title)
+    ax.invert_yaxis()
+    for y, value in enumerate(counts):
+        ax.text(value + max(1.0, max(counts) * 0.02), y, f"{int(value)}", va="center", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(figure_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _load_selected_flat_indices(selected_indices_path: Path, anat_shape: tuple[int, int, int]) -> np.ndarray:
@@ -193,14 +432,17 @@ def _load_trial_keep_mask(row: ManifestRow, n_trials_source: int) -> np.ndarray:
     return keep
 
 
-def _accumulate_consecutive_diff_metric(
+def _accumulate_consecutive_diff_and_variance_metrics(
     target_flat: np.ndarray,
     manifest_rows: list[ManifestRow],
     row_chunk_size: int,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     n_voxels = int(target_flat.size)
     pair_counts = np.zeros(n_voxels, dtype=np.int64)
     abs_diff_sums = np.zeros(n_voxels, dtype=np.float64)
+    trial_sums = np.zeros(n_voxels, dtype=np.float64)
+    trial_sq_sums = np.zeros(n_voxels, dtype=np.float64)
+    trial_counts = np.zeros(n_voxels, dtype=np.int64)
 
     row_chunk_size = max(1, int(row_chunk_size))
     total_runs = len(manifest_rows)
@@ -226,6 +468,16 @@ def _accumulate_consecutive_diff_metric(
         for start in range(0, n_voxels, row_chunk_size):
             stop = min(start + row_chunk_size, n_voxels)
             chunk = np.asarray(flat_view[target_flat[start:stop]][:, keep_mask], dtype=np.float32)
+            if chunk.shape[1] == 0:
+                continue
+
+            finite = np.isfinite(chunk)
+            trial_counts[start:stop] += np.sum(finite, axis=1, dtype=np.int64)
+            if np.any(finite):
+                safe_chunk = np.where(finite, chunk, 0.0)
+                trial_sums[start:stop] += np.sum(safe_chunk, axis=1, dtype=np.float64)
+                trial_sq_sums[start:stop] += np.sum(safe_chunk * safe_chunk, axis=1, dtype=np.float64)
+
             if chunk.shape[1] < 2:
                 continue
             prev_vals = chunk[:, :-1]
@@ -241,7 +493,15 @@ def _accumulate_consecutive_diff_metric(
     valid = pair_counts > 0
     if np.any(valid):
         metric[valid] = abs_diff_sums[valid] / pair_counts[valid]
-    return metric, pair_counts
+
+    variance = np.full(n_voxels, np.nan, dtype=np.float64)
+    variance_valid = trial_counts > 1
+    if np.any(variance_valid):
+        numerator = trial_sq_sums[variance_valid] - (trial_sums[variance_valid] ** 2) / trial_counts[variance_valid]
+        variance[variance_valid] = numerator / (trial_counts[variance_valid] - 1).astype(np.float64)
+        variance[variance_valid] = np.where(variance[variance_valid] >= 0.0, variance[variance_valid], 0.0)
+
+    return metric, pair_counts, variance, trial_counts
 
 
 def _subsample_for_kde(values: np.ndarray, kde_max_points: int, rng: np.random.Generator) -> np.ndarray:
@@ -361,6 +621,7 @@ def _plot_summary_figure(
     num_resamples: int,
     rng: np.random.Generator,
     kde_max_points: int,
+    metric_name: str,
 ) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(12, 9), constrained_layout=True)
     ax_a, ax_b, ax_c, ax_d = axes.ravel()
@@ -380,7 +641,7 @@ def _plot_summary_figure(
         nonselected_metric,
         rng,
         kde_max_points,
-        xlabel="Mean |Delta| Consecutive Trials",
+        xlabel=metric_name,
         panel_label="a",
     )
     _plot_density_panel(
@@ -389,7 +650,7 @@ def _plot_summary_figure(
         np.log10(np.clip(nonselected_metric, log_eps, None)),
         rng,
         kde_max_points,
-        xlabel="Log10(Mean |Delta| Consecutive Trials)",
+        xlabel=f"Log10({metric_name})",
         panel_label="b",
     )
 
@@ -410,7 +671,7 @@ def _plot_summary_figure(
     ax_d.axvline(resample_mean, linestyle="--", linewidth=1.6, color="0.45", label=f"Resample mean = {resample_mean:.4g}")
     ax_d.axvline(ci_low, linestyle="--", linewidth=1.4, color="0.55")
     ax_d.axvline(ci_high, linestyle="--", linewidth=1.4, color="0.55", label=f"95% CI = [{ci_low:.4g}, {ci_high:.4g}]")
-    ax_d.set_xlabel("Mean |Delta| Consecutive Trials (non-selected voxels)")
+    ax_d.set_xlabel(f"{metric_name} (non-selected voxels)")
     ax_d.set_ylabel("Density")
     ax_d.text(-0.02, 1.03, "d", transform=ax_d.transAxes, fontsize=18, fontweight="bold")
     ax_d.legend(frameon=True, fontsize=9, loc="upper right")
@@ -419,8 +680,8 @@ def _plot_summary_figure(
 
     fig.suptitle(
         (
-            "Selected vs anatomical non-selected voxels | "
-            f"mean |Delta|: {selected_mean:.3f} vs {nonselected_mean:.3f} | "
+            f"Selected vs motor-area non-selected voxels | {metric_name} | "
+            f"mean: {selected_mean:.3f} vs {nonselected_mean:.3f} | "
             f"p={p_lower:.4g} | resamples={num_resamples}"
         ),
         fontsize=14,
@@ -455,88 +716,170 @@ def main() -> None:
     if selected_flat.size == 0:
         raise ValueError("No selected voxels remain inside the anatomical non-zero mask.")
 
-    nonselected_flat = np.setdiff1d(brain_flat, selected_flat, assume_unique=False)
-    if nonselected_flat.size == 0:
-        raise ValueError("No anatomical non-selected voxels remain after removing the selected set.")
-
     manifest_rows = _load_manifest_rows(args.manifest_path)
+
+    motor_flat, motor_region_names, motor_region_counts, motor_patterns = _load_motor_flat_indices(
+        motor_mask_path=args.motor_mask_path,
+        anat_path=args.anat_path,
+        label_patterns=_split_csv_patterns(args.motor_label_patterns),
+        atlas_cache_dir=args.motor_atlas_cache_dir,
+    )
+    motor_region_figure = args.output_dir / f"{args.output_stem}_motor_regions.png"
+    _save_motor_region_figure(
+        figure_path=motor_region_figure,
+        region_names=motor_region_names,
+        region_counts=motor_region_counts,
+        selected_patterns=motor_patterns,
+    )
+    print(f"Saved motor-region report figure: {motor_region_figure}", flush=True)
+
+    if np.setdiff1d(motor_flat, selected_flat, assume_unique=False).size == 0:
+        raise ValueError("No motor voxels remain after removing selected set. Cannot form baseline non-selected pool.")
+    nonselected_flat = np.setdiff1d(motor_flat, selected_flat, assume_unique=False)
 
     target_flat = np.concatenate([selected_flat, nonselected_flat]).astype(np.int64, copy=False)
     print(
-        f"Selected voxels: {selected_flat.size} | anatomical non-selected voxels: {nonselected_flat.size} | "
+        f"Selected voxels: {selected_flat.size} | motor non-selected voxels: {nonselected_flat.size} | "
+        f"(motor pool size: {motor_flat.size}) | "
         f"runs in manifest: {len(manifest_rows)}",
         flush=True,
     )
-    metric_values, pair_counts = _accumulate_consecutive_diff_metric(
+    metric_values, pair_counts, variance_values, trial_counts = _accumulate_consecutive_diff_and_variance_metrics(
         target_flat=target_flat,
         manifest_rows=manifest_rows,
         row_chunk_size=args.row_chunk_size,
     )
 
     n_selected = int(selected_flat.size)
-    selected_metric_all = np.asarray(metric_values[:n_selected], dtype=np.float64)
-    nonselected_metric_all = np.asarray(metric_values[n_selected:], dtype=np.float64)
+    selected_diff_all = np.asarray(metric_values[:n_selected], dtype=np.float64)
+    nonselected_diff_all = np.asarray(metric_values[n_selected:], dtype=np.float64)
+    selected_variance_all = np.asarray(variance_values[:n_selected], dtype=np.float64)
+    nonselected_variance_all = np.asarray(variance_values[n_selected:], dtype=np.float64)
     selected_counts_all = np.asarray(pair_counts[:n_selected], dtype=np.int64)
     nonselected_counts_all = np.asarray(pair_counts[n_selected:], dtype=np.int64)
+    selected_trial_counts_all = np.asarray(trial_counts[:n_selected], dtype=np.int64)
+    nonselected_trial_counts_all = np.asarray(trial_counts[n_selected:], dtype=np.int64)
 
-    selected_valid = np.isfinite(selected_metric_all)
-    nonselected_valid = np.isfinite(nonselected_metric_all)
-    selected_metric = selected_metric_all[selected_valid]
-    nonselected_metric = nonselected_metric_all[nonselected_valid]
-    selected_counts = selected_counts_all[selected_valid]
-    nonselected_counts = nonselected_counts_all[nonselected_valid]
-    selected_flat_valid = selected_flat[selected_valid]
-    nonselected_flat_valid = nonselected_flat[nonselected_valid]
+    selected_diff_valid = np.isfinite(selected_diff_all)
+    nonselected_diff_valid = np.isfinite(nonselected_diff_all)
+    selected_variance_valid = np.isfinite(selected_variance_all)
+    nonselected_variance_valid = np.isfinite(nonselected_variance_all)
+
+    selected_metric = selected_diff_all[selected_diff_valid]
+    nonselected_metric = nonselected_diff_all[nonselected_diff_valid]
+    selected_counts = selected_counts_all[selected_diff_valid]
+    nonselected_counts = nonselected_counts_all[nonselected_diff_valid]
+    selected_flat_valid = selected_flat[selected_diff_valid]
+    nonselected_flat_valid = nonselected_flat[nonselected_diff_valid]
+
+    selected_variance = selected_variance_all[selected_variance_valid]
+    nonselected_variance = nonselected_variance_all[nonselected_variance_valid]
+    selected_trial_counts = selected_trial_counts_all[selected_variance_valid]
+    nonselected_trial_counts = nonselected_trial_counts_all[nonselected_variance_valid]
+    selected_flat_variance_valid = selected_flat[selected_variance_valid]
+    nonselected_flat_variance_valid = nonselected_flat[nonselected_variance_valid]
 
     if selected_metric.size == 0:
         raise ValueError("Selected voxels have no finite consecutive-trial difference estimates.")
     if nonselected_metric.size == 0:
-        raise ValueError("Anatomical non-selected voxels have no finite consecutive-trial difference estimates.")
+        raise ValueError("Motor non-selected voxels have no finite consecutive-trial difference estimates.")
+    if selected_variance.size == 0:
+        raise ValueError("Selected voxels have no finite trial-variance estimates.")
+    if nonselected_variance.size == 0:
+        raise ValueError("Motor non-selected voxels have no finite trial-variance estimates.")
 
-    thresholds, prevalence_ratios = _compute_prevalence_ratios(
+    diff_thresholds, diff_prevalence_ratios = _compute_prevalence_ratios(
         selected_values=selected_metric,
         nonselected_values=nonselected_metric,
         percentiles=list(args.percentile_thresholds),
     )
-    resampled_means, resample_replace = _resample_nonselected_means(
+    diff_resampled_means, diff_resample_replace = _resample_nonselected_means(
         nonselected_values=nonselected_metric,
         sample_size=selected_metric.size,
         num_resamples=args.num_resamples,
         rng=rng,
     )
-    selected_mean = float(np.mean(selected_metric))
-    p_lower = (1.0 + float(np.count_nonzero(resampled_means <= selected_mean))) / (1.0 + float(args.num_resamples))
+    diff_selected_mean = float(np.mean(selected_metric))
+    diff_p_lower = (1.0 + float(np.count_nonzero(diff_resampled_means <= diff_selected_mean))) / (1.0 + float(args.num_resamples))
 
-    png_path = args.output_dir / f"{args.output_stem}.png"
-    pdf_path = args.output_dir / f"{args.output_stem}.pdf"
+    var_thresholds, var_prevalence_ratios = _compute_prevalence_ratios(
+        selected_values=selected_variance,
+        nonselected_values=nonselected_variance,
+        percentiles=list(args.percentile_thresholds),
+    )
+    var_resampled_means, var_resample_replace = _resample_nonselected_means(
+        nonselected_values=nonselected_variance,
+        sample_size=selected_variance.size,
+        num_resamples=args.num_resamples,
+        rng=rng,
+    )
+    var_selected_mean = float(np.mean(selected_variance))
+    var_p_lower = (1.0 + float(np.count_nonzero(var_resampled_means <= var_selected_mean))) / (1.0 + float(args.num_resamples))
+
+    diff_png_path = args.output_dir / f"{args.output_stem}_diff.png"
+    diff_pdf_path = args.output_dir / f"{args.output_stem}_diff.pdf"
+    var_png_path = args.output_dir / f"{args.output_stem}_variance.png"
+    var_pdf_path = args.output_dir / f"{args.output_stem}_variance.pdf"
     summary_json_path = args.output_dir / f"{args.output_stem}_summary.json"
     prevalence_csv_path = args.output_dir / f"{args.output_stem}_prevalence.csv"
+    variance_prevalence_csv_path = args.output_dir / f"{args.output_stem}_prevalence_variance.csv"
     analysis_npz_path = args.output_dir / f"{args.output_stem}_analysis_data.npz"
 
-    print(f"Saving figure to {png_path} and {pdf_path}", flush=True)
+    print(
+        f"Saving figures to {diff_png_path}, {diff_pdf_path}, {var_png_path}, and {var_pdf_path}",
+        flush=True,
+    )
     _plot_summary_figure(
-        figure_path=png_path,
+        figure_path=diff_png_path,
         selected_metric=selected_metric,
         nonselected_metric=nonselected_metric,
         percentile_labels=list(args.percentile_thresholds),
-        prevalence_ratios=prevalence_ratios,
-        resampled_means=resampled_means,
-        p_lower=p_lower,
+        prevalence_ratios=diff_prevalence_ratios,
+        resampled_means=diff_resampled_means,
+        p_lower=diff_p_lower,
         num_resamples=int(args.num_resamples),
         rng=rng,
         kde_max_points=int(args.kde_max_points),
+        metric_name="Mean |Delta| Consecutive Trials",
     )
     _plot_summary_figure(
-        figure_path=pdf_path,
+        figure_path=diff_pdf_path,
         selected_metric=selected_metric,
         nonselected_metric=nonselected_metric,
         percentile_labels=list(args.percentile_thresholds),
-        prevalence_ratios=prevalence_ratios,
-        resampled_means=resampled_means,
-        p_lower=p_lower,
+        prevalence_ratios=diff_prevalence_ratios,
+        resampled_means=diff_resampled_means,
+        p_lower=diff_p_lower,
         num_resamples=int(args.num_resamples),
         rng=np.random.default_rng(args.random_seed),
         kde_max_points=int(args.kde_max_points),
+        metric_name="Mean |Delta| Consecutive Trials",
+    )
+    _plot_summary_figure(
+        figure_path=var_png_path,
+        selected_metric=selected_variance,
+        nonselected_metric=nonselected_variance,
+        percentile_labels=list(args.percentile_thresholds),
+        prevalence_ratios=var_prevalence_ratios,
+        resampled_means=var_resampled_means,
+        p_lower=var_p_lower,
+        num_resamples=int(args.num_resamples),
+        rng=rng,
+        kde_max_points=int(args.kde_max_points),
+        metric_name="Variance Across Kept Trials",
+    )
+    _plot_summary_figure(
+        figure_path=var_pdf_path,
+        selected_metric=selected_variance,
+        nonselected_metric=nonselected_variance,
+        percentile_labels=list(args.percentile_thresholds),
+        prevalence_ratios=var_prevalence_ratios,
+        resampled_means=var_resampled_means,
+        p_lower=var_p_lower,
+        num_resamples=int(args.num_resamples),
+        rng=np.random.default_rng(args.random_seed),
+        kde_max_points=int(args.kde_max_points),
+        metric_name="Variance Across Kept Trials",
     )
 
     summary = {
@@ -546,6 +889,12 @@ def main() -> None:
         "selected_csv_path": str(args.selected_csv_path) if args.selected_csv_path is not None else None,
         "anat_path": str(args.anat_path),
         "manifest_path": str(args.manifest_path),
+        "motor_mask_source": str(args.motor_mask_path) if args.motor_mask_path is not None else "harvard_oxford_auto",
+        "motor_label_patterns": list(_split_csv_patterns(args.motor_label_patterns)),
+        "motor_region_names": motor_region_names,
+        "motor_region_counts": [int(v) for v in motor_region_counts],
+        "motor_pool_size": int(motor_flat.size),
+        "selected_in_motor_count": int(np.count_nonzero(np.isin(selected_flat, motor_flat))),
         "selected_count_total": int(selected_flat.size),
         "nonselected_count_total": int(nonselected_flat.size),
         "selected_count_valid": int(selected_metric.size),
@@ -556,16 +905,35 @@ def main() -> None:
         "nonselected_median_abs_consecutive_trial_diff": float(np.median(nonselected_metric)),
         "selected_min_finite_consecutive_pairs": int(np.min(selected_counts)),
         "nonselected_min_finite_consecutive_pairs": int(np.min(nonselected_counts)),
-        "resample_mean": float(np.mean(resampled_means)),
-        "resample_std": float(np.std(resampled_means, ddof=1)),
-        "resample_ci_2p5": float(np.percentile(resampled_means, 2.5)),
-        "resample_ci_97p5": float(np.percentile(resampled_means, 97.5)),
-        "resample_p_lower_or_equal_selected": float(p_lower),
-        "resample_with_replacement": bool(resample_replace),
+        "selected_count_variance_valid": int(selected_variance.size),
+        "nonselected_count_variance_valid": int(nonselected_variance.size),
+        "selected_mean_trial_variance": float(np.mean(selected_variance)),
+        "nonselected_mean_trial_variance": float(np.mean(nonselected_variance)),
+        "selected_median_trial_variance": float(np.median(selected_variance)),
+        "nonselected_median_trial_variance": float(np.median(nonselected_variance)),
+        "selected_min_finite_trials": int(np.min(selected_trial_counts)),
+        "nonselected_min_finite_trials": int(np.min(nonselected_trial_counts)),
+        "diff_resample_mean": float(np.mean(diff_resampled_means)),
+        "diff_resample_std": float(np.std(diff_resampled_means, ddof=1)),
+        "diff_resample_ci_2p5": float(np.percentile(diff_resampled_means, 2.5)),
+        "diff_resample_ci_97p5": float(np.percentile(diff_resampled_means, 97.5)),
+        "diff_resample_p_lower_or_equal_selected": float(diff_p_lower),
+        "diff_resample_with_replacement": bool(diff_resample_replace),
+        "var_resample_mean": float(np.mean(var_resampled_means)),
+        "var_resample_std": float(np.std(var_resampled_means, ddof=1)),
+        "var_resample_ci_2p5": float(np.percentile(var_resampled_means, 2.5)),
+        "var_resample_ci_97p5": float(np.percentile(var_resampled_means, 97.5)),
+        "var_resample_p_lower_or_equal_selected": float(var_p_lower),
+        "var_resample_with_replacement": bool(var_resample_replace),
         "num_resamples": int(args.num_resamples),
         "random_seed": int(args.random_seed),
-        "png_path": str(png_path),
-        "pdf_path": str(pdf_path),
+        "diff_png_path": str(diff_png_path),
+        "diff_pdf_path": str(diff_pdf_path),
+        "variance_png_path": str(var_png_path),
+        "variance_pdf_path": str(var_pdf_path),
+        "motor_region_figure_path": str(motor_region_figure),
+        "prevalence_csv_path": str(prevalence_csv_path),
+        "variance_prevalence_csv_path": str(variance_prevalence_csv_path),
     }
     with summary_json_path.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
@@ -573,7 +941,12 @@ def main() -> None:
     with prevalence_csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["percentile", "threshold", "relative_prevalence_selected_over_nonselected"])
-        for percentile, threshold, ratio in zip(args.percentile_thresholds, thresholds, prevalence_ratios):
+        for percentile, threshold, ratio in zip(args.percentile_thresholds, diff_thresholds, diff_prevalence_ratios):
+            writer.writerow([float(percentile), float(threshold), float(ratio)])
+    with variance_prevalence_csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["percentile", "threshold", "relative_prevalence_selected_over_nonselected"])
+        for percentile, threshold, ratio in zip(args.percentile_thresholds, var_thresholds, var_prevalence_ratios):
             writer.writerow([float(percentile), float(threshold), float(ratio)])
 
     np.savez_compressed(
@@ -584,13 +957,25 @@ def main() -> None:
         nonselected_mean_abs_consecutive_trial_diff=nonselected_metric.astype(np.float32, copy=False),
         selected_finite_consecutive_pair_counts=selected_counts.astype(np.int32, copy=False),
         nonselected_finite_consecutive_pair_counts=nonselected_counts.astype(np.int32, copy=False),
-        prevalence_thresholds=thresholds.astype(np.float32, copy=False),
-        prevalence_ratios=prevalence_ratios.astype(np.float32, copy=False),
-        resampled_nonselected_means=resampled_means.astype(np.float32, copy=False),
+        prevalence_thresholds=diff_thresholds.astype(np.float32, copy=False),
+        prevalence_ratios=diff_prevalence_ratios.astype(np.float32, copy=False),
+        resampled_nonselected_means=diff_resampled_means.astype(np.float32, copy=False),
+        selected_trial_variance=selected_variance.astype(np.float32, copy=False),
+        nonselected_trial_variance=nonselected_variance.astype(np.float32, copy=False),
+        selected_finite_trial_counts=selected_trial_counts.astype(np.int32, copy=False),
+        nonselected_finite_trial_counts=nonselected_trial_counts.astype(np.int32, copy=False),
+        variance_prevalence_thresholds=var_thresholds.astype(np.float32, copy=False),
+        variance_prevalence_ratios=var_prevalence_ratios.astype(np.float32, copy=False),
+        resampled_nonselected_variance_means=var_resampled_means.astype(np.float32, copy=False),
+        motor_flat_indices=motor_flat.astype(np.int64, copy=False),
+        motor_region_names=np.array(motor_region_names, dtype=object),
+        motor_region_counts=np.asarray(motor_region_counts, dtype=np.int32),
+        motor_region_patterns=np.array(motor_patterns, dtype=object),
     )
 
     print(f"Saved summary JSON: {summary_json_path}", flush=True)
     print(f"Saved prevalence CSV: {prevalence_csv_path}", flush=True)
+    print(f"Saved variance prevalence CSV: {variance_prevalence_csv_path}", flush=True)
     print(f"Saved analysis NPZ: {analysis_npz_path}", flush=True)
     print("Done.", flush=True)
 
