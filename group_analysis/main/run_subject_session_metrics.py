@@ -5,7 +5,7 @@ Workflow:
 1) Split selected_beta_trials.npy into one file per subject-session label
    (`sub-*_ses-*`) by concatenating run1 and run2 trials.
 2) Run ROI-edge connectivity + advanced metrics for each subject-session file.
-3) Average advanced-metric matrices across subjects for each session.
+3) Optionally average advanced-metric matrices across subjects for each session.
 
 All outputs are written under:
   results/connectivity/between_sessions/subject_session_metrics/
@@ -38,7 +38,13 @@ DEFAULT_CONNECTIVITY_DIR = REPO_ROOT / "results" / "connectivity"
 DEFAULT_DATA_DIR = DEFAULT_CONNECTIVITY_DIR / "data"
 DEFAULT_MANIFEST_DIR = DEFAULT_CONNECTIVITY_DIR / "tmp"
 DEFAULT_INPUT_BETA_NAME = "selected_beta_trials.npy"
-DEFAULT_INPUT_VOXEL_INDICES_NAME = "selected_voxel_indices.npz"
+DEFAULT_INPUT_VOXEL_INDICES_PATH = (
+    REPO_ROOT
+    / "results"
+    / "connectivity"
+    / "data"
+    / "voxel_weights_mean_foldavg_sub9_ses1_task0.8_bold0.8_beta0.5_smooth0.2_gamma1_bold_thr90_nonzero_coords_all2674.csv"
+)
 DEFAULT_MANIFEST_NAME = "concat_manifest_group.tsv"
 DEFAULT_OUT_ROOT = HERE / "subject_session_metrics"
 
@@ -91,7 +97,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Voxel-index NPZ path. Defaults to --data-dir/selected_voxel_indices.npz."
+            "Voxel index source path (NPZ with selected_ijk/selected_flat_indices or CSV with x,y,z). "
+            "Defaults to the project CSV at results/connectivity/data/voxel_weights_mean_foldavg_sub9_ses1_task0.8_bold0.8_beta0.5_smooth0.2_gamma1_bold_thr90_nonzero_coords_all2674.csv."
         ),
     )
     parser.add_argument(
@@ -126,7 +133,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-session-average",
         action="store_true",
-        help="Skip averaging advanced metrics across subjects per session.",
+        help="Deprecated: use --run-session-average to enable per-session averaging.",
+    )
+    parser.add_argument(
+        "--run-session-average",
+        action="store_true",
+        help="Run section 7: average each metric across subjects per session and save mean/std CSV/PNG.",
     )
     parser.add_argument(
         "--overwrite",
@@ -144,7 +156,7 @@ def parse_args() -> argparse.Namespace:
     args.input_voxel_indices = (
         args.input_voxel_indices.expanduser().resolve()
         if args.input_voxel_indices is not None
-        else args.data_dir / DEFAULT_INPUT_VOXEL_INDICES_NAME
+        else DEFAULT_INPUT_VOXEL_INDICES_PATH
     )
 
     if args.manifest_path is not None:
@@ -244,6 +256,33 @@ def write_split_files(
 
     index_map = {split.label: split.columns for split in splits}
     np.savez(data_dir / "selected_beta_trials_subject_session_column_indices.npz", **index_map)
+
+
+def ensure_voxel_indices_npz(
+    input_voxel_indices: Path,
+    data_dir: Path,
+    overwrite: bool,
+) -> Path:
+    """Return a selected_voxel_indices.npz file path in `data_dir`."""
+    out_path = data_dir / "selected_voxel_indices.npz"
+    if not out_path.exists() or overwrite:
+        if input_voxel_indices.suffix.lower() == ".npz":
+            shutil.copy2(input_voxel_indices, out_path)
+        else:
+            df = pd.read_csv(input_voxel_indices)
+            if df.empty:
+                raise ValueError(f"Voxel indices source is empty: {input_voxel_indices}")
+
+            cols = {c.lower(): c for c in df.columns}
+            missing = [name for name in ("x", "y", "z") if name not in cols]
+            if missing:
+                raise ValueError(
+                    f"CSV voxel source must contain x,y,z columns; missing {missing}: {input_voxel_indices}"
+                )
+            xyz = df[[cols["x"], cols["y"], cols["z"]]].to_numpy(dtype=np.int32)
+            np.savez(out_path, selected_ijk=xyz)
+
+    return out_path
 
 
 def run_connectivity_pipeline(
@@ -451,13 +490,16 @@ def main() -> None:
 
     if not (data_dir / "concat_manifest_group.tsv").exists() or args.overwrite:
         shutil.copy2(manifest_path, data_dir / "concat_manifest_group.tsv")
-    if not (data_dir / "selected_voxel_indices.npz").exists() or args.overwrite:
-        shutil.copy2(input_voxel_indices, data_dir / "selected_voxel_indices.npz")
+    voxel_indices_npz = ensure_voxel_indices_npz(
+        input_voxel_indices=input_voxel_indices,
+        data_dir=data_dir,
+        overwrite=bool(args.overwrite),
+    )
 
     if not args.skip_connectivity:
         run_connectivity_pipeline(
             data_dir=data_dir,
-            voxel_indices_path=data_dir / "selected_voxel_indices.npz",
+            voxel_indices_path=voxel_indices_npz,
             out_dir=roi_out_dir,
             advanced_metrics=args.advanced_metrics,
             voxel_weight_img=voxel_weight_img,
@@ -465,7 +507,8 @@ def main() -> None:
     else:
         print("Skipping connectivity run (--skip-connectivity).")
 
-    if not args.skip_session_average:
+    do_session_average = bool(args.run_session_average and not args.skip_session_average)
+    if do_session_average:
         average_over_subjects_per_session(
             advanced_root=roi_out_dir / "advanced_metrics",
             out_dir=avg_out_dir,
