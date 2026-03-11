@@ -786,7 +786,7 @@ def main() -> None:
 
     advanced_info = None
     if args.run_advanced_metrics:
-        from roi_metric_runner import run_metric_pipeline
+        from group_analysis.main.roi_metric_runner import run_metric_pipeline
 
         advanced_info = run_metric_pipeline(
             network_dir=out_dir,
