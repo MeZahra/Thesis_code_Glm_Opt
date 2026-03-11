@@ -28,11 +28,12 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import nibabel as nib
 from numpy.lib.format import open_memmap
 
 
 HERE = Path(__file__).resolve().parent
-REPO_ROOT = HERE.parents[2]
+REPO_ROOT = HERE.parents[1]
 
 DEFAULT_CONNECTIVITY_DIR = REPO_ROOT / "results" / "connectivity"
 DEFAULT_DATA_DIR = DEFAULT_CONNECTIVITY_DIR / "data"
@@ -45,6 +46,12 @@ DEFAULT_INPUT_VOXEL_INDICES_PATH = (
     / "data"
     / "voxel_weights_mean_foldavg_sub9_ses1_task0.8_bold0.8_beta0.5_smooth0.2_gamma1_bold_thr90_nonzero_coords_all2674.csv"
 )
+DEFAULT_MATCHING_VOXEL_INDICES_PATH = (
+    REPO_ROOT / "results" / "connectivity" / "tmp" / "data" / "selected_voxel_indices.npz"
+)
+DEFAULT_ROI_IMG_PATH = REPO_ROOT / "results" / "connectivity" / "atlas figure" / "created_rois_fitted.nii.gz"
+FALLBACK_ROI_IMG_PATH = REPO_ROOT / "results" / "connectivity" / "created_rois_fitted.nii.gz"
+GENERATED_VOXEL_WEIGHT_IMG_NAME = "voxel_weight_from_csv.nii.gz"
 DEFAULT_MANIFEST_NAME = "concat_manifest_group.tsv"
 DEFAULT_OUT_ROOT = HERE / "subject_session_metrics"
 
@@ -97,7 +104,10 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Voxel index source path (NPZ with selected_ijk/selected_flat_indices or CSV with x,y,z). "
+            "Voxel index source path (NPZ with selected_ijk/selected_flat_indices, "
+            "or CSV with x,y,z coordinates). CSV is used as a voxel-weight map when its rows "
+            "do not match beta voxel count; a matching NPZ fallback is then used for indices."
+            "\n"
             "Defaults to the project CSV at results/connectivity/data/voxel_weights_mean_foldavg_sub9_ses1_task0.8_bold0.8_beta0.5_smooth0.2_gamma1_bold_thr90_nonzero_coords_all2674.csv."
         ),
     )
@@ -139,6 +149,29 @@ def parse_args() -> argparse.Namespace:
         "--run-session-average",
         action="store_true",
         help="Run section 7: average each metric across subjects per session and save mean/std CSV/PNG.",
+    )
+    parser.add_argument(
+        "--save-split-summary",
+        action="store_true",
+        help=(
+            "Save subject_session_split_summary.csv. Skip if you want only split beta files."
+        ),
+    )
+    parser.add_argument(
+        "--save-column-map",
+        action="store_true",
+        help=(
+            "Save selected_beta_trials_subject_session_column_indices.npz. Usually not required "
+            "for the ROI-edge pipeline."
+        ),
+    )
+    parser.add_argument(
+        "--save-manifest-copy",
+        action="store_true",
+        help=(
+            "Copy concat_manifest_group.tsv into the split data directory. Usually only needed for "
+            "temporal-boundary mode in roi_edge_connectivity."
+        ),
     )
     parser.add_argument(
         "--overwrite",
@@ -224,6 +257,7 @@ def write_split_files(
     splits: list[SubjectSessionSplit],
     chunk_size: int,
     overwrite: bool,
+    save_column_map: bool,
 ) -> None:
     beta = np.load(input_beta, mmap_mode="r")
 
@@ -254,47 +288,146 @@ def write_split_files(
             flush=True,
         )
 
-    index_map = {split.label: split.columns for split in splits}
-    np.savez(data_dir / "selected_beta_trials_subject_session_column_indices.npz", **index_map)
+    if save_column_map:
+        # Optional traceability output. Skip by default to avoid writing files that are not
+        # required by the ROI-edge stage.
+        index_map = {split.label: split.columns for split in splits}
+        np.savez(data_dir / "selected_beta_trials_subject_session_column_indices.npz", **index_map)
 
 
 def ensure_voxel_indices_npz(
     input_voxel_indices: Path,
     data_dir: Path,
+    expected_n_voxels: int,
     overwrite: bool,
-) -> Path:
-    """Return a selected_voxel_indices.npz file path in `data_dir`."""
+) -> tuple[Path, Path | None]:
+    """Return (selected_voxel_indices.npz path, optional generated voxel-weight NIfTI path)."""
+
+    def _count_rows(path: Path) -> int:
+        if path.suffix.lower() == ".npz":
+            pack = np.load(path, allow_pickle=True)
+            if "selected_ijk" in pack.files:
+                return int(np.asarray(pack["selected_ijk"]).shape[0])
+            if "selected_flat_indices" in pack.files:
+                return int(np.asarray(pack["selected_flat_indices"]).shape[0])
+
+    def _find_matching_fallback() -> Path | None:
+        if DEFAULT_MATCHING_VOXEL_INDICES_PATH.exists():
+            try:
+                if _count_rows(DEFAULT_MATCHING_VOXEL_INDICES_PATH) == expected_n_voxels:
+                    return DEFAULT_MATCHING_VOXEL_INDICES_PATH
+            except (KeyError, ValueError):
+                return None
+        return None
+
+    def _write_weight_img_from_csv(csv_path: Path) -> Path:
+        df = pd.read_csv(csv_path)
+        if df.empty:
+            raise ValueError(f"Voxel index CSV is empty: {csv_path}")
+
+        cols = {c.lower(): c for c in df.columns}
+        missing = [name for name in ("x", "y", "z") if name not in cols]
+        if missing:
+            raise ValueError(f"CSV missing x,y,z columns: {missing}, file={csv_path}")
+
+        roi_img_path = (
+            DEFAULT_ROI_IMG_PATH
+            if DEFAULT_ROI_IMG_PATH.exists()
+            else FALLBACK_ROI_IMG_PATH
+        )
+        if not roi_img_path.exists():
+            raise FileNotFoundError(
+                "ROI image not found for generating weight NIfTI. "
+                f"Checked: {DEFAULT_ROI_IMG_PATH} and {FALLBACK_ROI_IMG_PATH}"
+            )
+        roi_img = nib.load(str(roi_img_path))
+        shape = roi_img.shape
+        affine = roi_img.affine
+
+        x = np.asarray(df[cols["x"]], dtype=np.int64)
+        y = np.asarray(df[cols["y"]], dtype=np.int64)
+        z = np.asarray(df[cols["z"]], dtype=np.int64)
+        valid = (
+            (x >= 0) & (x < shape[0]) &
+            (y >= 0) & (y < shape[1]) &
+            (z >= 0) & (z < shape[2])
+        )
+        x = x[valid]
+        y = y[valid]
+        z = z[valid]
+
+        weight_data = np.zeros(shape, dtype=np.float32)
+        for xi, yi, zi in zip(x, y, z):
+            weight_data[int(xi), int(yi), int(zi)] = 1.0
+
+        out_path = data_dir / GENERATED_VOXEL_WEIGHT_IMG_NAME
+        if not out_path.exists() or overwrite:
+            nib.save(nib.Nifti1Image(weight_data, affine), str(out_path))
+        return out_path
+
     out_path = data_dir / "selected_voxel_indices.npz"
+    generated_weight_img: Path | None = None
+
+    if out_path.exists() and not overwrite:
+        if _count_rows(out_path) != expected_n_voxels:
+            raise ValueError(
+                f"Existing selected_voxel_indices.npz has {_count_rows(out_path)} rows, expected {expected_n_voxels}. "
+                "Pass --overwrite or remove the file and rerun."
+            )
+
     if not out_path.exists() or overwrite:
         if input_voxel_indices.suffix.lower() == ".npz":
-            shutil.copy2(input_voxel_indices, out_path)
-        else:
+            n_rows = _count_rows(input_voxel_indices)
+            if n_rows != expected_n_voxels:
+                raise ValueError(
+                    f"Voxel-index NPZ has {n_rows} rows, expected {expected_n_voxels}: {input_voxel_indices}"
+                )
+            if not out_path.exists() or overwrite:
+                shutil.copy2(input_voxel_indices, out_path)
+        elif input_voxel_indices.suffix.lower() == ".csv":
             df = pd.read_csv(input_voxel_indices)
             if df.empty:
-                raise ValueError(f"Voxel indices source is empty: {input_voxel_indices}")
+                raise ValueError(f"Voxel indices source CSV is empty: {input_voxel_indices}")
 
-            cols = {c.lower(): c for c in df.columns}
-            missing = [name for name in ("x", "y", "z") if name not in cols]
-            if missing:
-                raise ValueError(
-                    f"CSV voxel source must contain x,y,z columns; missing {missing}: {input_voxel_indices}"
-                )
-            xyz = df[[cols["x"], cols["y"], cols["z"]]].to_numpy(dtype=np.int32)
-            np.savez(out_path, selected_ijk=xyz)
+            if len(df) == expected_n_voxels:
+                cols = {c.lower(): c for c in df.columns}
+                missing = [name for name in ("x", "y", "z") if name not in cols]
+                if missing:
+                    raise ValueError(
+                        f"CSV voxel source must contain x,y,z columns; missing {missing}: {input_voxel_indices}"
+                    )
+                xyz = df[[cols["x"], cols["y"], cols["z"]]].to_numpy(dtype=np.int32)
+                if not out_path.exists() or overwrite:
+                    np.savez(out_path, selected_ijk=xyz)
+            else:
+                fallback = _find_matching_fallback()
+                if fallback is None:
+                    raise ValueError(
+                        f"CSV voxel source has {len(df)} rows; expected {expected_n_voxels}. "
+                        "No matching fallback selected_voxel_indices.npz found."
+                    )
+                if not out_path.exists() or overwrite:
+                    shutil.copy2(fallback, out_path)
+                generated_weight_img = _write_weight_img_from_csv(input_voxel_indices)
+        else:
+            raise ValueError(f"Unsupported voxel indices source: {input_voxel_indices}")
 
-    return out_path
+    return out_path, generated_weight_img
 
 
 def run_connectivity_pipeline(
     data_dir: Path,
     voxel_indices_path: Path,
+    roi_img_path: Path,
     out_dir: Path,
     advanced_metrics: str,
     voxel_weight_img: Path | None,
 ) -> None:
     cmd = [
         sys.executable,
-        str(REPO_ROOT / "group_analysis" / "roi_edge_connectivity.py"),
+        str(REPO_ROOT / "group_analysis" / "main" / "roi_edge_connectivity.py"),
+        "--roi-img",
+        str(roi_img_path),
         "--data-dir",
         str(data_dir),
         "--beta-pattern",
@@ -474,7 +607,9 @@ def main() -> None:
         ]
     )
     data_dir.mkdir(parents=True, exist_ok=True)
-    split_df.to_csv(data_dir / "subject_session_split_summary.csv", index=False)
+    # Optional provenance file: disable by default if you only need split betas.
+    if args.save_split_summary:
+        split_df.to_csv(data_dir / "subject_session_split_summary.csv", index=False)
     print(
         "Subject-session splits: "
         f"{len(splits)} labels across {split_df['subject'].nunique()} subjects"
@@ -486,26 +621,43 @@ def main() -> None:
         splits=splits,
         chunk_size=int(max(1, args.chunk_size)),
         overwrite=bool(args.overwrite),
+        save_column_map=bool(args.save_column_map),
     )
 
-    if not (data_dir / "concat_manifest_group.tsv").exists() or args.overwrite:
+    if args.save_manifest_copy and (not (data_dir / "concat_manifest_group.tsv").exists() or args.overwrite):
         shutil.copy2(manifest_path, data_dir / "concat_manifest_group.tsv")
-    voxel_indices_npz = ensure_voxel_indices_npz(
-        input_voxel_indices=input_voxel_indices,
-        data_dir=data_dir,
-        overwrite=bool(args.overwrite),
-    )
-
+    voxel_indices_npz = data_dir / "selected_voxel_indices.npz"
     if not args.skip_connectivity:
+        # Keep selected_voxel_indices.npz aligned with selected_beta voxel count; if source CSV has
+        # fewer rows than expected, fallback to a matching NPZ and build a voxel-weight NIfTI from CSV.
+        voxel_indices_npz, generated_weight_img = ensure_voxel_indices_npz(
+            input_voxel_indices=input_voxel_indices,
+            data_dir=data_dir,
+            expected_n_voxels=int(n_vox),
+            overwrite=bool(args.overwrite),
+        )
+        if voxel_weight_img is None and generated_weight_img is not None:
+            voxel_weight_img = generated_weight_img
+
+        roi_img_path = (
+            DEFAULT_ROI_IMG_PATH
+            if DEFAULT_ROI_IMG_PATH.exists()
+            else FALLBACK_ROI_IMG_PATH
+        )
+        if not roi_img_path.exists():
+            raise FileNotFoundError(
+                "ROI image not found. Checked: "
+                f"{DEFAULT_ROI_IMG_PATH} and {FALLBACK_ROI_IMG_PATH}"
+            )
+
         run_connectivity_pipeline(
             data_dir=data_dir,
             voxel_indices_path=voxel_indices_npz,
+            roi_img_path=roi_img_path,
             out_dir=roi_out_dir,
             advanced_metrics=args.advanced_metrics,
             voxel_weight_img=voxel_weight_img,
         )
-    else:
-        print("Skipping connectivity run (--skip-connectivity).")
 
     do_session_average = bool(args.run_session_average and not args.skip_session_average)
     if do_session_average:

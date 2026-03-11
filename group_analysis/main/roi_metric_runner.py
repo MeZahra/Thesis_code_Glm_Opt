@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,18 @@ import numpy as np
 import pandas as pd
 from nilearn import plotting
 
-from roi_metrics import METRIC_REGISTRY, normalize_metric_list
+_HERE = Path(__file__).resolve().parent
+_GROUP_ANALYSIS_DIR = _HERE.parent
+_REPO_ROOT = _GROUP_ANALYSIS_DIR.parent
+if str(_GROUP_ANALYSIS_DIR) not in sys.path:
+    sys.path.insert(0, str(_GROUP_ANALYSIS_DIR))
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+try:
+    from group_analysis.roi_metrics import METRIC_REGISTRY, normalize_metric_list
+except ModuleNotFoundError:
+    from roi_metrics import METRIC_REGISTRY, normalize_metric_list
 
 ALWAYS_EXCLUDED_ROI_PATTERNS = (
     "ventricular csf",

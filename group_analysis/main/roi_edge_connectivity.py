@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -23,6 +24,11 @@ ALWAYS_EXCLUDED_ROI_PATTERNS = (
     "ventrical csf",
     "lateral ventricle",
 )
+
+_HERE = Path(__file__).resolve().parent
+_REPO_ROOT = _HERE.parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 def _parse_args() -> argparse.Namespace:
@@ -94,12 +100,6 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         default=True,
         help="Split each ROI into left/right hemisphere nodes using MNI x coordinate.",
-    )
-    parser.add_argument(
-        "--no-split-hemispheres",
-        dest="split_hemispheres",
-        action="store_false",
-        help="Disable left/right splitting and keep one node per ROI label.",
     )
     parser.add_argument(
         "--midline-band-mm",
@@ -692,9 +692,6 @@ def main() -> None:
              "edge_corr_finite_fraction": float(np.mean(np.isfinite(edge_corr))),
              "voxel_weighting_applied": bool(selected_voxel_weights is not None)})
         print(f"Processed {label}: trials={beta.shape[1]}, rois={n_rois}, edges={len(edge_pairs)}", flush=True)
-
-    if not connectivity_vec_rows:
-        raise ValueError("No beta files were processed successfully.")
 
     edge_strength = np.vstack(connectivity_vec_rows).astype(np.float64, copy=False)  # files x edges
     np.save(out_dir / "edge_strength_by_file.npy", edge_strength.astype(np.float32, copy=False))
