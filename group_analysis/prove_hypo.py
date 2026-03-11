@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,8 +38,8 @@ class ManifestRow:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Test whether selected voxels have lower trial-to-trial beta variance than "
-            "anatomical non-selected voxels using the full per-run cleaned beta volumes."
+            "Test whether selected voxels have lower mean absolute consecutive-trial beta "
+            "difference than anatomical non-selected voxels using the full per-run cleaned beta volumes."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -48,7 +47,13 @@ def _parse_args() -> argparse.Namespace:
         "--selected-indices-path",
         type=Path,
         default=Path("results/connectivity/data/selected_voxel_indices.npz"),
-        help="NPZ containing the selected voxel indices.",
+        help="NPZ containing the selected voxel indices. Ignored when --selected-csv-path is provided.",
+    )
+    parser.add_argument(
+        "--selected-csv-path",
+        type=Path,
+        default=None,
+        help="CSV with x,y,z selected voxel coordinates in anatomy index space.",
     )
     parser.add_argument(
         "--anat-path",
@@ -136,6 +141,27 @@ def _load_selected_flat_indices(selected_indices_path: Path, anat_shape: tuple[i
     return selected_flat
 
 
+def _load_selected_flat_indices_from_csv(csv_path: Path, anat_shape: tuple[int, int, int]) -> np.ndarray:
+    coords = np.loadtxt(csv_path, delimiter=",", skiprows=1, dtype=np.int64)
+    if coords.ndim == 1:
+        coords = coords.reshape(1, -1)
+    if coords.ndim != 2 or coords.shape[1] != 3:
+        raise ValueError(f"Expected CSV coordinates shape (N, 3), got {coords.shape}")
+
+    valid = np.ones(coords.shape[0], dtype=bool)
+    for dim, size in enumerate(anat_shape):
+        valid &= (coords[:, dim] >= 0) & (coords[:, dim] < size)
+    if not np.all(valid):
+        dropped = int(np.count_nonzero(~valid))
+        print(f"Warning: dropped {dropped} CSV coordinates outside anatomy bounds.", flush=True)
+        coords = coords[valid]
+    if coords.size == 0:
+        raise RuntimeError("CSV selected voxel set is empty after bounds checking.")
+
+    selected_flat = np.ravel_multi_index(coords.T, dims=anat_shape).astype(np.int64, copy=False)
+    return np.unique(selected_flat)
+
+
 def _load_manifest_rows(manifest_path: Path) -> list[ManifestRow]:
     rows: list[ManifestRow] = []
     with manifest_path.open("r", encoding="utf-8", newline="") as handle:
@@ -170,15 +196,14 @@ def _load_trial_keep_mask(row: ManifestRow, n_trials_source: int) -> np.ndarray:
     return keep
 
 
-def _accumulate_trial_stats(
+def _accumulate_consecutive_diff_metric(
     target_flat: np.ndarray,
     manifest_rows: list[ManifestRow],
     row_chunk_size: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     n_voxels = int(target_flat.size)
-    counts = np.zeros(n_voxels, dtype=np.int64)
-    sums = np.zeros(n_voxels, dtype=np.float64)
-    sumsq = np.zeros(n_voxels, dtype=np.float64)
+    pair_counts = np.zeros(n_voxels, dtype=np.int64)
+    abs_diff_sums = np.zeros(n_voxels, dtype=np.float64)
 
     row_chunk_size = max(1, int(row_chunk_size))
     total_runs = len(manifest_rows)
@@ -204,21 +229,22 @@ def _accumulate_trial_stats(
         for start in range(0, n_voxels, row_chunk_size):
             stop = min(start + row_chunk_size, n_voxels)
             chunk = np.asarray(flat_view[target_flat[start:stop]][:, keep_mask], dtype=np.float32)
-            finite = np.isfinite(chunk)
-            counts[start:stop] += np.sum(finite, axis=1, dtype=np.int64)
-            if not np.all(finite):
-                chunk = np.where(finite, chunk, 0.0)
-            sums[start:stop] += np.sum(chunk, axis=1, dtype=np.float64)
-            sumsq[start:stop] += np.sum(chunk * chunk, axis=1, dtype=np.float64)
+            if chunk.shape[1] < 2:
+                continue
+            prev_vals = chunk[:, :-1]
+            next_vals = chunk[:, 1:]
+            valid_pairs = np.isfinite(prev_vals) & np.isfinite(next_vals)
+            pair_counts[start:stop] += np.sum(valid_pairs, axis=1, dtype=np.int64)
+            abs_diff = np.abs(next_vals - prev_vals)
+            if not np.all(valid_pairs):
+                abs_diff = np.where(valid_pairs, abs_diff, 0.0)
+            abs_diff_sums[start:stop] += np.sum(abs_diff, axis=1, dtype=np.float64)
 
-    variance = np.full(n_voxels, np.nan, dtype=np.float64)
-    valid = counts > 1
+    metric = np.full(n_voxels, np.nan, dtype=np.float64)
+    valid = pair_counts > 0
     if np.any(valid):
-        mean = sums[valid] / counts[valid]
-        centered_ss = sumsq[valid] - counts[valid] * np.square(mean)
-        centered_ss = np.maximum(centered_ss, 0.0)
-        variance[valid] = centered_ss / (counts[valid] - 1)
-    return variance, counts
+        metric[valid] = abs_diff_sums[valid] / pair_counts[valid]
+    return metric, pair_counts
 
 
 def _subsample_for_kde(values: np.ndarray, kde_max_points: int, rng: np.random.Generator) -> np.ndarray:
@@ -332,98 +358,46 @@ def _resample_nonselected_means(
     return out, replace
 
 
-def _build_text_panel(
-    selected_count_total: int,
-    nonselected_count_total: int,
-    selected_count_valid: int,
-    nonselected_count_valid: int,
-    selected_mean: float,
-    nonselected_mean: float,
-    p_lower: float,
-    num_resamples: int,
-    resample_replace: bool,
-) -> str:
-    lines = [
-        "A Selected voxels are shifted toward lower trial-to-trial beta variance than anatomical non-selected voxels.",
-        "Dashed lines mark group means.",
-        "",
-        "B Log10 transform reduces skew and makes the separation easier to inspect.",
-        "",
-        "C Bars show Selected / Non-selected prevalence below pooled percentile thresholds.",
-        "Values above 1 indicate overrepresentation among low-variability voxels.",
-        "",
-        f"D The null in panel d comes from {num_resamples} size-matched resamples of non-selected voxels.",
-        f"Observed mean variance: selected = {selected_mean:.4g}, non-selected = {nonselected_mean:.4g}.",
-        f"One-sided resampling p(mean_non <= mean_sel) = {p_lower:.4g}.",
-        "",
-        (
-            f"Selected voxels came directly from selected_voxel_indices.npz: {selected_count_valid} valid / "
-            f"{selected_count_total} total."
-        ),
-        (
-            f"Non-selected voxels were defined as non-zero MNI anatomical voxels not in the selected set: "
-            f"{nonselected_count_valid} valid / {nonselected_count_total} total."
-        ),
-    ]
-    if resample_replace:
-        lines.extend(
-            [
-                "",
-                "Panel d used replacement in the null resampling because the valid non-selected pool was smaller than the selected set.",
-            ]
-        )
-    return "\n".join(textwrap.fill(line, width=48) if line else "" for line in lines)
-
-
 def _plot_summary_figure(
     figure_path: Path,
-    selected_variance: np.ndarray,
-    nonselected_variance: np.ndarray,
+    selected_metric: np.ndarray,
+    nonselected_metric: np.ndarray,
     percentile_labels: list[float],
     prevalence_ratios: np.ndarray,
     resampled_means: np.ndarray,
     p_lower: float,
     num_resamples: int,
-    selected_count_total: int,
-    nonselected_count_total: int,
-    resample_replace: bool,
     rng: np.random.Generator,
     kde_max_points: int,
 ) -> None:
-    fig = plt.figure(figsize=(16, 8), constrained_layout=True)
-    gs = fig.add_gridspec(2, 3, width_ratios=[1.45, 1.0, 1.0])
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9), constrained_layout=True)
+    ax_a, ax_b, ax_c, ax_d = axes.ravel()
 
-    ax_text = fig.add_subplot(gs[:, 0])
-    ax_a = fig.add_subplot(gs[0, 1])
-    ax_b = fig.add_subplot(gs[0, 2])
-    ax_c = fig.add_subplot(gs[1, 1])
-    ax_d = fig.add_subplot(gs[1, 2])
-
-    selected_mean = float(np.mean(selected_variance))
-    nonselected_mean = float(np.mean(nonselected_variance))
+    selected_mean = float(np.mean(selected_metric))
+    nonselected_mean = float(np.mean(nonselected_metric))
 
     log_eps = 1e-12
-    positive = np.concatenate([selected_variance, nonselected_variance])
+    positive = np.concatenate([selected_metric, nonselected_metric])
     positive = positive[np.isfinite(positive) & (positive > 0)]
     if positive.size:
         log_eps = max(float(np.min(positive)) * 0.5, log_eps)
 
     _plot_density_panel(
         ax_a,
-        selected_variance,
-        nonselected_variance,
+        selected_metric,
+        nonselected_metric,
         rng,
         kde_max_points,
-        xlabel="Trial-to-Trial Variance",
+        xlabel="Mean |Delta| Consecutive Trials",
         panel_label="a",
     )
     _plot_density_panel(
         ax_b,
-        np.log10(np.clip(selected_variance, log_eps, None)),
-        np.log10(np.clip(nonselected_variance, log_eps, None)),
+        np.log10(np.clip(selected_metric, log_eps, None)),
+        np.log10(np.clip(nonselected_metric, log_eps, None)),
         rng,
         kde_max_points,
-        xlabel="Log10(Trial-to-Trial Variance)",
+        xlabel="Log10(Mean |Delta| Consecutive Trials)",
         panel_label="b",
     )
 
@@ -444,28 +418,22 @@ def _plot_summary_figure(
     ax_d.axvline(resample_mean, linestyle="--", linewidth=1.6, color="0.45", label=f"Resample mean = {resample_mean:.4g}")
     ax_d.axvline(ci_low, linestyle="--", linewidth=1.4, color="0.55")
     ax_d.axvline(ci_high, linestyle="--", linewidth=1.4, color="0.55", label=f"95% CI = [{ci_low:.4g}, {ci_high:.4g}]")
-    ax_d.set_xlabel("Mean Variance (non-selected voxels)")
+    ax_d.set_xlabel("Mean |Delta| Consecutive Trials (non-selected voxels)")
     ax_d.set_ylabel("Density")
     ax_d.text(-0.02, 1.03, "d", transform=ax_d.transAxes, fontsize=18, fontweight="bold")
     ax_d.legend(frameon=True, fontsize=9, loc="upper right")
     ax_d.spines["top"].set_visible(False)
     ax_d.spines["right"].set_visible(False)
 
-    ax_text.axis("off")
-    text_block = _build_text_panel(
-        selected_count_total=selected_count_total,
-        nonselected_count_total=nonselected_count_total,
-        selected_count_valid=int(selected_variance.size),
-        nonselected_count_valid=int(nonselected_variance.size),
-        selected_mean=selected_mean,
-        nonselected_mean=nonselected_mean,
-        p_lower=p_lower,
-        num_resamples=num_resamples,
-        resample_replace=resample_replace,
+    fig.suptitle(
+        (
+            "Selected vs anatomical non-selected voxels | "
+            f"mean |Delta|: {selected_mean:.3f} vs {nonselected_mean:.3f} | "
+            f"p={p_lower:.4g} | resamples={num_resamples}"
+        ),
+        fontsize=14,
+        y=1.02,
     )
-    ax_text.text(0.02, 0.98, text_block, va="top", ha="left", fontsize=16.5, linespacing=1.45)
-
-    fig.suptitle("Selected voxels vs anatomical non-selected voxels: trial variability of beta values", fontsize=16, y=1.02)
     fig.savefig(figure_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
@@ -476,7 +444,16 @@ def main() -> None:
 
     rng = np.random.default_rng(args.random_seed)
     brain_flat, anat_shape = _load_brain_flat_indices(args.anat_path)
-    selected_flat = _load_selected_flat_indices(args.selected_indices_path, anat_shape)
+    if args.selected_csv_path is not None:
+        print(f"Loading selected voxels from CSV: {args.selected_csv_path}", flush=True)
+        selected_flat = _load_selected_flat_indices_from_csv(args.selected_csv_path, anat_shape)
+        selected_source = str(args.selected_csv_path)
+        selected_source_type = "csv"
+    else:
+        print(f"Loading selected voxels from NPZ: {args.selected_indices_path}", flush=True)
+        selected_flat = _load_selected_flat_indices(args.selected_indices_path, anat_shape)
+        selected_source = str(args.selected_indices_path)
+        selected_source_type = "npz"
 
     brain_selected_mask = np.isin(selected_flat, brain_flat, assume_unique=False)
     if not np.all(brain_selected_mask):
@@ -498,44 +475,44 @@ def main() -> None:
         f"runs in manifest: {len(manifest_rows)}",
         flush=True,
     )
-    variance, trial_counts = _accumulate_trial_stats(
+    metric_values, pair_counts = _accumulate_consecutive_diff_metric(
         target_flat=target_flat,
         manifest_rows=manifest_rows,
         row_chunk_size=args.row_chunk_size,
     )
 
     n_selected = int(selected_flat.size)
-    selected_variance_all = np.asarray(variance[:n_selected], dtype=np.float64)
-    nonselected_variance_all = np.asarray(variance[n_selected:], dtype=np.float64)
-    selected_counts_all = np.asarray(trial_counts[:n_selected], dtype=np.int64)
-    nonselected_counts_all = np.asarray(trial_counts[n_selected:], dtype=np.int64)
+    selected_metric_all = np.asarray(metric_values[:n_selected], dtype=np.float64)
+    nonselected_metric_all = np.asarray(metric_values[n_selected:], dtype=np.float64)
+    selected_counts_all = np.asarray(pair_counts[:n_selected], dtype=np.int64)
+    nonselected_counts_all = np.asarray(pair_counts[n_selected:], dtype=np.int64)
 
-    selected_valid = np.isfinite(selected_variance_all)
-    nonselected_valid = np.isfinite(nonselected_variance_all)
-    selected_variance = selected_variance_all[selected_valid]
-    nonselected_variance = nonselected_variance_all[nonselected_valid]
+    selected_valid = np.isfinite(selected_metric_all)
+    nonselected_valid = np.isfinite(nonselected_metric_all)
+    selected_metric = selected_metric_all[selected_valid]
+    nonselected_metric = nonselected_metric_all[nonselected_valid]
     selected_counts = selected_counts_all[selected_valid]
     nonselected_counts = nonselected_counts_all[nonselected_valid]
     selected_flat_valid = selected_flat[selected_valid]
     nonselected_flat_valid = nonselected_flat[nonselected_valid]
 
-    if selected_variance.size == 0:
-        raise RuntimeError("Selected voxels have no finite variance estimates.")
-    if nonselected_variance.size == 0:
-        raise RuntimeError("Anatomical non-selected voxels have no finite variance estimates.")
+    if selected_metric.size == 0:
+        raise RuntimeError("Selected voxels have no finite consecutive-trial difference estimates.")
+    if nonselected_metric.size == 0:
+        raise RuntimeError("Anatomical non-selected voxels have no finite consecutive-trial difference estimates.")
 
     thresholds, prevalence_ratios = _compute_prevalence_ratios(
-        selected_values=selected_variance,
-        nonselected_values=nonselected_variance,
+        selected_values=selected_metric,
+        nonselected_values=nonselected_metric,
         percentiles=list(args.percentile_thresholds),
     )
     resampled_means, resample_replace = _resample_nonselected_means(
-        nonselected_values=nonselected_variance,
-        sample_size=selected_variance.size,
+        nonselected_values=nonselected_metric,
+        sample_size=selected_metric.size,
         num_resamples=args.num_resamples,
         rng=rng,
     )
-    selected_mean = float(np.mean(selected_variance))
+    selected_mean = float(np.mean(selected_metric))
     p_lower = (1.0 + float(np.count_nonzero(resampled_means <= selected_mean))) / (1.0 + float(args.num_resamples))
 
     png_path = args.output_dir / f"{args.output_stem}.png"
@@ -547,49 +524,46 @@ def main() -> None:
     print(f"Saving figure to {png_path} and {pdf_path}", flush=True)
     _plot_summary_figure(
         figure_path=png_path,
-        selected_variance=selected_variance,
-        nonselected_variance=nonselected_variance,
+        selected_metric=selected_metric,
+        nonselected_metric=nonselected_metric,
         percentile_labels=list(args.percentile_thresholds),
         prevalence_ratios=prevalence_ratios,
         resampled_means=resampled_means,
         p_lower=p_lower,
         num_resamples=int(args.num_resamples),
-        selected_count_total=int(selected_flat.size),
-        nonselected_count_total=int(nonselected_flat.size),
-        resample_replace=bool(resample_replace),
         rng=rng,
         kde_max_points=int(args.kde_max_points),
     )
     _plot_summary_figure(
         figure_path=pdf_path,
-        selected_variance=selected_variance,
-        nonselected_variance=nonselected_variance,
+        selected_metric=selected_metric,
+        nonselected_metric=nonselected_metric,
         percentile_labels=list(args.percentile_thresholds),
         prevalence_ratios=prevalence_ratios,
         resampled_means=resampled_means,
         p_lower=p_lower,
         num_resamples=int(args.num_resamples),
-        selected_count_total=int(selected_flat.size),
-        nonselected_count_total=int(nonselected_flat.size),
-        resample_replace=bool(resample_replace),
         rng=np.random.default_rng(args.random_seed),
         kde_max_points=int(args.kde_max_points),
     )
 
     summary = {
+        "selected_source": selected_source,
+        "selected_source_type": selected_source_type,
         "selected_indices_path": str(args.selected_indices_path),
+        "selected_csv_path": str(args.selected_csv_path) if args.selected_csv_path is not None else None,
         "anat_path": str(args.anat_path),
         "manifest_path": str(args.manifest_path),
         "selected_count_total": int(selected_flat.size),
         "nonselected_count_total": int(nonselected_flat.size),
-        "selected_count_valid": int(selected_variance.size),
-        "nonselected_count_valid": int(nonselected_variance.size),
-        "selected_mean_variance": float(np.mean(selected_variance)),
-        "nonselected_mean_variance": float(np.mean(nonselected_variance)),
-        "selected_median_variance": float(np.median(selected_variance)),
-        "nonselected_median_variance": float(np.median(nonselected_variance)),
-        "selected_min_finite_trials": int(np.min(selected_counts)),
-        "nonselected_min_finite_trials": int(np.min(nonselected_counts)),
+        "selected_count_valid": int(selected_metric.size),
+        "nonselected_count_valid": int(nonselected_metric.size),
+        "selected_mean_abs_consecutive_trial_diff": float(np.mean(selected_metric)),
+        "nonselected_mean_abs_consecutive_trial_diff": float(np.mean(nonselected_metric)),
+        "selected_median_abs_consecutive_trial_diff": float(np.median(selected_metric)),
+        "nonselected_median_abs_consecutive_trial_diff": float(np.median(nonselected_metric)),
+        "selected_min_finite_consecutive_pairs": int(np.min(selected_counts)),
+        "nonselected_min_finite_consecutive_pairs": int(np.min(nonselected_counts)),
         "resample_mean": float(np.mean(resampled_means)),
         "resample_std": float(np.std(resampled_means, ddof=1)),
         "resample_ci_2p5": float(np.percentile(resampled_means, 2.5)),
@@ -614,10 +588,10 @@ def main() -> None:
         analysis_npz_path,
         selected_flat_indices=selected_flat_valid.astype(np.int64, copy=False),
         nonselected_flat_indices=nonselected_flat_valid.astype(np.int64, copy=False),
-        selected_variance=selected_variance.astype(np.float32, copy=False),
-        nonselected_variance=nonselected_variance.astype(np.float32, copy=False),
-        selected_finite_trial_counts=selected_counts.astype(np.int32, copy=False),
-        nonselected_finite_trial_counts=nonselected_counts.astype(np.int32, copy=False),
+        selected_mean_abs_consecutive_trial_diff=selected_metric.astype(np.float32, copy=False),
+        nonselected_mean_abs_consecutive_trial_diff=nonselected_metric.astype(np.float32, copy=False),
+        selected_finite_consecutive_pair_counts=selected_counts.astype(np.int32, copy=False),
+        nonselected_finite_consecutive_pair_counts=nonselected_counts.astype(np.int32, copy=False),
         prevalence_thresholds=thresholds.astype(np.float32, copy=False),
         prevalence_ratios=prevalence_ratios.astype(np.float32, copy=False),
         resampled_nonselected_means=resampled_means.astype(np.float32, copy=False),
