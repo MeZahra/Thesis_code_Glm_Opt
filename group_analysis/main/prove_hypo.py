@@ -70,7 +70,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("results/connectivity/prove_hypothesis"),
+        default=Path("results/prove_hypothesis"),
         help="Directory for figure and summary outputs.",
     )
     parser.add_argument(

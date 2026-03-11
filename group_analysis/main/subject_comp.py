@@ -32,7 +32,7 @@ import pandas as pd
 from scipy.stats import gaussian_kde
 from scipy.stats import combine_pvalues, ks_2samp, rankdata, wilcoxon
 
-from motor_brain_com import (
+from group_analysis.main.motor_brain_com import (
     DEFAULT_MANIFEST_PATH,
     DEFAULT_TRIAL_KEEP_ROOT,
     split_projection_by_run,
