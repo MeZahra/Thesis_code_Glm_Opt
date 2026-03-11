@@ -279,10 +279,7 @@ def _load_summary(network_dir: Path) -> dict:
     summary_path = network_dir / "roi_edge_network_summary.json"
     if not summary_path.exists():
         return {}
-    try:
-        return json.loads(summary_path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return json.loads(summary_path.read_text(encoding="utf-8"))
 
 
 def _load_node_geometry(network_dir: Path) -> tuple[np.ndarray | None, list[str] | None]:
@@ -290,10 +287,7 @@ def _load_node_geometry(network_dir: Path) -> tuple[np.ndarray | None, list[str]
     if not node_path.exists():
         return None, None
 
-    try:
-        df = pd.read_csv(node_path)
-    except Exception:
-        return None, None
+    df = pd.read_csv(node_path)
 
     required = {"x_mm", "y_mm", "z_mm"}
     if not required.issubset(set(df.columns)):

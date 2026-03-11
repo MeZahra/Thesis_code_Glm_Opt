@@ -30,19 +30,13 @@ def _parse_params(name: str) -> Tuple[dict, Optional[float]]:
         for token in tokens:
             if token.startswith(key):
                 raw = token[len(key):]
-                try:
-                    params[key] = float(raw)
-                except ValueError:
-                    pass
+                params[key] = float(raw)
                 break
     thr = None
     for token in tokens:
         if token.startswith("bold_thr"):
             raw = token.replace("bold_thr", "")
-            try:
-                thr = float(raw)
-            except ValueError:
-                thr = raw or None
+            thr = float(raw)
             break
     return params, thr
 
@@ -73,10 +67,7 @@ def _sort_key(path: Path) -> tuple:
     if thr is None:
         key.append(float("inf"))
     else:
-        try:
-            key.append(float(thr))
-        except ValueError:
-            key.append(float("inf"))
+        key.append(float(thr))
     return tuple(key)
 
 

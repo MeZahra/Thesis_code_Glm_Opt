@@ -1164,10 +1164,7 @@ def _sort_count_category_cell(cell_df, row_title, primary_subject_sort_col=None)
     ):
         subject_order = []
         for value in cell_df["category"].astype(str):
-            try:
-                subject_order.append(int(_extract_subject_digits(value)))
-            except ValueError:
-                subject_order.append(int(1e9))
+            subject_order.append(int(_extract_subject_digits(value)))
         cell_df["_subject_order"] = subject_order
         cell_df = cell_df.sort_values(
             [primary_subject_sort_col, "_subject_order", "category"],

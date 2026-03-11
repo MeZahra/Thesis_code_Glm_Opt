@@ -34,10 +34,7 @@ def _env_override(name, cast, default):
     value = os.getenv(name)
     if value is None:
         return default
-    try:
-        return cast(value)
-    except ValueError as exc:
-        raise ValueError(f"Invalid value for {name}: {value!r}") from exc
+    return cast(value)
 
 trial_metric = _env_override('GLM_TRIAL_METRIC', str, 'std')
 trial_z = _env_override('GLM_TRIAL_Z', float, 3)

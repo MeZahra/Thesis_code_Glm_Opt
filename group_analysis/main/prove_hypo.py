@@ -17,10 +17,7 @@ import matplotlib.pyplot as plt
 import nibabel as nib
 import numpy as np
 
-try:
-    from scipy.stats import gaussian_kde
-except Exception:  # pragma: no cover
-    gaussian_kde = None
+from scipy.stats import gaussian_kde
 
 
 SELECTED_COLOR = "#e74c5b"
@@ -264,7 +261,7 @@ def _density_curve(
     if values.size == 0:
         raise RuntimeError("Cannot estimate density for an empty vector.")
 
-    if gaussian_kde is None or values.size < 2 or np.allclose(values, values[0]):
+    if values.size < 2 or np.allclose(values, values[0]):
         hist, edges = np.histogram(values, bins=min(80, max(10, values.size // 20)), density=True)
         centers = 0.5 * (edges[:-1] + edges[1:])
         return centers, hist
@@ -277,13 +274,8 @@ def _density_curve(
         upper += 1e-6
     pad = 0.05 * (upper - lower)
     grid = np.linspace(lower - pad, upper + pad, 512)
-    try:
-        kde = gaussian_kde(sampled)
-        return grid, kde.evaluate(grid)
-    except Exception:
-        hist, edges = np.histogram(values, bins=min(80, max(10, values.size // 20)), density=True)
-        centers = 0.5 * (edges[:-1] + edges[1:])
-        return centers, hist
+    kde = gaussian_kde(sampled)
+    return grid, kde.evaluate(grid)
 
 
 def _plot_density_panel(

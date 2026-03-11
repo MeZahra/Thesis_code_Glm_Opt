@@ -20,10 +20,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-try:
-    from scipy.stats import mannwhitneyu
-except Exception:
-    mannwhitneyu = None
+from scipy.stats import mannwhitneyu
 
 
 COMBO_RE = re.compile(
@@ -368,7 +365,7 @@ def _plot_results(
         for idx in range(1, len(grouped_vals)):
             other_vals = grouped_vals[idx]
             comparisons.append((idx, other_vals))
-            if first_vals.size < 2 or other_vals.size < 2 or mannwhitneyu is None:
+            if first_vals.size < 2 or other_vals.size < 2:
                 raw_p_values.append(np.nan)
                 continue
             result = mannwhitneyu(first_vals, other_vals, alternative="two-sided")

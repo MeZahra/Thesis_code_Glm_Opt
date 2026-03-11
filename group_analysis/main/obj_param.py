@@ -14,13 +14,10 @@ from os.path import join
 import gc
 import sys
 
-try:
-    from empca.empca import empca
-except ModuleNotFoundError:
-    repo_root = os.path.abspath(join(os.path.dirname(__file__), ".."))
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
-    from empca.empca import empca
+repo_root = os.path.abspath(join(os.path.dirname(__file__), "..", ".."))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+from empca.empca import empca
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -866,10 +863,7 @@ def _fetch_ho_atlas(atlas_name, data_dir=None):
 
 def _resolve_fsl_dir(flirt_path=None):
     if flirt_path:
-        try:
-            flirt_path = os.path.realpath(flirt_path)
-        except OSError:
-            flirt_path = None
+        flirt_path = os.path.realpath(flirt_path)
     if flirt_path:
         candidate = os.path.dirname(os.path.dirname(flirt_path))
         if os.path.isdir(os.path.join(candidate, "data", "standard")):

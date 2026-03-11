@@ -387,10 +387,7 @@ def _load_roi_names(summary_path: Path) -> Dict[int, str]:
     names: Dict[int, str] = {}
     if not summary_path.exists():
         return names
-    try:
-        payload = json.loads(summary_path.read_text(encoding="utf-8"))
-    except Exception:
-        return names
+    payload = json.loads(summary_path.read_text(encoding="utf-8"))
     rows = payload.get("roi_rows")
     if isinstance(rows, list) and rows:
         for row in rows:
