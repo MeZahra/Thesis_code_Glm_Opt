@@ -987,7 +987,7 @@ def _density_grid(values, grid_points=512, pad_fraction=0.1, fallback_pad=0.25):
     values = np.asarray(values, dtype=np.float64)
     values = values[np.isfinite(values)]
     if values.size == 0:
-        raise RuntimeError("No finite values available for density-grid construction.")
+        raise ValueError("No finite values available for density-grid construction.")
 
     vmin = float(np.min(values))
     vmax = float(np.max(values))
@@ -1000,7 +1000,7 @@ def _evaluate_density(values, x):
     values = np.asarray(values, dtype=np.float64)
     values = values[np.isfinite(values)]
     if values.size == 0:
-        raise RuntimeError("No finite values available for density estimation.")
+        raise ValueError("No finite values available for density estimation.")
 
     if values.size < 2 or np.allclose(values, values[0]):
         width = max(np.std(values), max(abs(values[0]) * 0.05, 1e-6))
@@ -1602,11 +1602,11 @@ def _read_numeric_text_values(path):
             tokens.extend(line.split())
 
     if not tokens:
-        raise RuntimeError(f"Failed to load numeric projection from '{path}'.")
+        raise ValueError(f"Failed to load numeric projection from '{path}'.")
 
     numeric_values = pd.to_numeric(pd.Series(tokens), errors="coerce")
     if numeric_values.isna().any():
-        raise RuntimeError(f"Failed to load numeric projection from '{path}'.")
+        raise ValueError(f"Failed to load numeric projection from '{path}'.")
 
     return numeric_values.to_numpy(dtype=np.float64)
 
@@ -1753,7 +1753,7 @@ def _resolve_projection_and_excluded_subjects(projection_path, excluded_subjects
         else:
             inferred_projection_path = _infer_projection_path_from_subject_list_path(projection_path)
             if inferred_projection_path is None:
-                raise RuntimeError(
+                raise ValueError(
                     "Projection path points to non-numeric text and no matching .npy file was found: "
                     f"{projection_path}"
                 )
@@ -1866,7 +1866,7 @@ def main():
         excluded_subjects=excluded_subjects,
     )
     if len(run_segments) == 0:
-        raise RuntimeError("No run segments remaining after exclusions.")
+        raise ValueError("No run segments remaining after exclusions.")
 
     out_dir = args.out_dir
     if out_dir is None:

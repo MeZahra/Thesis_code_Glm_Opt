@@ -115,7 +115,7 @@ def _load_brain_flat_indices(anat_path: Path) -> tuple[np.ndarray, tuple[int, in
     brain_mask = np.isfinite(anat_data) & (anat_data != 0)
     brain_flat = np.flatnonzero(brain_mask.ravel()).astype(np.int64, copy=False)
     if brain_flat.size == 0:
-        raise RuntimeError(f"No non-zero voxels found in {anat_path}")
+        raise ValueError(f"No non-zero voxels found in {anat_path}")
     return brain_flat, tuple(int(dim) for dim in anat_img.shape[:3])
 
 
@@ -134,7 +134,7 @@ def _load_selected_flat_indices(selected_indices_path: Path, anat_shape: tuple[i
         )
     selected_flat = np.unique(selected_flat)
     if selected_flat.size == 0:
-        raise RuntimeError("Selected voxel set is empty.")
+        raise ValueError("Selected voxel set is empty.")
     return selected_flat
 
 
@@ -153,7 +153,7 @@ def _load_selected_flat_indices_from_csv(csv_path: Path, anat_shape: tuple[int, 
         print(f"Warning: dropped {dropped} CSV coordinates outside anatomy bounds.", flush=True)
         coords = coords[valid]
     if coords.size == 0:
-        raise RuntimeError("CSV selected voxel set is empty after bounds checking.")
+        raise ValueError("CSV selected voxel set is empty after bounds checking.")
 
     selected_flat = np.ravel_multi_index(coords.T, dims=anat_shape).astype(np.int64, copy=False)
     return np.unique(selected_flat)
@@ -178,7 +178,7 @@ def _load_manifest_rows(manifest_path: Path) -> list[ManifestRow]:
                 )
             )
     if not rows:
-        raise RuntimeError(f"Manifest is empty: {manifest_path}")
+        raise ValueError(f"Manifest is empty: {manifest_path}")
     return rows
 
 
@@ -259,7 +259,7 @@ def _density_curve(
     values = np.asarray(values, dtype=np.float64)
     values = values[np.isfinite(values)]
     if values.size == 0:
-        raise RuntimeError("Cannot estimate density for an empty vector.")
+        raise ValueError("Cannot estimate density for an empty vector.")
 
     if values.size < 2 or np.allclose(values, values[0]):
         hist, edges = np.histogram(values, bins=min(80, max(10, values.size // 20)), density=True)
@@ -453,11 +453,11 @@ def main() -> None:
         print(f"Warning: dropped {dropped} selected voxels outside the anatomical non-zero mask.", flush=True)
         selected_flat = selected_flat[brain_selected_mask]
     if selected_flat.size == 0:
-        raise RuntimeError("No selected voxels remain inside the anatomical non-zero mask.")
+        raise ValueError("No selected voxels remain inside the anatomical non-zero mask.")
 
     nonselected_flat = np.setdiff1d(brain_flat, selected_flat, assume_unique=False)
     if nonselected_flat.size == 0:
-        raise RuntimeError("No anatomical non-selected voxels remain after removing the selected set.")
+        raise ValueError("No anatomical non-selected voxels remain after removing the selected set.")
 
     manifest_rows = _load_manifest_rows(args.manifest_path)
 
@@ -489,9 +489,9 @@ def main() -> None:
     nonselected_flat_valid = nonselected_flat[nonselected_valid]
 
     if selected_metric.size == 0:
-        raise RuntimeError("Selected voxels have no finite consecutive-trial difference estimates.")
+        raise ValueError("Selected voxels have no finite consecutive-trial difference estimates.")
     if nonselected_metric.size == 0:
-        raise RuntimeError("Anatomical non-selected voxels have no finite consecutive-trial difference estimates.")
+        raise ValueError("Anatomical non-selected voxels have no finite consecutive-trial difference estimates.")
 
     thresholds, prevalence_ratios = _compute_prevalence_ratios(
         selected_values=selected_metric,

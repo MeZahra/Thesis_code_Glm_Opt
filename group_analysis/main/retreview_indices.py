@@ -83,7 +83,7 @@ def _build_condition_column_indices(manifest_path, total_output_trials):
         rows = list(reader)
 
     if not rows:
-        raise RuntimeError(f"Manifest is empty: {manifest_path}")
+        raise ValueError(f"Manifest is empty: {manifest_path}")
 
     for row in rows:
         offset_start = int(row["offset_start"])
@@ -127,7 +127,7 @@ def _build_condition_column_indices(manifest_path, total_output_trials):
 
     if np.any(coverage != 1):
         bad = np.flatnonzero(coverage != 1)
-        raise RuntimeError(
+        raise ValueError(
             f"Manifest/keep mapping does not cover each output trial exactly once. "
             f"Columns with invalid coverage: {bad.size}"
         )
@@ -200,7 +200,7 @@ def main():
     selected_mask = np.isfinite(active_weights) & (active_weights > float(args.weight_threshold))
     sel_active_idx = np.flatnonzero(selected_mask).astype(np.int64, copy=False)
     if sel_active_idx.size == 0:
-        raise RuntimeError(
+        raise ValueError(
             f"No selected voxels found with finite weight > {args.weight_threshold}."
         )
 

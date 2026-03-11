@@ -32,7 +32,7 @@ def _safe_symlink(src, dest):
             return
         os.unlink(dest)
     elif os.path.exists(dest):
-        raise RuntimeError(f"{dest} exists and is not a symlink; remove it to continue.")
+        raise ValueError(f"{dest} exists and is not a symlink; remove it to continue.")
     os.symlink(src, dest)
 
 
@@ -138,13 +138,13 @@ def _build_union_mask(entries, trial_keep_root=None, min_trial_coverage=0.70):
         coverage_counts_flat += flat_count
 
     if coverage_counts_flat is None:
-        raise RuntimeError("No cleaned_beta_volume files found to build a union mask.")
+        raise ValueError("No cleaned_beta_volume files found to build a union mask.")
     if total_trials <= 0:
-        raise RuntimeError("No trials found across inputs.")
+        raise ValueError("No trials found across inputs.")
     coverage_flat = coverage_counts_flat.astype(np.float32) / float(total_trials)
     union_mask = coverage_flat.reshape(volume_shape) > float(min_trial_coverage)
     if not np.any(union_mask):
-        raise RuntimeError("Union mask is empty after aggregation.")
+        raise ValueError("Union mask is empty after aggregation.")
     return union_mask, volume_shape, trial_len, coverage_flat, missing_trial_keep
 
 
@@ -411,11 +411,11 @@ def main():
             source_offset += n_trials
 
         if offset != output_trials:
-            raise RuntimeError(
+            raise ValueError(
                 f"Output trial count mismatch while writing: wrote {offset}, expected {output_trials}."
             )
         if source_offset != total_trials:
-            raise RuntimeError(
+            raise ValueError(
                 f"Source trial count mismatch while writing: consumed {source_offset}, expected {total_trials}."
             )
 

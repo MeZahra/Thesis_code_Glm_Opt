@@ -289,7 +289,7 @@ def _load_group_behavior_matrix(group_base_path, group_label, expected_trials):
         behavior_chunks.append(run_behavior)
 
     if not behavior_chunks:
-        raise RuntimeError("Manifest is empty; cannot build group behavior matrix.")
+        raise ValueError("Manifest is empty; cannot build group behavior matrix.")
     behavior_matrix = np.concatenate(behavior_chunks, axis=0)
     behavior_matrix = _align_behavior_matrix(behavior_matrix, expected_trials)
     return behavior_matrix, manifest_path
@@ -1476,7 +1476,7 @@ def solve_soc_problem_eig(run_data, alpha_task, alpha_bold, alpha_beta, alpha_sm
     # Ensure B is positive definite for the generalized eigenvalue problem.
     min_eig_B = float(np.min(np.linalg.eigvalsh(B_mat)))
     if not np.isfinite(min_eig_B):
-        raise RuntimeError("Invalid correlation denominator matrix (non-finite eigenvalues).")
+        raise ValueError("Invalid correlation denominator matrix (non-finite eigenvalues).")
     if min_eig_B <= 0:
         B_mat = B_mat + (abs(min_eig_B) + 1e-8) * np.eye(n_components)
 

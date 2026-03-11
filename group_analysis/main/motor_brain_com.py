@@ -934,7 +934,7 @@ def plot_subject_projection_behavior_variability_panel(
     paired_mask = np.isfinite(metric_df[projection_col]) & np.isfinite(metric_df[behavior_col])
     paired_df = metric_df.loc[paired_mask].copy().reset_index(drop=True)
     if paired_df.empty:
-        raise RuntimeError("No finite paired values are available for the subject projection-behavior panel.")
+        raise ValueError("No finite paired values are available for the subject projection-behavior panel.")
 
     normalized_exclusions = set()
     for value in excluded_subject_digits or ():
@@ -955,7 +955,7 @@ def plot_subject_projection_behavior_variability_panel(
         paired_df = paired_df.loc[np.asarray(keep_mask, dtype=bool)].reset_index(drop=True)
 
     if paired_df.empty:
-        raise RuntimeError("No rows remain for the subject projection-behavior panel after subject exclusion.")
+        raise ValueError("No rows remain for the subject projection-behavior panel after subject exclusion.")
 
     paired_df["projection_raw"] = paired_df[projection_col].to_numpy(dtype=np.float64)
     paired_df["behavior_raw"] = paired_df[behavior_col].to_numpy(dtype=np.float64)
@@ -1130,7 +1130,7 @@ def _build_metric_column_dfs(metric_df, metric_specs=None, use_zscore=False):
             continue
         column_defs.append((column_title, paired_df, spec))
     if len(column_defs) == 0:
-        raise RuntimeError("No metrics with finite paired values are available for plotting.")
+        raise ValueError("No metrics with finite paired values are available for plotting.")
     return column_defs
 
 
@@ -1315,7 +1315,7 @@ def _classify_whisker_position(values, near_fraction=0.10):
     values = np.asarray(values, dtype=np.float64)
     finite_values = values[np.isfinite(values)]
     if finite_values.size == 0:
-        raise RuntimeError("No finite values available for whisker classification.")
+        raise ValueError("No finite values available for whisker classification.")
 
     q1, q3 = np.percentile(finite_values, [25.0, 75.0])
     iqr = float(q3 - q1)
@@ -1807,9 +1807,9 @@ def _plot_subject_metric_comparison(
     finite_proj = projection_values[np.isfinite(projection_values)]
     finite_beh = behavior_values[np.isfinite(behavior_values)]
     if finite_proj.size == 0:
-        raise RuntimeError(f"No finite subject-level projection {metric_label} values.")
+        raise ValueError(f"No finite subject-level projection {metric_label} values.")
     if finite_beh.size == 0:
-        raise RuntimeError(f"No finite subject-level behavior {metric_label} values.")
+        raise ValueError(f"No finite subject-level behavior {metric_label} values.")
 
     paired = _paired_outlier_filtered(
         projection_values,
@@ -1818,7 +1818,7 @@ def _plot_subject_metric_comparison(
         iqr_multiplier=outlier_iqr_multiplier,
     )
     if paired["n_pairs_kept"] == 0:
-        raise RuntimeError(
+        raise ValueError(
             f"No paired subject-level {metric_label} values after outlier filtering."
         )
 
@@ -2029,7 +2029,7 @@ def analyze_subject_metric_difference(
         iqr_multiplier=outlier_iqr_multiplier,
     )
     if paired["n_pairs_kept"] == 0:
-        raise RuntimeError(
+        raise ValueError(
             f"No paired subject values for {metric_label} after outlier filtering."
         )
 
@@ -2079,7 +2079,7 @@ def analyze_subject_metric_difference(
     proj_kept = paired["paired_a_kept"]
     beh_kept = paired["paired_b_kept"]
     if proj_kept.size == 0 or beh_kept.size == 0:
-        raise RuntimeError(
+        raise ValueError(
             f"No finite paired {metric_label} values after outlier filtering."
         )
 

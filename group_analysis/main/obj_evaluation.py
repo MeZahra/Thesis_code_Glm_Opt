@@ -634,7 +634,7 @@ def main() -> None:
     deduped = _deduplicate_records(all_records)
     print(f"Total parsed records: {len(all_records)} | after deduplication: {len(deduped)}")
     if not deduped:
-        raise RuntimeError("No fold records were extracted from the provided logs.")
+        raise ValueError("No fold records were extracted from the provided logs.")
 
     df = _compute_dataframe(
         deduped,

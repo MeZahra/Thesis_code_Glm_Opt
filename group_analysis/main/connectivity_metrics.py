@@ -185,7 +185,7 @@ def _load_and_pool_beta_scores(
         used_files.append(beta_path.name)
         print(f"Loaded beta file: {beta_path.name} {beta.shape}", flush=True)
     if not used_files:
-        raise RuntimeError("No valid beta files loaded.")
+        raise ValueError("No valid beta files loaded.")
     pooled /= float(len(used_files))
     return pooled.astype(np.float32, copy=False), used_files
 

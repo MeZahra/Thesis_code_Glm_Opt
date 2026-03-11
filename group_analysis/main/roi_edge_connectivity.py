@@ -694,7 +694,7 @@ def main() -> None:
         print(f"Processed {label}: trials={beta.shape[1]}, rois={n_rois}, edges={len(edge_pairs)}", flush=True)
 
     if not connectivity_vec_rows:
-        raise RuntimeError("No beta files were processed successfully.")
+        raise ValueError("No beta files were processed successfully.")
 
     edge_strength = np.vstack(connectivity_vec_rows).astype(np.float64, copy=False)  # files x edges
     np.save(out_dir / "edge_strength_by_file.npy", edge_strength.astype(np.float32, copy=False))

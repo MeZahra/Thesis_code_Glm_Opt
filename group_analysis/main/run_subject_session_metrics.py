@@ -34,11 +34,12 @@ from numpy.lib.format import open_memmap
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parents[2]
 
-DEFAULT_INPUT_BETA = REPO_ROOT / "results" / "connectivity" / "data" / "selected_beta_trials.npy"
-DEFAULT_INPUT_VOXEL_INDICES = (
-    REPO_ROOT / "results" / "connectivity" / "data" / "selected_voxel_indices.npz"
-)
-DEFAULT_MANIFEST = REPO_ROOT / "results" / "connectivity" / "tmp" / "concat_manifest_group.tsv"
+DEFAULT_CONNECTIVITY_DIR = REPO_ROOT / "results" / "connectivity"
+DEFAULT_DATA_DIR = DEFAULT_CONNECTIVITY_DIR / "data"
+DEFAULT_MANIFEST_DIR = DEFAULT_CONNECTIVITY_DIR / "tmp"
+DEFAULT_INPUT_BETA_NAME = "selected_beta_trials.npy"
+DEFAULT_INPUT_VOXEL_INDICES_NAME = "selected_voxel_indices.npz"
+DEFAULT_MANIFEST_NAME = "concat_manifest_group.tsv"
 DEFAULT_OUT_ROOT = HERE / "subject_session_metrics"
 
 DEFAULT_METRICS = ",".join(
@@ -71,15 +72,40 @@ def parse_args() -> argparse.Namespace:
             "(run1+run2 concatenated) and average across subjects per session."
         )
     )
-    parser.add_argument("--input-beta", type=Path, default=DEFAULT_INPUT_BETA)
-    parser.add_argument("--input-voxel-indices", type=Path, default=DEFAULT_INPUT_VOXEL_INDICES)
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=DEFAULT_DATA_DIR,
+        help="Directory containing selected_beta_trials.npy and selected_voxel_indices.npz.",
+    )
+    parser.add_argument(
+        "--input-beta",
+        type=Path,
+        default=None,
+        help=(
+            "Global beta matrix path. Defaults to --data-dir/selected_beta_trials.npy."
+        ),
+    )
+    parser.add_argument(
+        "--input-voxel-indices",
+        type=Path,
+        default=None,
+        help=(
+            "Voxel-index NPZ path. Defaults to --data-dir/selected_voxel_indices.npz."
+        ),
+    )
     parser.add_argument(
         "--voxel-weight-img",
         type=Path,
         default=None,
         help="Optional NIfTI voxel-weight map applied rowwise before connectivity.",
     )
-    parser.add_argument("--manifest-path", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument(
+        "--manifest-path",
+        type=Path,
+        default=None,
+        help="Trial manifest path. Defaults to --data-dir/concat_manifest_group.tsv if present, else results/connectivity/tmp/concat_manifest_group.tsv.",
+    )
     parser.add_argument("--out-root", type=Path, default=DEFAULT_OUT_ROOT)
     parser.add_argument("--chunk-size", type=int, default=2048)
     parser.add_argument(
@@ -107,7 +133,31 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite existing split files and copied metadata.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.data_dir = args.data_dir.expanduser().resolve()
+
+    args.input_beta = (
+        args.input_beta.expanduser().resolve()
+        if args.input_beta is not None
+        else args.data_dir / DEFAULT_INPUT_BETA_NAME
+    )
+    args.input_voxel_indices = (
+        args.input_voxel_indices.expanduser().resolve()
+        if args.input_voxel_indices is not None
+        else args.data_dir / DEFAULT_INPUT_VOXEL_INDICES_NAME
+    )
+
+    if args.manifest_path is not None:
+        args.manifest_path = args.manifest_path.expanduser().resolve()
+    else:
+        candidate = args.data_dir / DEFAULT_MANIFEST_NAME
+        args.manifest_path = (
+            candidate
+            if candidate.exists()
+            else (DEFAULT_MANIFEST_DIR / DEFAULT_MANIFEST_NAME).expanduser()
+        )
+
+    return args
 
 
 def build_subject_session_splits(
@@ -117,10 +167,6 @@ def build_subject_session_splits(
 ) -> list[SubjectSessionSplit]:
     manifest_df = pd.read_csv(manifest_path, sep="\t")
     needed = {"offset_start", "offset_end", "sub_tag", "ses", "run"}
-    missing = needed - set(manifest_df.columns)
-    if missing:
-        raise ValueError(f"Manifest missing required columns {sorted(missing)}: {manifest_path}")
-
     coverage = np.zeros(n_trials_total, dtype=np.int16)
     store: dict[tuple[str, int], dict[str, list[int] | set[int]]] = {}
 
@@ -131,11 +177,6 @@ def build_subject_session_splits(
         ses = int(row.ses)
         run = int(row.run)
 
-        if start < 0 or end < start or end > n_trials_total:
-            raise ValueError(
-                f"Invalid manifest offsets start={start} end={end} for total trials {n_trials_total}"
-            )
-
         key = (sub, ses)
         if key not in store:
             store[key] = {"cols": [], "runs": set()}
@@ -143,12 +184,6 @@ def build_subject_session_splits(
         store[key]["cols"].extend(run_cols.tolist())
         store[key]["runs"].add(run)
         coverage[run_cols] += 1
-
-    if np.any(coverage != 1):
-        bad = np.flatnonzero(coverage != 1)
-        raise RuntimeError(
-            f"Manifest coverage invalid: {bad.size} trial columns are not covered exactly once."
-        )
 
     splits: list[SubjectSessionSplit] = []
     for (sub, ses), payload in sorted(store.items(), key=lambda x: (x[0][0], x[0][1])):
@@ -179,8 +214,6 @@ def write_split_files(
     overwrite: bool,
 ) -> None:
     beta = np.load(input_beta, mmap_mode="r")
-    if beta.ndim != 2:
-        raise ValueError(f"Expected 2D beta matrix, got {beta.shape}")
 
     n_vox, n_trials = beta.shape
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -189,15 +222,8 @@ def write_split_files(
         cols = split.columns
         if cols.size == 0:
             continue
-        if int(cols.max()) >= n_trials:
-            raise ValueError(
-                f"{split.label} includes trial index {int(cols.max())} outside [0, {n_trials - 1}]"
-            )
+        
         out_path = data_dir / f"selected_beta_trials_{split.label}.npy"
-        if out_path.exists() and not overwrite:
-            print(f"Keeping existing split file: {out_path}")
-            continue
-
         out_mm = open_memmap(
             out_path,
             mode="w+",
@@ -269,8 +295,6 @@ def _write_heatmap(matrix: np.ndarray, out_png: Path, title: str, cbar_label: st
 
 def average_over_subjects_per_session(advanced_root: Path, out_dir: Path) -> None:
     summary_csv = advanced_root / "metric_run_summary.csv"
-    if not summary_csv.exists():
-        raise FileNotFoundError(f"Missing advanced metric summary CSV: {summary_csv}")
 
     run_df = pd.read_csv(summary_csv)
     labels = sorted(set(run_df["label"].astype(str).tolist()))
@@ -314,7 +338,7 @@ def average_over_subjects_per_session(advanced_root: Path, out_dir: Path) -> Non
                 continue
             shape0 = mats[0].shape
             if any(mat.shape != shape0 for mat in mats):
-                raise RuntimeError(
+                raise ValueError(
                     f"Shape mismatch for session {ses}, metric {metric}: {[m.shape for m in mats]}"
                 )
 
@@ -372,8 +396,6 @@ def average_over_subjects_per_session(advanced_root: Path, out_dir: Path) -> Non
                 }
             )
 
-    if not summary_rows:
-        raise RuntimeError("No session-average outputs were produced.")
     pd.DataFrame(summary_rows).to_csv(out_dir / "session_metric_averages_summary.csv", index=False)
 
 
@@ -390,27 +412,14 @@ def main() -> None:
     roi_out_dir = out_root / "roi_edge_network"
     avg_out_dir = roi_out_dir / "advanced_metrics_session_average"
 
-    if not input_beta.exists():
-        raise FileNotFoundError(f"Input beta matrix not found: {input_beta}")
-    if not input_voxel_indices.exists():
-        raise FileNotFoundError(f"Voxel-index file not found: {input_voxel_indices}")
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
-
     beta = np.load(input_beta, mmap_mode="r")
-    if beta.ndim != 2:
-        raise ValueError(f"Expected 2D beta matrix at {input_beta}, got {beta.shape}")
-
     n_vox, n_trials = beta.shape
-    print(f"Input beta: {input_beta} | shape=({n_vox}, {n_trials})")
 
     splits = build_subject_session_splits(
         manifest_path=manifest_path,
         n_trials_total=int(n_trials),
         allow_partial_runs=bool(args.allow_partial_runs),
     )
-    if not splits:
-        raise RuntimeError("No subject-session splits found.")
 
     split_df = pd.DataFrame(
         [

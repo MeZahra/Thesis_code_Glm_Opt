@@ -666,7 +666,7 @@ def run_metric_pipeline(
     selected_metrics = normalize_metric_list(metrics)
     selected_labels = labels if labels is not None else _resolve_labels(network_dir, requested="", summary=summary)
     if not selected_labels:
-        raise RuntimeError("No condition labels found to process.")
+        raise ValueError("No condition labels found to process.")
 
     out_root = network_dir / out_subdir
     out_root.mkdir(parents=True, exist_ok=True)
