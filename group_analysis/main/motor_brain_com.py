@@ -907,6 +907,161 @@ def _add_category_legend(ax, color_map, category_values, title, loc="upper right
     legend.get_frame().set_alpha(0.95)
 
 
+def plot_subject_projection_behavior_variability_panel(
+    metric_df,
+    out_path,
+    projection_col=None,
+    behavior_col=None,
+    subject_col="sub_tag",
+    excluded_subject_digits=(17,),
+    figsize=(9.2, 4.8),
+    jitter_seed=140,
+    y_limits=None,
+):
+    """Reproduce the standalone subject-colored Behaviour vs Projection variability panel."""
+    if projection_col is None:
+        projection_col = str(ADJACENT_DIFF_RATIO_SUM_SPEC["projection_col"])
+    if behavior_col is None:
+        behavior_col = str(ADJACENT_DIFF_RATIO_SUM_SPEC["behavior_col"])
+
+    required_cols = {str(subject_col), str(projection_col), str(behavior_col)}
+    missing_cols = required_cols.difference(metric_df.columns)
+    if missing_cols:
+        raise ValueError(
+            f"Missing required columns for subject projection-behavior panel: {sorted(missing_cols)}"
+        )
+
+    paired_mask = np.isfinite(metric_df[projection_col]) & np.isfinite(metric_df[behavior_col])
+    paired_df = metric_df.loc[paired_mask].copy().reset_index(drop=True)
+    if paired_df.empty:
+        raise RuntimeError("No finite paired values are available for the subject projection-behavior panel.")
+
+    normalized_exclusions = set()
+    for value in excluded_subject_digits or ():
+        match = re.search(r"(\d+)$", str(value))
+        if match is not None:
+            normalized_exclusions.add(str(int(match.group(1))))
+        else:
+            normalized_exclusions.add(str(value))
+
+    if normalized_exclusions:
+        keep_mask = []
+        for subject_value in paired_df[str(subject_col)].astype(str):
+            match = re.search(r"(\d+)$", subject_value)
+            if match is not None:
+                keep_mask.append(str(int(match.group(1))) not in normalized_exclusions)
+            else:
+                keep_mask.append(subject_value not in normalized_exclusions)
+        paired_df = paired_df.loc[np.asarray(keep_mask, dtype=bool)].reset_index(drop=True)
+
+    if paired_df.empty:
+        raise RuntimeError("No rows remain for the subject projection-behavior panel after subject exclusion.")
+
+    paired_df["projection_raw"] = paired_df[projection_col].to_numpy(dtype=np.float64)
+    paired_df["behavior_raw"] = paired_df[behavior_col].to_numpy(dtype=np.float64)
+
+    if y_limits is None:
+        combined_values = np.concatenate(
+            [paired_df["behavior_raw"].to_numpy(dtype=np.float64), paired_df["projection_raw"].to_numpy(dtype=np.float64)]
+        )
+        finite_values = combined_values[np.isfinite(combined_values)]
+        if finite_values.size == 0:
+            y_limits = (-1.0, 1.0)
+        else:
+            q_low = float(np.percentile(finite_values, 2.0))
+            q_high = float(np.percentile(finite_values, 98.0))
+            q_span = q_high - q_low
+            pad = 0.18 * q_span if q_span > 0 else 0.55
+            y_limits = (q_low - pad, q_high + pad)
+
+    color_map, category_values = _build_category_color_map(
+        paired_df[str(subject_col)].tolist(),
+        category_name=str(subject_col),
+    )
+    lme_stats = _mixedlm_projection_effect(
+        paired_df,
+        behavior_value_col="behavior_raw",
+        projection_value_col="projection_raw",
+        subject_col=str(subject_col),
+    )
+
+    fig, ax = plt.subplots(figsize=figsize)
+    _plot_paired_box_with_connections(
+        ax=ax,
+        paired_df=paired_df,
+        group_col=str(subject_col),
+        color_map=color_map,
+        jitter_seed=int(jitter_seed),
+        y_limits=y_limits,
+        behavior_value_col="behavior_raw",
+        projection_value_col="projection_raw",
+        x_tick_labels=("Behaviour", "Projection"),
+    )
+    ax.set_ylim(y_limits)
+    ax.set_ylabel("Variability")
+    ax.set_title("")
+
+    if np.isfinite(lme_stats["lme_p_two_sided"]) and np.isfinite(
+        lme_stats["lme_z_projection_minus_behavior"]
+    ):
+        lme_text = (
+            "LME (Projection-Behaviour)\n"
+            f"p={lme_stats['lme_p_two_sided']:.3g}, "
+            f"z={lme_stats['lme_z_projection_minus_behavior']:.3g}, "
+            f"beta={lme_stats['lme_coef_projection_minus_behavior']:.3g}"
+        )
+    else:
+        lme_text = "LME (Projection-Behaviour)\nfit unavailable"
+    ax.text(
+        0.70,
+        0.98,
+        lme_text,
+        transform=ax.transAxes,
+        ha="center",
+        va="top",
+        fontsize=8.3,
+        bbox={
+            "boxstyle": "round,pad=0.22",
+            "facecolor": "white",
+            "alpha": 0.8,
+            "edgecolor": "0.75",
+        },
+    )
+
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="",
+            markerfacecolor=color_map[value],
+            markeredgecolor="0.25",
+            markersize=5.5,
+            label=str(value),
+        )
+        for value in category_values
+    ]
+    ax.legend(
+        handles=handles,
+        title="Subject",
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.42),
+        fontsize=7.5,
+        title_fontsize=8.5,
+        frameon=True,
+        ncol=2,
+        borderaxespad=0.4,
+        handletextpad=0.35,
+        columnspacing=0.8,
+        labelspacing=0.25,
+    )
+
+    fig.tight_layout(rect=(0.0, 0.0, 0.74, 1.0))
+    fig.savefig(out_path, dpi=220, bbox_inches="tight", pad_inches=0.04)
+    plt.close(fig)
+    return lme_stats, paired_df
+
+
 def _metric_specs_from_keys(metric_keys=None):
     if metric_keys is None:
         return [dict(spec) for spec in METRIC_SPECS]
@@ -2174,88 +2329,23 @@ def main():
         "subject_metrics_csv": os.path.join(
             out_dir, f"{stem}_subject_projection_behavior_metrics.csv"
         ),
-        "paired_stats_csv": os.path.join(
-            out_dir, f"{stem}_subject_projection_behavior_paired_stats.csv"
-        ),
-        "metric_ds_stats_csv": os.path.join(
-            out_dir, f"{stem}_sub_ses_run_projection_behavior_metric_ds_stats.csv"
-        ),
         "run_pairs_outlier_csv": os.path.join(
             out_dir, f"{stem}_sub_ses_run_adjacent_diff_ratio_sum_pairs_outlier_flags.csv"
         ),
     }
-    metric_spec = dict(ADJACENT_DIFF_RATIO_SUM_SPEC)
-    metric_stub = str(metric_spec["file_stub"])
     metric_paths = {
-        "comparison_plot": os.path.join(
-            out_dir, f"{stem}_sub_ses_run_projection_behavior_{metric_stub}_density.png"
-        ),
-        "pairs_csv": os.path.join(
-            out_dir, f"{stem}_sub_ses_run_projection_behavior_{metric_stub}_pairs.csv"
-        ),
-        "ds_plot": os.path.join(
-            out_dir, f"{stem}_projection_behavior_{metric_stub}_ds_analysis.png"
-        ),
-        "ds_pairs_csv": os.path.join(
-            out_dir, f"{stem}_sub_ses_run_projection_behavior_{metric_stub}_ds_pairs.csv"
+        "subject_panel_plot": os.path.join(
+            out_dir, f"{stem}_sub_ses_run_projection_behavior_subject_panel.png"
         ),
     }
 
     run_metric_df.to_csv(output_paths["run_metric_csv"], index=False)
     subject_metrics_df.to_csv(output_paths["subject_metrics_csv"], index=False)
     run_pair_outlier_df.to_csv(output_paths["run_pairs_outlier_csv"], index=False)
-
-    paired_stats_rows = []
-    ds_stats_rows = []
-    for metric_spec in METRIC_SPECS:
-        metric_key = str(metric_spec["key"])
-        metric_projection_col = str(metric_spec["projection_col"])
-        metric_behavior_col = str(metric_spec["behavior_col"])
-        if not _has_finite_metric_pairs(
-            run_metric_df,
-            projection_col=metric_projection_col,
-            behavior_col=metric_behavior_col,
-        ):
-            print(
-                f"Skipping metric {metric_spec['label']} (no finite paired values after preprocessing)."
-            )
-            continue
-
-        summary_row, metric_pairs_df = _plot_subject_metric_comparison(
-            subject_metrics_df=run_metric_df,
-            projection_col=metric_projection_col,
-            behavior_col=metric_behavior_col,
-            metric_label=str(metric_spec["label"]),
-            out_path=metric_paths["comparison_plot"],
-            outlier_iqr_multiplier=float(args.outlier_iqr_multiplier),
-            projection_plot_scale=float(metric_spec.get("projection_plot_scale", 1.0)),
-            grid_points=512,
-            use_2x2_layout=True,
-        )
-        summary_row["metric_key"] = metric_key
-        paired_stats_rows.append(summary_row)
-        metric_pairs_df.to_csv(metric_paths["pairs_csv"], index=False)
-
-        ds_stats_row, ds_pairs_df = analyze_subject_metric_difference(
-            metric_df=run_metric_df,
-            projection_col=metric_projection_col,
-            behavior_col=metric_behavior_col,
-            metric_label=str(metric_spec["label"]),
-            out_path=metric_paths["ds_plot"],
-            outlier_iqr_multiplier=float(args.outlier_iqr_multiplier),
-            n_permutations=int(args.permutation_iterations),
-            n_bootstrap=int(args.bootstrap_iterations),
-            bootstrap_ci_percent=float(args.bootstrap_ci_percent),
-            random_seed=int(args.random_seed),
-            grid_points=512,
-        )
-        ds_stats_row["metric_key"] = metric_key
-        ds_stats_rows.append(ds_stats_row)
-        ds_pairs_df.to_csv(metric_paths["ds_pairs_csv"], index=False)
-
-    paired_stats_df = pd.DataFrame(paired_stats_rows)
-    paired_stats_df.to_csv(output_paths["paired_stats_csv"], index=False)
-    pd.DataFrame(ds_stats_rows).to_csv(output_paths["metric_ds_stats_csv"], index=False)
+    plot_subject_projection_behavior_variability_panel(
+        metric_df=run_metric_df,
+        out_path=metric_paths["subject_panel_plot"],
+    )
 
     print(f"Saved outputs to: {out_dir}")
 
