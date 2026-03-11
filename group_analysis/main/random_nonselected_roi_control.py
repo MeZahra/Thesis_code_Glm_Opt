@@ -71,13 +71,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--roi-img",
         type=Path,
-        default=Path("results/connectivity/created_rois_fitted.nii.gz"),
+        default=Path(
+            "results/connectivity/atlas figure/created_rois_fitted.nii.gz"
+        ),
         help="ROI atlas image.",
     )
     parser.add_argument(
         "--brain-img",
         type=Path,
-        default=Path("results/connectivity/data/MNI152_T1_2mm_brain.nii.gz"),
+        default=Path(
+            "results/connectivity/tmp/data/MNI152_T1_2mm_brain.nii.gz"
+        ),
         help="Brain image used to restrict atlas voxels to the analysis volume.",
     )
     parser.add_argument(
@@ -111,6 +115,15 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=100,
         help="How many random control draws to generate.",
+    )
+    parser.add_argument(
+        "--n-control-voxels",
+        type=int,
+        default=0,
+        help=(
+            "Number of non-selected voxels to draw per random control. "
+            "If <= 0, uses the selected-network voxel count from selected_voxel_indices.npz."
+        ),
     )
     parser.add_argument(
         "--min-node-voxels",
@@ -344,7 +357,7 @@ def _build_control_candidate_pool(
     selected_voxel_indices_path: Path,
     reference_node_csv: Path,
     midline_band_mm: float,
-) -> tuple[np.ndarray, np.ndarray, pd.DataFrame, dict[str, np.ndarray]]:
+) -> tuple[int, np.ndarray, np.ndarray, pd.DataFrame, dict[str, np.ndarray]]:
     roi_img = nib.load(str(roi_img_path))
     roi_data = np.asarray(roi_img.get_fdata(), dtype=np.int32)
     brain_data = np.asarray(nib.load(str(brain_img_path)).get_fdata(), dtype=np.float32)
@@ -354,6 +367,7 @@ def _build_control_candidate_pool(
         )
 
     selected_flat = _load_selected_flat_indices(selected_voxel_indices_path, roi_data.shape)
+    selected_count = int(selected_flat.size)
     flat_mask = (roi_data.ravel() > 0) & np.isfinite(brain_data.ravel()) & (brain_data.ravel() != 0)
     flat_mask[selected_flat] = False
 
@@ -408,7 +422,7 @@ def _build_control_candidate_pool(
                 }
             )
     inventory_df = pd.DataFrame(inventory_rows).sort_values("node_id").reset_index(drop=True)
-    return candidate_flat, candidate_ijk, inventory_df, node_union_indices
+    return selected_count, candidate_flat, candidate_ijk, inventory_df, node_union_indices
 
 
 def _collect_control_counts(
@@ -509,32 +523,108 @@ def _sample_control_draws(
     control_data_by_label: dict[str, dict[str, np.ndarray]],
     labels: list[str],
     keep_nodes: list[str],
-    sample_sizes: dict[str, int],
+    n_control_voxels: int,
     n_draws: int,
     random_seed: int,
 ) -> list[dict[str, np.ndarray]]:
     rng = np.random.default_rng(int(random_seed))
     draws: list[dict[str, np.ndarray]] = []
+    if int(n_control_voxels) <= 0:
+        raise ValueError(f"n_control_voxels must be > 0, got {n_control_voxels}")
+    if not keep_nodes:
+        raise RuntimeError("No keep nodes were selected; cannot sample control draws.")
+    if int(n_control_voxels) < len(keep_nodes):
+        raise ValueError(
+            f"n_control_voxels ({n_control_voxels}) must be at least the number of kept nodes ({len(keep_nodes)})."
+        )
+
     for draw_idx in range(int(n_draws)):
         draw_map: dict[str, np.ndarray] = {}
         for label in labels:
-            first_node = keep_nodes[0]
-            n_trials = int(control_data_by_label[label][first_node].shape[1])
-            roi_ts = np.full((len(keep_nodes), n_trials), np.nan, dtype=np.float32)
+            n_nodes = len(keep_nodes)
+            first_node_data = control_data_by_label[label][keep_nodes[0]]
+            if first_node_data.ndim != 2:
+                raise ValueError(
+                    f"Expected 2D node data for label {label}, got {first_node_data.ndim} dims."
+                )
+            n_trials = int(first_node_data.shape[1])
+            if n_trials <= 0:
+                raise RuntimeError(f"No trials available for label {label}.")
+
+            node_rows = np.zeros(0, dtype=np.int32)
+            node_ranges: list[tuple[int, int]] = []
+            control_pool: list[np.ndarray] = []
             for node_idx, node_name in enumerate(keep_nodes):
                 available = control_data_by_label[label][node_name]
-                sample_n = int(sample_sizes[node_name])
-                if available.shape[0] < sample_n:
-                    raise RuntimeError(
-                        f"Control pool underflow for draw {draw_idx}, label {label}, node {node_name}: "
-                        f"{available.shape[0]} < {sample_n}"
+                if available.ndim != 2:
+                    raise ValueError(
+                        f"Expected 2D node data for label {label}, node {node_name}, got {available.ndim} dims."
                     )
-                if available.shape[0] == sample_n:
-                    chosen = available
+                if available.shape[1] != n_trials:
+                    raise ValueError(
+                        f"Trial count mismatch for label {label}, node {node_name}: "
+                        f"{available.shape[1]} vs {n_trials}"
+                    )
+                if available.shape[0] <= 0:
+                    raise RuntimeError(
+                        f"No usable control voxels for label {label}, node {node_name}; cannot enforce one voxel per node."
+                    )
+                control_pool.append(available.astype(np.float32, copy=False))
+                start = int(node_rows.shape[0])
+                end = start + int(available.shape[0])
+                node_ranges.append((start, end))
+                node_rows = np.concatenate(
+                    (node_rows, np.full(available.shape[0], node_idx, dtype=np.int32)),
+                    axis=0,
+                )
+
+            if len(control_pool) == 0:
+                raise RuntimeError(f"No available control voxels for label {label}.")
+            control_data = np.concatenate(control_pool, axis=0)
+            if control_data.shape[0] != node_rows.shape[0]:
+                raise RuntimeError(f"Control pool size mismatch for label {label}.")
+            if control_data.shape[0] == int(n_control_voxels):
+                chosen = np.arange(control_data.shape[0], dtype=np.int64)
+            elif control_data.shape[0] < int(n_control_voxels):
+                mandatory: list[np.int64] = []
+                for start, end in node_ranges:
+                    mandatory.append(rng.choice(np.arange(start, end, dtype=np.int64), size=1)[0])
+                remaining_to_draw = int(n_control_voxels - len(mandatory))
+                if remaining_to_draw > 0:
+                    extras = rng.choice(
+                        np.arange(control_data.shape[0], dtype=np.int64),
+                        size=remaining_to_draw,
+                        replace=True,
+                    )
+                    chosen = np.concatenate((np.array(mandatory, dtype=np.int64), extras), axis=0)
                 else:
-                    draw_idx_local = rng.choice(available.shape[0], size=sample_n, replace=False)
-                    chosen = available[draw_idx_local]
-                roi_ts[node_idx] = _nanmean_rows(chosen)
+                    chosen = np.array(mandatory, dtype=np.int64)
+            else:
+                mandatory: list[np.int64] = []
+                for start, end in node_ranges:
+                    mandatory.append(rng.choice(np.arange(start, end, dtype=np.int64), size=1)[0])
+                remaining = np.ones(control_data.shape[0], dtype=bool)
+                remaining[np.array(mandatory, dtype=np.int64)] = False
+                remaining_indices = np.flatnonzero(remaining)
+                remaining_to_draw = int(n_control_voxels - n_nodes)
+                if remaining_to_draw > 0:
+                    extras = rng.choice(
+                        remaining_indices,
+                        size=remaining_to_draw,
+                        replace=False,
+                    )
+                    chosen = np.concatenate((np.array(mandatory, dtype=np.int64), extras), axis=0)
+                else:
+                    chosen = np.array(mandatory, dtype=np.int64)
+
+            picked_data = control_data[chosen]
+            picked_node = node_rows[chosen]
+
+            roi_ts = np.full((n_nodes, n_trials), np.nan, dtype=np.float32)
+            for node_idx in range(n_nodes):
+                node_mask = picked_node == node_idx
+                if np.any(node_mask):
+                    roi_ts[node_idx] = _nanmean_rows(picked_data[node_mask])
             draw_map[label] = roi_ts
         draws.append(draw_map)
     return draws
@@ -790,7 +880,7 @@ def main() -> None:
     manifest_df, labels, label_meta = _load_manifest(manifest_path, excluded_subjects=excluded_subjects)
     selected_metrics = normalize_metric_list(args.metrics)
 
-    candidate_flat, candidate_ijk, node_inventory_df, node_union_indices = _build_control_candidate_pool(
+    selected_voxel_count, candidate_flat, candidate_ijk, node_inventory_df, node_union_indices = _build_control_candidate_pool(
         roi_img_path=roi_img_path,
         brain_img_path=brain_img_path,
         selected_voxel_indices_path=selected_voxel_indices_path,
@@ -835,11 +925,13 @@ def main() -> None:
     )
     pd.DataFrame(control_data_rows).to_csv(out_dir / "control_available_node_data_summary.csv", index=False)
 
+    n_control_voxels = int(args.n_control_voxels) if int(args.n_control_voxels) > 0 else int(selected_voxel_count)
+
     control_draws = _sample_control_draws(
         control_data_by_label=control_data_by_label,
         labels=labels,
         keep_nodes=keep_nodes,
-        sample_sizes=sample_sizes,
+        n_control_voxels=int(n_control_voxels),
         n_draws=int(args.n_draws),
         random_seed=int(args.random_seed),
     )
@@ -963,7 +1055,7 @@ def main() -> None:
                     float(observed_stats["delta_within"]),
                 ),
                 "kept_nodes": json.dumps(ordered_nodes),
-                "sample_sizes_by_node": json.dumps(sample_sizes),
+                "n_control_voxels_per_draw": int(n_control_voxels),
             }
         )
 
@@ -987,13 +1079,13 @@ def main() -> None:
         "n_draws": int(args.n_draws),
         "candidate_union_voxels": int(candidate_flat.size),
         "kept_nodes": keep_nodes,
-        "sample_sizes_by_node": sample_sizes,
         "comparison_note": (
             "Observed selected-network metrics are recomputed from the saved selected ROI-average time series "
             "using the same retained ROI node set as the random non-selected controls. Random controls are "
             "sampled from non-selected voxels in the same atlas nodes and averaged within node before metric computation."
         ),
         "args": _json_safe(vars(args)),
+        "n_control_voxels_per_draw": int(n_control_voxels),
     }
     (out_dir / "analysis_manifest.json").write_text(
         json.dumps(_json_safe(manifest), indent=2),
