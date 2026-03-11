@@ -769,15 +769,15 @@ def main() -> None:
     nonselected_metric = nonselected_diff_all[nonselected_diff_valid]
     selected_counts = selected_counts_all[selected_diff_valid]
     nonselected_counts = nonselected_counts_all[nonselected_diff_valid]
-    selected_flat_valid = selected_flat[selected_diff_valid]
-    nonselected_flat_valid = nonselected_flat[nonselected_diff_valid]
-
     selected_variance = selected_variance_all[selected_variance_valid]
     nonselected_variance = nonselected_variance_all[nonselected_variance_valid]
     selected_trial_counts = selected_trial_counts_all[selected_variance_valid]
     nonselected_trial_counts = nonselected_trial_counts_all[nonselected_variance_valid]
     selected_flat_variance_valid = selected_flat[selected_variance_valid]
     nonselected_flat_variance_valid = nonselected_flat[nonselected_variance_valid]
+
+    selected_flat_valid = selected_flat[selected_diff_valid]
+    nonselected_flat_valid = nonselected_flat[nonselected_diff_valid]
 
     if selected_metric.size == 0:
         raise ValueError("Selected voxels have no finite consecutive-trial difference estimates.")
@@ -816,8 +816,8 @@ def main() -> None:
     var_selected_mean = float(np.mean(selected_variance))
     var_p_lower = (1.0 + float(np.count_nonzero(var_resampled_means <= var_selected_mean))) / (1.0 + float(args.num_resamples))
 
-    diff_png_path = args.output_dir / f"{args.output_stem}_diff.png"
-    diff_pdf_path = args.output_dir / f"{args.output_stem}_diff.pdf"
+    diff_png_path = args.output_dir / f"{args.output_stem}.png"
+    diff_pdf_path = args.output_dir / f"{args.output_stem}.pdf"
     var_png_path = args.output_dir / f"{args.output_stem}_variance.png"
     var_pdf_path = args.output_dir / f"{args.output_stem}_variance.pdf"
     summary_json_path = args.output_dir / f"{args.output_stem}_summary.json"
@@ -964,6 +964,8 @@ def main() -> None:
         nonselected_trial_variance=nonselected_variance.astype(np.float32, copy=False),
         selected_finite_trial_counts=selected_trial_counts.astype(np.int32, copy=False),
         nonselected_finite_trial_counts=nonselected_trial_counts.astype(np.int32, copy=False),
+        selected_flat_indices_variance=selected_flat_variance_valid.astype(np.int64, copy=False),
+        nonselected_flat_indices_variance=nonselected_flat_variance_valid.astype(np.int64, copy=False),
         variance_prevalence_thresholds=var_thresholds.astype(np.float32, copy=False),
         variance_prevalence_ratios=var_prevalence_ratios.astype(np.float32, copy=False),
         resampled_nonselected_variance_means=var_resampled_means.astype(np.float32, copy=False),
