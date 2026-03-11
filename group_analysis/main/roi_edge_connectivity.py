@@ -666,8 +666,8 @@ def main() -> None:
         np.save(cond_dir / f"edge_timeseries_{label}.npy", edge_ts.astype(np.float32, copy=False))
         np.save(cond_dir / f"edge_correlation_{label}.npy", edge_corr.astype(np.float32, copy=False))
 
-        _write_matrix_csv(cond_dir / f"roi_connectivity_corr_{label}.csv", node_conn, row_labels=roi_labels, col_labels=roi_labels)
-        _write_matrix_csv(cond_dir / f"edge_correlation_{label}.csv", edge_corr, row_labels=edge_labels, col_labels=edge_labels)
+        # _write_matrix_csv(cond_dir / f"roi_connectivity_corr_{label}.csv", node_conn, row_labels=roi_labels, col_labels=roi_labels)
+        # _write_matrix_csv(cond_dir / f"edge_correlation_{label}.csv", edge_corr, row_labels=edge_labels, col_labels=edge_labels)
 
         edge_df = pd.DataFrame({
                 "edge_id": np.arange(len(edge_pairs), dtype=int),
@@ -695,15 +695,15 @@ def main() -> None:
 
     edge_strength = np.vstack(connectivity_vec_rows).astype(np.float64, copy=False)  # files x edges
     np.save(out_dir / "edge_strength_by_file.npy", edge_strength.astype(np.float32, copy=False))
-    _write_matrix_csv(out_dir / "edge_strength_by_file.csv", edge_strength, row_labels=connectivity_vec_labels, col_labels=edge_labels)
+    # _write_matrix_csv(out_dir / "edge_strength_by_file.csv", edge_strength, row_labels=connectivity_vec_labels, col_labels=edge_labels)
 
     file_similarity = _safe_corrcoef_rows(edge_strength)
     np.save(out_dir / "file_similarity_from_edges.npy", file_similarity.astype(np.float32, copy=False))
-    _write_matrix_csv(out_dir / "file_similarity_from_edges.csv", file_similarity, row_labels=connectivity_vec_labels, col_labels=connectivity_vec_labels)
+    # _write_matrix_csv(out_dir / "file_similarity_from_edges.csv", file_similarity, row_labels=connectivity_vec_labels, col_labels=connectivity_vec_labels)
 
     edge_strength_corr = _safe_corrcoef_rows(edge_strength.T)
     np.save(out_dir / "edge_strength_correlation_across_files.npy", edge_strength_corr.astype(np.float32, copy=False))
-    _write_matrix_csv(out_dir / "edge_strength_correlation_across_files.csv", edge_strength_corr, row_labels=edge_labels, col_labels=edge_labels)
+    # _write_matrix_csv(out_dir / "edge_strength_correlation_across_files.csv", edge_strength_corr, row_labels=edge_labels, col_labels=edge_labels)
     _plot_heatmap(edge_strength_corr, edge_labels, out_png=out_dir / "edge_strength_correlation_across_files.png",
                   title="Edge-strength correlation across selected_beta_trials_* files")
 
