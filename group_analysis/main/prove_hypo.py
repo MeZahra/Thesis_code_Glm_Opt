@@ -436,6 +436,8 @@ def _accumulate_consecutive_diff_and_variance_metrics(
     target_flat: np.ndarray,
     manifest_rows: list[ManifestRow],
     row_chunk_size: int,
+    normalization_mean: np.ndarray | None = None,
+    normalization_std: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     n_voxels = int(target_flat.size)
     pair_counts = np.zeros(n_voxels, dtype=np.int64)
@@ -464,12 +466,23 @@ def _accumulate_consecutive_diff_and_variance_metrics(
             f"Run {run_idx}/{total_runs}: {row.cleaned_beta.name} | kept trials = {int(np.count_nonzero(keep_mask))}",
             flush=True,
         )
+        # Adjacency mask: True only for pairs that are consecutive in the original run.
+        # Computed once per run, broadcast across voxel chunks.
+        kept_idx = np.flatnonzero(keep_mask)
+        is_adjacent = np.diff(kept_idx) == 1  # shape (n_kept - 1,)
 
         for start in range(0, n_voxels, row_chunk_size):
             stop = min(start + row_chunk_size, n_voxels)
             chunk = np.asarray(flat_view[target_flat[start:stop]][:, keep_mask], dtype=np.float32)
             if chunk.shape[1] == 0:
                 continue
+
+            # Per-voxel normalization: subtract global mean and divide by global std.
+            # Voxels with std=nan (zero-variance) produce nan here; the isfinite guard below handles them.
+            if normalization_mean is not None and normalization_std is not None:
+                vox_mean = normalization_mean[start:stop, np.newaxis]
+                vox_std = normalization_std[start:stop, np.newaxis]
+                chunk = (chunk - vox_mean) / vox_std
 
             finite = np.isfinite(chunk)
             trial_counts[start:stop] += np.sum(finite, axis=1, dtype=np.int64)
@@ -482,7 +495,8 @@ def _accumulate_consecutive_diff_and_variance_metrics(
                 continue
             prev_vals = chunk[:, :-1]
             next_vals = chunk[:, 1:]
-            valid_pairs = np.isfinite(prev_vals) & np.isfinite(next_vals)
+            # valid_pairs combines: both values finite AND the pair is truly adjacent in the original run.
+            valid_pairs = np.isfinite(prev_vals) & np.isfinite(next_vals) & is_adjacent[np.newaxis, :]
             pair_counts[start:stop] += np.sum(valid_pairs, axis=1, dtype=np.int64)
             abs_diff = np.abs(next_vals - prev_vals)
             if not np.all(valid_pairs):
@@ -502,6 +516,71 @@ def _accumulate_consecutive_diff_and_variance_metrics(
         variance[variance_valid] = np.where(variance[variance_valid] >= 0.0, variance[variance_valid], 0.0)
 
     return metric, pair_counts, variance, trial_counts
+
+
+def _compute_per_voxel_mean_std(
+    target_flat: np.ndarray,
+    manifest_rows: list[ManifestRow],
+    row_chunk_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pass 1: compute per-voxel mean and std across all kept trials in all runs.
+
+    Returns (mean, std), both shape (n_voxels,) float64.
+    Voxels with zero std or fewer than 2 finite values get std=nan so that
+    the normalization step naturally produces nan, which the isfinite guard handles.
+    """
+    n_voxels = int(target_flat.size)
+    sums = np.zeros(n_voxels, dtype=np.float64)
+    sq_sums = np.zeros(n_voxels, dtype=np.float64)
+    counts = np.zeros(n_voxels, dtype=np.int64)
+
+    row_chunk_size = max(1, int(row_chunk_size))
+    total_runs = len(manifest_rows)
+
+    print("Pass 1: computing per-voxel mean and std for normalization...", flush=True)
+    for run_idx, row in enumerate(manifest_rows, start=1):
+        volume = np.load(row.cleaned_beta, mmap_mode="r")
+        flat_view = volume.reshape(-1, volume.shape[-1])
+        n_trials_source = int(volume.shape[-1])
+        keep_mask = _load_trial_keep_mask(row, n_trials_source)
+        print(
+            f"  Pass 1 run {run_idx}/{total_runs}: {row.cleaned_beta.name} | kept = {int(np.count_nonzero(keep_mask))}",
+            flush=True,
+        )
+
+        for start in range(0, n_voxels, row_chunk_size):
+            stop = min(start + row_chunk_size, n_voxels)
+            chunk = np.asarray(flat_view[target_flat[start:stop]][:, keep_mask], dtype=np.float32)
+            if chunk.shape[1] == 0:
+                continue
+            finite = np.isfinite(chunk)
+            counts[start:stop] += np.sum(finite, axis=1, dtype=np.int64)
+            safe = np.where(finite, chunk.astype(np.float64), 0.0)
+            sums[start:stop] += np.sum(safe, axis=1)
+            sq_sums[start:stop] += np.sum(safe * safe, axis=1)
+
+    per_voxel_mean = np.full(n_voxels, np.nan, dtype=np.float64)
+    per_voxel_std = np.full(n_voxels, np.nan, dtype=np.float64)
+
+    has_data = counts > 0
+    per_voxel_mean[has_data] = sums[has_data] / counts[has_data]
+
+    has_variance = counts > 1
+    pop_var = np.zeros(n_voxels, dtype=np.float64)
+    pop_var[has_variance] = np.maximum(
+        0.0,
+        sq_sums[has_variance] / counts[has_variance]
+        - per_voxel_mean[has_variance] ** 2,
+    )
+    std_candidate = np.sqrt(pop_var)
+    # Voxels with zero std cannot be normalized; set to nan so the isfinite
+    # guard in the accumulation function excludes them automatically.
+    nonzero_std = has_variance & (std_candidate > 0)
+    per_voxel_std[nonzero_std] = std_candidate[nonzero_std]
+
+    n_valid = int(np.count_nonzero(nonzero_std))
+    print(f"Pass 1 complete: {n_valid}/{n_voxels} voxels have finite mean and non-zero std.", flush=True)
+    return per_voxel_mean, per_voxel_std
 
 
 def _subsample_for_kde(values: np.ndarray, kde_max_points: int, rng: np.random.Generator) -> np.ndarray:
@@ -744,10 +823,19 @@ def main() -> None:
         f"runs in manifest: {len(manifest_rows)}",
         flush=True,
     )
+    # Pass 1: compute per-voxel mean and std for normalization.
+    norm_mean, norm_std = _compute_per_voxel_mean_std(
+        target_flat=target_flat,
+        manifest_rows=manifest_rows,
+        row_chunk_size=args.row_chunk_size,
+    )
+    # Pass 2: accumulate metrics on z-scored (normalized) betas.
     metric_values, pair_counts, variance_values, trial_counts = _accumulate_consecutive_diff_and_variance_metrics(
         target_flat=target_flat,
         manifest_rows=manifest_rows,
         row_chunk_size=args.row_chunk_size,
+        normalization_mean=norm_mean,
+        normalization_std=norm_std,
     )
 
     n_selected = int(selected_flat.size)
@@ -788,6 +876,26 @@ def main() -> None:
     if nonselected_variance.size == 0:
         raise ValueError("Motor non-selected voxels have no finite trial-variance estimates.")
 
+    # Coefficient of variation: scale-free metric derived from Pass 1 statistics.
+    # CV = std / |mean|; undefined (nan) where |mean| is near zero.
+    cv_values = np.where(
+        np.abs(norm_mean) > 1e-8,
+        norm_std / np.abs(norm_mean),
+        np.nan,
+    )
+    selected_cv_all = np.asarray(cv_values[:n_selected], dtype=np.float64)
+    nonselected_cv_all = np.asarray(cv_values[n_selected:], dtype=np.float64)
+    selected_cv_valid = np.isfinite(selected_cv_all)
+    nonselected_cv_valid = np.isfinite(nonselected_cv_all)
+    selected_cv = selected_cv_all[selected_cv_valid]
+    nonselected_cv = nonselected_cv_all[nonselected_cv_valid]
+    selected_flat_cv_valid = selected_flat[selected_cv_valid]
+    nonselected_flat_cv_valid = nonselected_flat[nonselected_cv_valid]
+    if selected_cv.size == 0:
+        raise ValueError("Selected voxels have no finite coefficient-of-variation estimates.")
+    if nonselected_cv.size == 0:
+        raise ValueError("Motor non-selected voxels have no finite coefficient-of-variation estimates.")
+
     diff_thresholds, diff_prevalence_ratios = _compute_prevalence_ratios(
         selected_values=selected_metric,
         nonselected_values=nonselected_metric,
@@ -816,17 +924,35 @@ def main() -> None:
     var_selected_mean = float(np.mean(selected_variance))
     var_p_lower = (1.0 + float(np.count_nonzero(var_resampled_means <= var_selected_mean))) / (1.0 + float(args.num_resamples))
 
+    cv_thresholds, cv_prevalence_ratios = _compute_prevalence_ratios(
+        selected_values=selected_cv,
+        nonselected_values=nonselected_cv,
+        percentiles=list(args.percentile_thresholds),
+    )
+    cv_resampled_means, cv_resample_replace = _resample_nonselected_means(
+        nonselected_values=nonselected_cv,
+        sample_size=selected_cv.size,
+        num_resamples=args.num_resamples,
+        rng=rng,
+    )
+    cv_selected_mean = float(np.mean(selected_cv))
+    cv_p_lower = (1.0 + float(np.count_nonzero(cv_resampled_means <= cv_selected_mean))) / (1.0 + float(args.num_resamples))
+
     diff_png_path = args.output_dir / f"{args.output_stem}.png"
     diff_pdf_path = args.output_dir / f"{args.output_stem}.pdf"
     var_png_path = args.output_dir / f"{args.output_stem}_variance.png"
     var_pdf_path = args.output_dir / f"{args.output_stem}_variance.pdf"
+    cv_png_path = args.output_dir / f"{args.output_stem}_cv.png"
+    cv_pdf_path = args.output_dir / f"{args.output_stem}_cv.pdf"
     summary_json_path = args.output_dir / f"{args.output_stem}_summary.json"
     prevalence_csv_path = args.output_dir / f"{args.output_stem}_prevalence.csv"
     variance_prevalence_csv_path = args.output_dir / f"{args.output_stem}_prevalence_variance.csv"
+    cv_prevalence_csv_path = args.output_dir / f"{args.output_stem}_prevalence_cv.csv"
     analysis_npz_path = args.output_dir / f"{args.output_stem}_analysis_data.npz"
 
     print(
-        f"Saving figures to {diff_png_path}, {diff_pdf_path}, {var_png_path}, and {var_pdf_path}",
+        f"Saving figures to {diff_png_path}, {diff_pdf_path}, {var_png_path}, {var_pdf_path}, "
+        f"{cv_png_path}, and {cv_pdf_path}",
         flush=True,
     )
     _plot_summary_figure(
@@ -881,6 +1007,32 @@ def main() -> None:
         kde_max_points=int(args.kde_max_points),
         metric_name="Variance Across Kept Trials",
     )
+    _plot_summary_figure(
+        figure_path=cv_png_path,
+        selected_metric=selected_cv,
+        nonselected_metric=nonselected_cv,
+        percentile_labels=list(args.percentile_thresholds),
+        prevalence_ratios=cv_prevalence_ratios,
+        resampled_means=cv_resampled_means,
+        p_lower=cv_p_lower,
+        num_resamples=int(args.num_resamples),
+        rng=rng,
+        kde_max_points=int(args.kde_max_points),
+        metric_name="Coefficient of Variation (std/|mean|)",
+    )
+    _plot_summary_figure(
+        figure_path=cv_pdf_path,
+        selected_metric=selected_cv,
+        nonselected_metric=nonselected_cv,
+        percentile_labels=list(args.percentile_thresholds),
+        prevalence_ratios=cv_prevalence_ratios,
+        resampled_means=cv_resampled_means,
+        p_lower=cv_p_lower,
+        num_resamples=int(args.num_resamples),
+        rng=np.random.default_rng(args.random_seed),
+        kde_max_points=int(args.kde_max_points),
+        metric_name="Coefficient of Variation (std/|mean|)",
+    )
 
     summary = {
         "selected_source": selected_source,
@@ -925,15 +1077,31 @@ def main() -> None:
         "var_resample_ci_97p5": float(np.percentile(var_resampled_means, 97.5)),
         "var_resample_p_lower_or_equal_selected": float(var_p_lower),
         "var_resample_with_replacement": bool(var_resample_replace),
+        "normalization_applied": True,
+        "selected_count_cv_valid": int(selected_cv.size),
+        "nonselected_count_cv_valid": int(nonselected_cv.size),
+        "selected_mean_cv": float(np.mean(selected_cv)),
+        "nonselected_mean_cv": float(np.mean(nonselected_cv)),
+        "selected_median_cv": float(np.median(selected_cv)),
+        "nonselected_median_cv": float(np.median(nonselected_cv)),
+        "cv_resample_mean": float(np.mean(cv_resampled_means)),
+        "cv_resample_std": float(np.std(cv_resampled_means, ddof=1)),
+        "cv_resample_ci_2p5": float(np.percentile(cv_resampled_means, 2.5)),
+        "cv_resample_ci_97p5": float(np.percentile(cv_resampled_means, 97.5)),
+        "cv_resample_p_lower_or_equal_selected": float(cv_p_lower),
+        "cv_resample_with_replacement": bool(cv_resample_replace),
         "num_resamples": int(args.num_resamples),
         "random_seed": int(args.random_seed),
         "diff_png_path": str(diff_png_path),
         "diff_pdf_path": str(diff_pdf_path),
         "variance_png_path": str(var_png_path),
         "variance_pdf_path": str(var_pdf_path),
+        "cv_png_path": str(cv_png_path),
+        "cv_pdf_path": str(cv_pdf_path),
         "motor_region_figure_path": str(motor_region_figure),
         "prevalence_csv_path": str(prevalence_csv_path),
         "variance_prevalence_csv_path": str(variance_prevalence_csv_path),
+        "cv_prevalence_csv_path": str(cv_prevalence_csv_path),
     }
     with summary_json_path.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
@@ -947,6 +1115,11 @@ def main() -> None:
         writer = csv.writer(handle)
         writer.writerow(["percentile", "threshold", "relative_prevalence_selected_over_nonselected"])
         for percentile, threshold, ratio in zip(args.percentile_thresholds, var_thresholds, var_prevalence_ratios):
+            writer.writerow([float(percentile), float(threshold), float(ratio)])
+    with cv_prevalence_csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["percentile", "threshold", "relative_prevalence_selected_over_nonselected"])
+        for percentile, threshold, ratio in zip(args.percentile_thresholds, cv_thresholds, cv_prevalence_ratios):
             writer.writerow([float(percentile), float(threshold), float(ratio)])
 
     np.savez_compressed(
@@ -973,11 +1146,19 @@ def main() -> None:
         motor_region_names=np.array(motor_region_names, dtype=object),
         motor_region_counts=np.asarray(motor_region_counts, dtype=np.int32),
         motor_region_patterns=np.array(motor_patterns, dtype=object),
+        selected_cv=selected_cv.astype(np.float32, copy=False),
+        nonselected_cv=nonselected_cv.astype(np.float32, copy=False),
+        selected_flat_indices_cv=selected_flat_cv_valid.astype(np.int64, copy=False),
+        nonselected_flat_indices_cv=nonselected_flat_cv_valid.astype(np.int64, copy=False),
+        cv_prevalence_thresholds=cv_thresholds.astype(np.float32, copy=False),
+        cv_prevalence_ratios=cv_prevalence_ratios.astype(np.float32, copy=False),
+        resampled_nonselected_cv_means=cv_resampled_means.astype(np.float32, copy=False),
     )
 
     print(f"Saved summary JSON: {summary_json_path}", flush=True)
     print(f"Saved prevalence CSV: {prevalence_csv_path}", flush=True)
     print(f"Saved variance prevalence CSV: {variance_prevalence_csv_path}", flush=True)
+    print(f"Saved CV prevalence CSV: {cv_prevalence_csv_path}", flush=True)
     print(f"Saved analysis NPZ: {analysis_npz_path}", flush=True)
     print("Done.", flush=True)
 

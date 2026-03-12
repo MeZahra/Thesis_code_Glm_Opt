@@ -851,15 +851,57 @@ def _plot_null_distribution(
     out_png: Path,
     title: str,
     xlabel: str,
+    annotation_label: str,
 ) -> None:
     values = np.asarray(null_values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        fig, ax = plt.subplots(figsize=(6.4, 4.3))
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Random draws")
+        ax.text(
+            0.5,
+            0.5,
+            "No finite null samples available",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+        )
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=190, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    z_score = _z_score_against_null(values, observed)
+    p_value = _empirical_two_sided(values, observed)
+    null_mean = float(np.mean(values))
+    null_sd = float(np.std(values, ddof=1))
+    percentile = _percentile_against_null(values, observed)
     fig, ax = plt.subplots(figsize=(6.4, 4.3))
     ax.hist(values, bins=min(30, max(10, values.size // 4)), color="#9ecae1", edgecolor="white")
-    ax.axvline(float(np.mean(values)), color="#08519c", linestyle="--", linewidth=1.5, label="Null mean")
+    ax.axvline(float(null_mean), color="#08519c", linestyle="--", linewidth=1.5, label="Null mean")
     ax.axvline(float(observed), color="#cb181d", linewidth=2.0, label="Observed selected")
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Random draws")
+    stat_text = (
+        f"{annotation_label}\n"
+        f"Observed={observed:.4g}\n"
+        f"Null mean={null_mean:.4g}, SD={null_sd:.4g}\n"
+        f"z={z_score:.3g}, p(two-sided)={p_value:.2g}\n"
+        f"percentile={percentile:.2f}%"
+    )
+    ax.text(
+        0.02,
+        0.98,
+        stat_text,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "#ffffff", "alpha": 0.85, "edgecolor": "#cccccc"},
+    )
     ax.legend(frameon=False)
     fig.tight_layout()
     fig.savefig(out_png, dpi=190, bbox_inches="tight")
@@ -1007,29 +1049,65 @@ def main() -> None:
         null_df = pd.DataFrame(null_rows).sort_values("draw").reset_index(drop=True)
         null_df.to_csv(metric_out / "random_draw_contrast_summary.csv", index=False)
 
+        null_class_specs = [
+            ("OFF-OFF", "mu_off_off"),
+            ("ON-ON", "mu_on_on"),
+            ("OFF-ON", "mu_off_on"),
+        ]
+        for class_label, null_key in null_class_specs:
+            _plot_null_distribution(
+                null_df[null_key].to_numpy(dtype=np.float64),
+                float(observed_stats[null_key]),
+                metric_out / f"{null_key}_selected_vs_null_distribution.png",
+                title=f"{metric_name} | {class_label} mean selected vs null",
+                xlabel=f"{class_label} mean graph distance",
+                annotation_label=class_label,
+            )
+
         delta_sep_null = null_df["delta_sep"].to_numpy(dtype=np.float64)
         delta_within_null = null_df["delta_within"].to_numpy(dtype=np.float64)
-
-        _plot_null_distribution(
-            delta_sep_null,
-            float(observed_stats["delta_sep"]),
-            metric_out / "delta_sep_null_distribution.png",
-            title=f"{metric_name} | state-separation contrast null",
-            xlabel="Delta_sep = OFF-ON - 0.5*(OFF-OFF + ON-ON)",
-        )
-        _plot_null_distribution(
-            delta_within_null,
-            float(observed_stats["delta_within"]),
-            metric_out / "delta_within_null_distribution.png",
-            title=f"{metric_name} | within-state asymmetry null",
-            xlabel="Delta_within = ON-ON - OFF-OFF",
-        )
 
         summary_rows.append(
             {
                 "metric": metric_name,
                 "graph_distance": str(args.graph_distance),
                 **observed_stats,
+                "mu_off_off_z_vs_null": _z_score_against_null(
+                    null_df["mu_off_off"].to_numpy(dtype=np.float64),
+                    float(observed_stats["mu_off_off"]),
+                ),
+                "mu_off_off_p_empirical_two_sided": _empirical_two_sided(
+                    null_df["mu_off_off"].to_numpy(dtype=np.float64),
+                    float(observed_stats["mu_off_off"]),
+                ),
+                "mu_off_off_percentile_vs_null": _percentile_against_null(
+                    null_df["mu_off_off"].to_numpy(dtype=np.float64),
+                    float(observed_stats["mu_off_off"]),
+                ),
+                "mu_on_on_z_vs_null": _z_score_against_null(
+                    null_df["mu_on_on"].to_numpy(dtype=np.float64),
+                    float(observed_stats["mu_on_on"]),
+                ),
+                "mu_on_on_p_empirical_two_sided": _empirical_two_sided(
+                    null_df["mu_on_on"].to_numpy(dtype=np.float64),
+                    float(observed_stats["mu_on_on"]),
+                ),
+                "mu_on_on_percentile_vs_null": _percentile_against_null(
+                    null_df["mu_on_on"].to_numpy(dtype=np.float64),
+                    float(observed_stats["mu_on_on"]),
+                ),
+                "mu_off_on_z_vs_null": _z_score_against_null(
+                    null_df["mu_off_on"].to_numpy(dtype=np.float64),
+                    float(observed_stats["mu_off_on"]),
+                ),
+                "mu_off_on_p_empirical_two_sided": _empirical_two_sided(
+                    null_df["mu_off_on"].to_numpy(dtype=np.float64),
+                    float(observed_stats["mu_off_on"]),
+                ),
+                "mu_off_on_percentile_vs_null": _percentile_against_null(
+                    null_df["mu_off_on"].to_numpy(dtype=np.float64),
+                    float(observed_stats["mu_off_on"]),
+                ),
                 "null_mean_delta_sep": float(np.mean(delta_sep_null)),
                 "null_sd_delta_sep": float(np.std(delta_sep_null, ddof=1)),
                 "delta_sep_z_vs_null": _z_score_against_null(delta_sep_null, float(observed_stats["delta_sep"])),

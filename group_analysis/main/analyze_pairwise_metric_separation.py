@@ -99,6 +99,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--nonselected-pairwise-csv",
+        type=Path,
+        default=None,
+        help=(
+            "Optional precomputed pairwise_metric_values.csv for the non-selected network. "
+            "When supplied, distribution plots will show paired selected vs non-selected boxes."
+        ),
+    )
+    parser.add_argument(
         "--permutations",
         type=int,
         default=0,
@@ -414,6 +423,47 @@ def _normalize_selection(raw_value: str, available: list[str], field_name: str) 
 
 def _normalize_subject_exclusions(raw_value: str) -> set[str]:
     return {item.strip() for item in str(raw_value).split(",") if item.strip()}
+
+
+def _load_pairwise_csv(
+    pairwise_csv: Path,
+    comparison_names: list[str],
+    excluded_subjects: set[str],
+) -> tuple[pd.DataFrame, list[str]]:
+    pairwise_df = pd.read_csv(pairwise_csv)
+    required_cols = {
+        "connectivity_metric",
+        "subject_a",
+        "subject_b",
+        "pair_label",
+        "pair_class",
+        "comparison_metric",
+        "comparison_kind",
+        "higher_is_more_similar",
+        "raw_score",
+        "oriented_score",
+        "same_subject",
+    }
+    missing_cols = required_cols.difference(pairwise_df.columns)
+    if missing_cols:
+        raise ValueError(f"Pairwise CSV is missing required columns: {sorted(missing_cols)}")
+
+    if excluded_subjects:
+        pairwise_df = pairwise_df.loc[
+            (~pairwise_df["subject_a"].astype(str).isin(excluded_subjects))
+            & (~pairwise_df["subject_b"].astype(str).isin(excluded_subjects))
+        ].copy()
+
+    if comparison_names:
+        pairwise_df = pairwise_df.loc[pairwise_df["comparison_metric"].astype(str).isin(comparison_names)].copy()
+
+    available_metrics = sorted(pairwise_df["connectivity_metric"].astype(str).unique().tolist())
+    if not available_metrics:
+        return pd.DataFrame(columns=pairwise_df.columns), []
+
+    pairwise_df["higher_is_more_similar"] = pairwise_df["higher_is_more_similar"].astype(bool)
+    pairwise_df["same_subject"] = pairwise_df["same_subject"].astype(bool)
+    return pairwise_df.reset_index(drop=True), available_metrics
 
 
 def _load_metric_sessions(
@@ -1118,6 +1168,7 @@ def _save_distribution_plot(
     comparison_metric: str,
     cohort_name: str,
     out_png: Path,
+    secondary_pairwise_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     subset = pairwise_df.loc[
         (pairwise_df["connectivity_metric"] == connectivity_metric)
@@ -1133,36 +1184,123 @@ def _save_distribution_plot(
         categories=list(PAIR_LABEL_ORDER),
         ordered=True,
     )
+    class_order = [
+        ("OFF-OFF", "off-off"),
+        ("ON-ON", "on-on"),
+        ("OFF-ON", "off-on"),
+    ]
     groups = [
-        ("OFF-OFF", subset.loc[subset["pair_label"] == "off-off", "raw_score"].to_numpy(dtype=np.float64)),
-        ("ON-ON", subset.loc[subset["pair_label"] == "on-on", "raw_score"].to_numpy(dtype=np.float64)),
-        ("ON-OFF", subset.loc[subset["pair_label"] == "off-on", "raw_score"].to_numpy(dtype=np.float64)),
+        (
+            display_name,
+            subset.loc[subset["pair_label"] == pair_key, "raw_score"].to_numpy(dtype=np.float64),
+        )
+        for display_name, pair_key in class_order
     ]
     group_lookup = {name: values for name, values in groups}
-    plot_data = [values for _name, values in groups if values.size]
-    plot_labels = [name for name, values in groups if values.size]
+    class_positions = {name: float(2 * idx + 1) for idx, (name, _pair_key) in enumerate(class_order)}
+    secondary_group_data: dict[str, np.ndarray] = {}
+
+    if secondary_pairwise_df is not None:
+        secondary_subset = secondary_pairwise_df.loc[
+            (secondary_pairwise_df["connectivity_metric"] == connectivity_metric)
+            & (secondary_pairwise_df["comparison_metric"] == comparison_metric)
+        ].copy()
+        if cohort_name == "cross_subject_only":
+            secondary_subset = secondary_subset.loc[~secondary_subset["same_subject"]].copy()
+        secondary_subset["pair_label"] = pd.Categorical(
+            secondary_subset["pair_label"],
+            categories=list(PAIR_LABEL_ORDER),
+            ordered=True,
+        )
+        secondary_groups = [
+            (
+                display_name,
+                secondary_subset.loc[
+                    secondary_subset["pair_label"] == pair_key, "raw_score"
+                ].to_numpy(dtype=np.float64),
+            )
+            for display_name, pair_key in class_order
+        ]
+        secondary_group_data = {name: values for name, values in secondary_groups}
+
+    has_secondary = bool(
+        secondary_pairwise_df is not None
+        and any(values.size for values in secondary_group_data.values())
+    )
+    selected_color = "#4c78a8"
+    nonselected_color = "#7b7b7b"
+    side_offset = 0.24
+
+    plot_data: list[np.ndarray] = []
+    plot_positions: list[float] = []
+    plot_colors: list[str] = []
+    for name, values in groups:
+        center = class_positions[name]
+        if values.size > 0:
+            if has_secondary:
+                plot_data.append(values)
+                plot_positions.append(center - side_offset / 2.0)
+            else:
+                plot_data.append(values)
+                plot_positions.append(center)
+            plot_colors.append(selected_color)
+        secondary_values = secondary_group_data.get(name, np.asarray([], dtype=np.float64))
+        if has_secondary and secondary_values.size > 0:
+            plot_data.append(secondary_values)
+            plot_positions.append(center + side_offset / 2.0)
+            plot_colors.append(nonselected_color)
+
     if not plot_data:
         return pd.DataFrame()
 
-    fig, ax = plt.subplots(figsize=(7.6, 5.2))
-    box = ax.boxplot(plot_data, patch_artist=True, tick_labels=plot_labels)
-    colors = ["#4c78a8", "#59a14f", "#e15759"]
-    for patch, color in zip(box["boxes"], colors[: len(box["boxes"])]):
+    class_positions_x = [class_positions[name] for name, _ in class_order]
+    class_labels = [name for name, _ in class_order]
+    fig, ax = plt.subplots(figsize=(9.2, 5.2))
+    box_kwargs = {
+        "patch_artist": True,
+        "flierprops": {
+            "markeredgecolor": "#444444",
+            "markerfacecolor": "#444444",
+            "markersize": 2.5,
+        },
+    }
+    if has_secondary:
+        box = ax.boxplot(plot_data, positions=plot_positions, widths=0.30, **box_kwargs)
+        ax.set_xticks(class_positions_x)
+        ax.set_xticklabels(class_labels)
+        ax.set_xlim(min(class_positions_x) - 0.8, max(class_positions_x) + 0.8)
+        ax.plot([], [], linewidth=8, color=selected_color, alpha=0.55, label="selected")
+        ax.plot([], [], linewidth=8, color=nonselected_color, alpha=0.55, label="non-selected")
+        ax.legend(frameon=False, loc="upper right")
+    else:
+        box = ax.boxplot(plot_data, positions=plot_positions, widths=0.56, **box_kwargs)
+        ax.set_xticks(class_positions_x)
+        ax.set_xticklabels(class_labels)
+        ax.set_xlim(min(class_positions_x) - 0.8, max(class_positions_x) + 0.8)
+
+    for patch, color in zip(box["boxes"], plot_colors[: len(box["boxes"])]):
         patch.set_facecolor(color)
         patch.set_alpha(0.55)
+
     rng = np.random.default_rng(0)
-    for idx, values in enumerate(plot_data, start=1):
-        x = rng.normal(loc=idx, scale=0.04, size=values.size)
-        ax.scatter(x, values, s=14, alpha=0.55, color="black", linewidths=0.0)
+    for idx, values in enumerate(plot_data):
+        jitter_x = rng.normal(loc=plot_positions[idx], scale=0.04, size=values.size)
+        ax.scatter(jitter_x, values, s=14, alpha=0.55, color="black", linewidths=0.0)
+
     ax.set_title(f"{connectivity_metric} | {comparison_metric} | {cohort_name}")
     ax.set_ylabel("Raw pairwise score")
 
-    y_max = max(float(np.max(values)) for values in plot_data if values.size)
-    y_min = min(float(np.min(values)) for values in plot_data if values.size)
+    finite_plot_data = [
+        np.asarray(values, dtype=np.float64)[np.isfinite(values)] for values in plot_data if np.isfinite(values).any()
+    ]
+    if not finite_plot_data:
+        return pd.DataFrame()
+    y_max = max(float(np.max(values)) for values in finite_plot_data)
+    y_min = min(float(np.min(values)) for values in finite_plot_data)
     y_span = max(y_max - y_min, 1e-6)
     h = 0.04 * y_span
     current_y = y_max + 0.08 * y_span
-    label_to_x = {label: idx for idx, label in enumerate(plot_labels, start=1)}
+    label_to_x = class_positions
     fit, fit_info = _fit_crossed_subject_mixedlm(
         model_df=subset.loc[:, ["raw_score", "pair_label", "subject_a", "subject_b"]].copy(),
         formula="raw_score ~ C(pair_label, Treatment(reference='off-off'))",
@@ -1174,8 +1312,8 @@ def _save_distribution_plot(
     }
     comparisons = [
         ("OFF-OFF", "ON-ON"),
-        ("OFF-OFF", "ON-OFF"),
-        ("ON-ON", "ON-OFF"),
+        ("OFF-OFF", "OFF-ON"),
+        ("ON-ON", "OFF-ON"),
     ]
     stats_rows: list[dict] = []
     for left_name, right_name in comparisons:
@@ -1187,9 +1325,9 @@ def _save_distribution_plot(
             continue
         if left_name == "OFF-OFF" and right_name == "ON-ON":
             contrast = _mixedlm_contrast(fit, {pair_coef_names["on-on"]: 1.0})
-        elif left_name == "OFF-OFF" and right_name == "ON-OFF":
+        elif left_name == "OFF-OFF" and right_name == "OFF-ON":
             contrast = _mixedlm_contrast(fit, {pair_coef_names["off-on"]: 1.0})
-        elif left_name == "ON-ON" and right_name == "ON-OFF":
+        elif left_name == "ON-ON" and right_name == "OFF-ON":
             contrast = _mixedlm_contrast(
                 fit,
                 {
@@ -1309,41 +1447,42 @@ def main() -> None:
     comparison_specs = [spec for spec in comparison_specs_all if spec.name in selected_comparison_names]
     distribution_stats_tables: list[pd.DataFrame] = []
     pairwise_csv = args.pairwise_csv.resolve() if args.pairwise_csv is not None else None
+    nonselected_pairwise_csv = (
+        args.nonselected_pairwise_csv.resolve() if args.nonselected_pairwise_csv is not None else None
+    )
     pairwise_input_mode = pairwise_csv is not None
+    nonselected_pairwise_df: pd.DataFrame | None = None
 
     if pairwise_input_mode:
         if not pairwise_csv.exists():
             raise FileNotFoundError(f"Pairwise CSV not found: {pairwise_csv}")
-        pairwise_df = pd.read_csv(pairwise_csv)
-        required_cols = {
-            "connectivity_metric",
-            "subject_a",
-            "subject_b",
-            "pair_label",
-            "pair_class",
-            "comparison_metric",
-            "comparison_kind",
-            "higher_is_more_similar",
-            "raw_score",
-            "oriented_score",
-            "same_subject",
-        }
-        missing_cols = required_cols.difference(pairwise_df.columns)
-        if missing_cols:
-            raise ValueError(f"Pairwise CSV is missing required columns: {sorted(missing_cols)}")
-        if excluded_subjects:
-            pairwise_df = pairwise_df.loc[
-                (~pairwise_df["subject_a"].astype(str).isin(excluded_subjects))
-                & (~pairwise_df["subject_b"].astype(str).isin(excluded_subjects))
-            ].copy()
-        available_metrics = sorted(pairwise_df["connectivity_metric"].astype(str).unique().tolist())
+        pairwise_df, available_metrics = _load_pairwise_csv(
+            pairwise_csv,
+            comparison_names=selected_comparison_names,
+            excluded_subjects=excluded_subjects,
+        )
         selected_metrics = _normalize_selection(args.metrics, available_metrics, "metrics")
-        pairwise_df = pairwise_df.loc[
-            pairwise_df["connectivity_metric"].astype(str).isin(selected_metrics)
-            & pairwise_df["comparison_metric"].astype(str).isin(selected_comparison_names)
-        ].copy()
-        pairwise_df["higher_is_more_similar"] = pairwise_df["higher_is_more_similar"].astype(bool)
-        pairwise_df["same_subject"] = pairwise_df["same_subject"].astype(bool)
+        pairwise_df = pairwise_df.loc[pairwise_df["connectivity_metric"].astype(str).isin(selected_metrics)].copy()
+
+        if nonselected_pairwise_csv is not None:
+            if not nonselected_pairwise_csv.exists():
+                raise FileNotFoundError(f"Non-selected pairwise CSV not found: {nonselected_pairwise_csv}")
+            nonselected_pairwise_df, nonselected_available_metrics = _load_pairwise_csv(
+                nonselected_pairwise_csv,
+                comparison_names=selected_comparison_names,
+                excluded_subjects=excluded_subjects,
+            )
+            nonselected_pairwise_df = nonselected_pairwise_df.loc[
+                nonselected_pairwise_df["connectivity_metric"].astype(str).isin(selected_metrics)
+            ].copy()
+            if nonselected_available_metrics:
+                missing = [metric for metric in selected_metrics if metric not in nonselected_available_metrics]
+                if missing:
+                    print(
+                        "Warning: non-selected pairwise CSV is missing metrics: "
+                        f"{missing}",
+                        flush=True,
+                    )
         skipped_metric_rows: list[dict] = []
     else:
         available_metrics = _discover_available_metrics(advanced_root)
@@ -1428,6 +1567,27 @@ def main() -> None:
                 edge_variance_detail_tables.append(top_edge_detail_df)
 
         pairwise_df = pd.concat(pairwise_tables, ignore_index=True)
+        if nonselected_pairwise_csv is not None:
+            if not nonselected_pairwise_csv.exists():
+                raise FileNotFoundError(f"Non-selected pairwise CSV not found: {nonselected_pairwise_csv}")
+            nonselected_pairwise_df, nonselected_available_metrics = _load_pairwise_csv(
+                nonselected_pairwise_csv,
+                comparison_names=selected_comparison_names,
+                excluded_subjects=excluded_subjects,
+            )
+            nonselected_pairwise_df = nonselected_pairwise_df.loc[
+                nonselected_pairwise_df["connectivity_metric"].astype(str).isin(selected_metrics)
+            ].copy()
+            if nonselected_available_metrics:
+                missing = [metric for metric in selected_metrics if metric not in nonselected_available_metrics]
+                if missing:
+                    print(
+                        "Warning: non-selected pairwise CSV is missing metrics: "
+                        f"{missing}",
+                        flush=True,
+                    )
+        else:
+            nonselected_pairwise_df = None
 
     if pairwise_df.empty:
         raise RuntimeError("No pairwise rows available after filtering.")
@@ -1449,6 +1609,7 @@ def main() -> None:
             comparison_metric="laplacian_spectral_distance_signed",
             cohort_name="cross_subject_only",
             out_png=metric_out / "cross_subject_only_laplacian_spectral_distance_signed_distribution.png",
+            secondary_pairwise_df=nonselected_pairwise_df,
         )
         if not dist_stats_df.empty:
             distribution_stats_tables.append(dist_stats_df)
