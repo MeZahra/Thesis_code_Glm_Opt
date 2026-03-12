@@ -37,6 +37,7 @@ LABEL_RE = re.compile(r"^(sub-[^_]+)_ses-(\d+)$")
 SESSION_TO_STATE = {1: "off", 2: "on"}
 PAIR_LABEL_ORDER = ("off-off", "on-on", "off-on")
 NULL_METRIC_EXCLUDE = {"linear_granger", "nonlinear_granger"}
+EXCLUDED_NODE_PATTERNS = ("brain-stem", "cerebral white matter")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -59,9 +60,12 @@ def _parse_args() -> argparse.Namespace:
         "--selected-ts-root",
         type=Path,
         default=Path(
-            "results/connectivity/tmp/tmp-roi_edge_network/all"
+            "results/connectivity/tmp/tmp-roi_edge_network_from_data/all"
         ),
-        help="Root containing the saved selected ROI average time series per subject/session.",
+        help=(
+            "Root containing the saved selected ROI average time series per subject/session. "
+            "This must match --selected-voxel-indices."
+        ),
     )
     parser.add_argument(
         "--selected-voxel-indices",
@@ -88,10 +92,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reference-node-csv",
         type=Path,
-        default=Path(
-            "results/connectivity/roi_edge_network/roi_nodes.csv"
+        default=None,
+        help=(
+            "ROI-node CSV used to preserve node names and geometry. "
+            "If omitted, defaults to <selected-ts-root>/../roi_nodes.csv."
         ),
-        help="Current ROI-node CSV used to preserve node names and geometry.",
     )
     parser.add_argument(
         "--out-dir",
@@ -233,6 +238,11 @@ def _parse_label(label: str) -> tuple[str, int]:
     if match is None:
         raise ValueError(f"Unrecognized subject/session label: {label}")
     return str(match.group(1)), int(match.group(2))
+
+
+def _is_excluded_node_name(node_name: str) -> bool:
+    lower = str(node_name).lower()
+    return any(pattern in lower for pattern in EXCLUDED_NODE_PATTERNS)
 
 
 def _load_selected_flat_indices(path: Path, volume_shape: tuple[int, int, int]) -> np.ndarray:
@@ -476,7 +486,10 @@ def _choose_keep_nodes(
     stat_df = pd.DataFrame(stat_rows)
     merged = node_inventory_df.merge(stat_df, on="node_name", how="left")
     merged["sampled_voxels_per_draw"] = merged["min_available_voxels"].astype(int)
-    keep_df = merged.loc[merged["min_available_voxels"].astype(int) >= int(max(1, min_node_voxels))].copy()
+    keep_df = merged.loc[
+        (~merged["node_name"].astype(str).map(_is_excluded_node_name))
+        & (merged["min_available_voxels"].astype(int) >= int(max(1, min_node_voxels)))
+    ].copy()
     keep_df = keep_df.sort_values("node_id").reset_index(drop=True)
     keep_nodes = keep_df["node_name"].astype(str).tolist()
     sample_sizes = {
@@ -662,12 +675,16 @@ def _load_selected_roi_timeseries(
     keep_nodes: list[str],
     label_meta: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, np.ndarray], list[str]]:
-    node_csv = selected_ts_root.parent / "roi_nodes.csv"
+    node_csv_parent = selected_ts_root.parent / "roi_nodes.csv"
+    node_csv_local = selected_ts_root / "roi_nodes.csv"
+    node_csv = node_csv_parent if node_csv_parent.exists() else node_csv_local
     if not node_csv.exists():
-        raise FileNotFoundError(f"Selected ROI node CSV not found: {node_csv}")
+        raise FileNotFoundError(
+            "Selected ROI node CSV not found. Checked: "
+            f"{node_csv_parent} and {node_csv_local}"
+        )
     all_nodes = pd.read_csv(node_csv)["node_name"].astype(str).tolist()
-    drop_patterns = ("brain-stem", "cerebral white matter")
-    filtered_nodes = [node for node in all_nodes if not any(pattern in node.lower() for pattern in drop_patterns)]
+    filtered_nodes = [node for node in all_nodes if not _is_excluded_node_name(node)]
     missing_nodes = [node for node in keep_nodes if node not in filtered_nodes]
     if missing_nodes:
         raise RuntimeError(f"Selected ROI time series are missing required nodes: {missing_nodes}")
@@ -683,6 +700,27 @@ def _load_selected_roi_timeseries(
             raise ValueError(f"Unexpected selected ROI time series shape for {path}: {roi_ts.shape}")
         selected_ts[label] = roi_ts[keep_idx].astype(np.float32, copy=False)
     return selected_ts, list(keep_nodes)
+
+
+def _selected_kept_voxel_count(
+    selected_ts_root: Path,
+    keep_nodes: list[str],
+) -> int | None:
+    node_csv_parent = selected_ts_root.parent / "roi_nodes.csv"
+    node_csv_local = selected_ts_root / "roi_nodes.csv"
+    node_csv = node_csv_parent if node_csv_parent.exists() else node_csv_local
+    if not node_csv.exists():
+        return None
+
+    node_df = pd.read_csv(node_csv)
+    if "node_name" not in node_df.columns or "n_selected_voxels" not in node_df.columns:
+        return None
+
+    keep = set(str(node) for node in keep_nodes)
+    matched = node_df.loc[node_df["node_name"].astype(str).isin(keep), "n_selected_voxels"]
+    if matched.empty:
+        return None
+    return int(np.sum(pd.to_numeric(matched, errors="coerce").fillna(0.0).to_numpy(dtype=np.float64)))
 
 
 def _compute_control_metric_matrices(
@@ -916,7 +954,11 @@ def main() -> None:
     selected_voxel_indices_path = args.selected_voxel_indices.expanduser().resolve()
     roi_img_path = args.roi_img.expanduser().resolve()
     brain_img_path = args.brain_img.expanduser().resolve()
-    reference_node_csv = args.reference_node_csv.expanduser().resolve()
+    reference_node_csv = (
+        args.reference_node_csv.expanduser().resolve()
+        if args.reference_node_csv is not None
+        else (selected_ts_root.parent / "roi_nodes.csv").resolve()
+    )
     out_dir = args.out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -990,10 +1032,29 @@ def main() -> None:
         keep_nodes=keep_nodes,
         label_meta=label_meta,
     )
+    selected_kept_voxel_count = _selected_kept_voxel_count(
+        selected_ts_root=selected_ts_root,
+        keep_nodes=keep_nodes,
+    )
+    if selected_kept_voxel_count is not None:
+        ratio = float(selected_kept_voxel_count) / max(float(n_control_voxels), 1.0)
+        if ratio < 0.5 or ratio > 2.0:
+            raise RuntimeError(
+                "Selected-vs-null voxel scale mismatch detected. "
+                f"Selected kept-node voxels={selected_kept_voxel_count}, "
+                f"null voxels per draw={int(n_control_voxels)}, ratio={ratio:.3f}. "
+                "Use a selected_ts_root/roi_nodes pair built from the same selected_voxel_indices "
+                "as this null run."
+            )
 
     summary_rows: list[dict[str, Any]] = []
     skipped_rows: list[dict[str, Any]] = []
-    for metric_name in selected_metrics:
+    total_metrics = len(selected_metrics)
+    for metric_idx, metric_name in enumerate(selected_metrics, start=1):
+        print(
+            f"[{metric_idx}/{total_metrics}] Starting metric: {metric_name}",
+            flush=True,
+        )
         metric_out = out_dir / metric_name
         metric_out.mkdir(parents=True, exist_ok=True)
 
