@@ -939,20 +939,13 @@ def main() -> None:
     cv_p_lower = (1.0 + float(np.count_nonzero(cv_resampled_means <= cv_selected_mean))) / (1.0 + float(args.num_resamples))
 
     diff_png_path = args.output_dir / f"{args.output_stem}.png"
-    diff_pdf_path = args.output_dir / f"{args.output_stem}.pdf"
     var_png_path = args.output_dir / f"{args.output_stem}_variance.png"
-    var_pdf_path = args.output_dir / f"{args.output_stem}_variance.pdf"
     cv_png_path = args.output_dir / f"{args.output_stem}_cv.png"
-    cv_pdf_path = args.output_dir / f"{args.output_stem}_cv.pdf"
     summary_json_path = args.output_dir / f"{args.output_stem}_summary.json"
-    prevalence_csv_path = args.output_dir / f"{args.output_stem}_prevalence.csv"
-    variance_prevalence_csv_path = args.output_dir / f"{args.output_stem}_prevalence_variance.csv"
-    cv_prevalence_csv_path = args.output_dir / f"{args.output_stem}_prevalence_cv.csv"
     analysis_npz_path = args.output_dir / f"{args.output_stem}_analysis_data.npz"
 
     print(
-        f"Saving figures to {diff_png_path}, {diff_pdf_path}, {var_png_path}, {var_pdf_path}, "
-        f"{cv_png_path}, and {cv_pdf_path}",
+        f"Saving figures to {diff_png_path}, {var_png_path}, and {cv_png_path}",
         flush=True,
     )
     _plot_summary_figure(
@@ -965,19 +958,6 @@ def main() -> None:
         p_lower=diff_p_lower,
         num_resamples=int(args.num_resamples),
         rng=rng,
-        kde_max_points=int(args.kde_max_points),
-        metric_name="Mean |Delta| Consecutive Trials",
-    )
-    _plot_summary_figure(
-        figure_path=diff_pdf_path,
-        selected_metric=selected_metric,
-        nonselected_metric=nonselected_metric,
-        percentile_labels=list(args.percentile_thresholds),
-        prevalence_ratios=diff_prevalence_ratios,
-        resampled_means=diff_resampled_means,
-        p_lower=diff_p_lower,
-        num_resamples=int(args.num_resamples),
-        rng=np.random.default_rng(args.random_seed),
         kde_max_points=int(args.kde_max_points),
         metric_name="Mean |Delta| Consecutive Trials",
     )
@@ -995,19 +975,6 @@ def main() -> None:
         metric_name="Variance Across Kept Trials",
     )
     _plot_summary_figure(
-        figure_path=var_pdf_path,
-        selected_metric=selected_variance,
-        nonselected_metric=nonselected_variance,
-        percentile_labels=list(args.percentile_thresholds),
-        prevalence_ratios=var_prevalence_ratios,
-        resampled_means=var_resampled_means,
-        p_lower=var_p_lower,
-        num_resamples=int(args.num_resamples),
-        rng=np.random.default_rng(args.random_seed),
-        kde_max_points=int(args.kde_max_points),
-        metric_name="Variance Across Kept Trials",
-    )
-    _plot_summary_figure(
         figure_path=cv_png_path,
         selected_metric=selected_cv,
         nonselected_metric=nonselected_cv,
@@ -1017,19 +984,6 @@ def main() -> None:
         p_lower=cv_p_lower,
         num_resamples=int(args.num_resamples),
         rng=rng,
-        kde_max_points=int(args.kde_max_points),
-        metric_name="Coefficient of Variation (std/|mean|)",
-    )
-    _plot_summary_figure(
-        figure_path=cv_pdf_path,
-        selected_metric=selected_cv,
-        nonselected_metric=nonselected_cv,
-        percentile_labels=list(args.percentile_thresholds),
-        prevalence_ratios=cv_prevalence_ratios,
-        resampled_means=cv_resampled_means,
-        p_lower=cv_p_lower,
-        num_resamples=int(args.num_resamples),
-        rng=np.random.default_rng(args.random_seed),
         kde_max_points=int(args.kde_max_points),
         metric_name="Coefficient of Variation (std/|mean|)",
     )
@@ -1093,34 +1047,12 @@ def main() -> None:
         "num_resamples": int(args.num_resamples),
         "random_seed": int(args.random_seed),
         "diff_png_path": str(diff_png_path),
-        "diff_pdf_path": str(diff_pdf_path),
         "variance_png_path": str(var_png_path),
-        "variance_pdf_path": str(var_pdf_path),
         "cv_png_path": str(cv_png_path),
-        "cv_pdf_path": str(cv_pdf_path),
         "motor_region_figure_path": str(motor_region_figure),
-        "prevalence_csv_path": str(prevalence_csv_path),
-        "variance_prevalence_csv_path": str(variance_prevalence_csv_path),
-        "cv_prevalence_csv_path": str(cv_prevalence_csv_path),
     }
     with summary_json_path.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
-
-    with prevalence_csv_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["percentile", "threshold", "relative_prevalence_selected_over_nonselected"])
-        for percentile, threshold, ratio in zip(args.percentile_thresholds, diff_thresholds, diff_prevalence_ratios):
-            writer.writerow([float(percentile), float(threshold), float(ratio)])
-    with variance_prevalence_csv_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["percentile", "threshold", "relative_prevalence_selected_over_nonselected"])
-        for percentile, threshold, ratio in zip(args.percentile_thresholds, var_thresholds, var_prevalence_ratios):
-            writer.writerow([float(percentile), float(threshold), float(ratio)])
-    with cv_prevalence_csv_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["percentile", "threshold", "relative_prevalence_selected_over_nonselected"])
-        for percentile, threshold, ratio in zip(args.percentile_thresholds, cv_thresholds, cv_prevalence_ratios):
-            writer.writerow([float(percentile), float(threshold), float(ratio)])
 
     np.savez_compressed(
         analysis_npz_path,
@@ -1156,9 +1088,6 @@ def main() -> None:
     )
 
     print(f"Saved summary JSON: {summary_json_path}", flush=True)
-    print(f"Saved prevalence CSV: {prevalence_csv_path}", flush=True)
-    print(f"Saved variance prevalence CSV: {variance_prevalence_csv_path}", flush=True)
-    print(f"Saved CV prevalence CSV: {cv_prevalence_csv_path}", flush=True)
     print(f"Saved analysis NPZ: {analysis_npz_path}", flush=True)
     print("Done.", flush=True)
 
