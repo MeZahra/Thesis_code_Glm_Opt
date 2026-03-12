@@ -36,6 +36,7 @@ from roi_metric_runner import _metric_kwargs  # noqa: E402
 LABEL_RE = re.compile(r"^(sub-[^_]+)_ses-(\d+)$")
 SESSION_TO_STATE = {1: "off", 2: "on"}
 PAIR_LABEL_ORDER = ("off-off", "on-on", "off-on")
+NULL_METRIC_EXCLUDE = {"linear_granger", "nonlinear_granger"}
 
 
 def _parse_args() -> argparse.Namespace:
@@ -102,8 +103,8 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--metrics",
-        default="mutual_information_ksg",
-        help="Comma-separated connectivity metrics to analyze or 'all'.",
+        default="all",
+        help="Comma-separated connectivity metrics to analyze or 'all'. Granger metrics are excluded by default.",
     )
     parser.add_argument(
         "--exclude-subjects",
@@ -921,7 +922,12 @@ def main() -> None:
 
     excluded_subjects = _normalize_subject_exclusions(args.exclude_subjects)
     manifest_df, labels, label_meta = _load_manifest(manifest_path, excluded_subjects=excluded_subjects)
-    selected_metrics = normalize_metric_list(args.metrics)
+    selected_metrics = [
+        name for name in normalize_metric_list(args.metrics)
+        if name not in NULL_METRIC_EXCLUDE
+    ]
+    if not selected_metrics:
+        raise ValueError("No metrics selected after excluding unsupported metrics for null analysis.")
 
     selected_voxel_count, candidate_flat, candidate_ijk, node_inventory_df, node_union_indices = _build_control_candidate_pool(
         roi_img_path=roi_img_path,

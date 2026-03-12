@@ -436,9 +436,16 @@ def _accumulate_consecutive_diff_and_variance_metrics(
     target_flat: np.ndarray,
     manifest_rows: list[ManifestRow],
     row_chunk_size: int,
-    normalization_mean: np.ndarray | None = None,
-    normalization_std: np.ndarray | None = None,
+    per_run_normalization: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Accumulate raw (or per-run-scaled) variability metrics across all runs.
+
+    When per_run_normalization=True, each run's betas are divided by the run-level
+    std (computed across all target voxels × kept trials in that run). This removes
+    between-run amplitude differences while preserving relative voxel ordering within
+    each run. Mean is NOT subtracted because Var(beta - c) = Var(beta) — subtracting
+    a constant never changes variance or |delta|.
+    """
     n_voxels = int(target_flat.size)
     pair_counts = np.zeros(n_voxels, dtype=np.int64)
     abs_diff_sums = np.zeros(n_voxels, dtype=np.float64)
@@ -471,18 +478,37 @@ def _accumulate_consecutive_diff_and_variance_metrics(
         kept_idx = np.flatnonzero(keep_mask)
         is_adjacent = np.diff(kept_idx) == 1  # shape (n_kept - 1,)
 
+        # Per-run normalization: compute a single scale factor from all (target_voxel × kept_trial)
+        # entries in this run. The same divisor is applied to every voxel, so relative variability
+        # differences between voxels are preserved. Mean is NOT subtracted (would not affect variance).
+        run_scale = 1.0
+        if per_run_normalization:
+            run_sum = 0.0
+            run_sq_sum = 0.0
+            run_count = 0
+            for start in range(0, n_voxels, row_chunk_size):
+                stop = min(start + row_chunk_size, n_voxels)
+                pre_chunk = flat_view[target_flat[start:stop]][:, keep_mask].astype(np.float64)
+                fin = np.isfinite(pre_chunk)
+                run_count += int(fin.sum())
+                safe = np.where(fin, pre_chunk, 0.0)
+                run_sum += float(safe.sum())
+                run_sq_sum += float((safe * safe).sum())
+            if run_count > 1:
+                run_mean = run_sum / run_count
+                run_pop_var = max(0.0, run_sq_sum / run_count - run_mean ** 2)
+                run_std = float(np.sqrt(run_pop_var))
+                if run_std > 0.0:
+                    run_scale = run_std
+
         for start in range(0, n_voxels, row_chunk_size):
             stop = min(start + row_chunk_size, n_voxels)
             chunk = np.asarray(flat_view[target_flat[start:stop]][:, keep_mask], dtype=np.float32)
             if chunk.shape[1] == 0:
                 continue
 
-            # Per-voxel normalization: subtract global mean and divide by global std.
-            # Voxels with std=nan (zero-variance) produce nan here; the isfinite guard below handles them.
-            if normalization_mean is not None and normalization_std is not None:
-                vox_mean = normalization_mean[start:stop, np.newaxis]
-                vox_std = normalization_std[start:stop, np.newaxis]
-                chunk = (chunk - vox_mean) / vox_std
+            if per_run_normalization and run_scale != 1.0:
+                chunk = chunk / np.float32(run_scale)
 
             finite = np.isfinite(chunk)
             trial_counts[start:stop] += np.sum(finite, axis=1, dtype=np.int64)
@@ -823,19 +849,27 @@ def main() -> None:
         f"runs in manifest: {len(manifest_rows)}",
         flush=True,
     )
-    # Pass 1: compute per-voxel mean and std for normalization.
+    # Pass 1: per-voxel raw mean and std (used for CV and normalized metrics only).
     norm_mean, norm_std = _compute_per_voxel_mean_std(
         target_flat=target_flat,
         manifest_rows=manifest_rows,
         row_chunk_size=args.row_chunk_size,
     )
-    # Pass 2: accumulate metrics on z-scored (normalized) betas.
+    # Pass 2: raw metrics on untouched betas (adjacency fix applied).
+    print("Pass 2 (raw): accumulating variability metrics on raw betas...", flush=True)
     metric_values, pair_counts, variance_values, trial_counts = _accumulate_consecutive_diff_and_variance_metrics(
         target_flat=target_flat,
         manifest_rows=manifest_rows,
         row_chunk_size=args.row_chunk_size,
-        normalization_mean=norm_mean,
-        normalization_std=norm_std,
+        per_run_normalization=False,
+    )
+    # Pass 3: per-run std-scaled metrics (same relative voxel ordering, comparable across runs).
+    print("Pass 3 (per-run scaled): accumulating variability metrics with run-level std scaling...", flush=True)
+    rs_metric_values, rs_pair_counts, rs_variance_values, rs_trial_counts = _accumulate_consecutive_diff_and_variance_metrics(
+        target_flat=target_flat,
+        manifest_rows=manifest_rows,
+        row_chunk_size=args.row_chunk_size,
+        per_run_normalization=True,
     )
 
     n_selected = int(selected_flat.size)
@@ -896,6 +930,44 @@ def main() -> None:
     if nonselected_cv.size == 0:
         raise ValueError("Motor non-selected voxels have no finite coefficient-of-variation estimates.")
 
+    # Normalized |Δ| = raw_mean_abs_diff / |per_voxel_mean|  (scale-free temporal stability).
+    # Equivalent to the temporal version of CV: "how large is a typical step relative to activation level?"
+    norm_diff_values = np.where(
+        np.abs(norm_mean) > 1e-8,
+        metric_values / np.abs(norm_mean),
+        np.nan,
+    )
+    selected_norm_diff_all = np.asarray(norm_diff_values[:n_selected], dtype=np.float64)
+    nonselected_norm_diff_all = np.asarray(norm_diff_values[n_selected:], dtype=np.float64)
+    selected_norm_diff_valid = np.isfinite(selected_norm_diff_all)
+    nonselected_norm_diff_valid = np.isfinite(nonselected_norm_diff_all)
+    selected_norm_diff = selected_norm_diff_all[selected_norm_diff_valid]
+    nonselected_norm_diff = nonselected_norm_diff_all[nonselected_norm_diff_valid]
+    selected_flat_norm_diff_valid = selected_flat[selected_norm_diff_valid]
+    nonselected_flat_norm_diff_valid = nonselected_flat[nonselected_norm_diff_valid]
+    if selected_norm_diff.size == 0:
+        raise ValueError("Selected voxels have no finite normalized-|delta| estimates.")
+    if nonselected_norm_diff.size == 0:
+        raise ValueError("Motor non-selected voxels have no finite normalized-|delta| estimates.")
+
+    # Per-run-scaled metrics: slice from rs_metric_values and rs_variance_values.
+    selected_rs_diff_all = np.asarray(rs_metric_values[:n_selected], dtype=np.float64)
+    nonselected_rs_diff_all = np.asarray(rs_metric_values[n_selected:], dtype=np.float64)
+    selected_rs_var_all = np.asarray(rs_variance_values[:n_selected], dtype=np.float64)
+    nonselected_rs_var_all = np.asarray(rs_variance_values[n_selected:], dtype=np.float64)
+    selected_rs_diff_valid = np.isfinite(selected_rs_diff_all)
+    nonselected_rs_diff_valid = np.isfinite(nonselected_rs_diff_all)
+    selected_rs_var_valid = np.isfinite(selected_rs_var_all)
+    nonselected_rs_var_valid = np.isfinite(nonselected_rs_var_all)
+    selected_rs_diff = selected_rs_diff_all[selected_rs_diff_valid]
+    nonselected_rs_diff = nonselected_rs_diff_all[nonselected_rs_diff_valid]
+    selected_rs_var = selected_rs_var_all[selected_rs_var_valid]
+    nonselected_rs_var = nonselected_rs_var_all[nonselected_rs_var_valid]
+    if selected_rs_diff.size == 0 or nonselected_rs_diff.size == 0:
+        raise ValueError("Per-run-scaled |delta| has empty valid set for selected or non-selected voxels.")
+    if selected_rs_var.size == 0 or nonselected_rs_var.size == 0:
+        raise ValueError("Per-run-scaled variance has empty valid set for selected or non-selected voxels.")
+
     diff_thresholds, diff_prevalence_ratios = _compute_prevalence_ratios(
         selected_values=selected_metric,
         nonselected_values=nonselected_metric,
@@ -938,14 +1010,60 @@ def main() -> None:
     cv_selected_mean = float(np.mean(selected_cv))
     cv_p_lower = (1.0 + float(np.count_nonzero(cv_resampled_means <= cv_selected_mean))) / (1.0 + float(args.num_resamples))
 
+    norm_diff_thresholds, norm_diff_prevalence_ratios = _compute_prevalence_ratios(
+        selected_values=selected_norm_diff,
+        nonselected_values=nonselected_norm_diff,
+        percentiles=list(args.percentile_thresholds),
+    )
+    norm_diff_resampled_means, norm_diff_resample_replace = _resample_nonselected_means(
+        nonselected_values=nonselected_norm_diff,
+        sample_size=selected_norm_diff.size,
+        num_resamples=args.num_resamples,
+        rng=rng,
+    )
+    norm_diff_selected_mean = float(np.mean(selected_norm_diff))
+    norm_diff_p_lower = (1.0 + float(np.count_nonzero(norm_diff_resampled_means <= norm_diff_selected_mean))) / (1.0 + float(args.num_resamples))
+
+    rs_diff_thresholds, rs_diff_prevalence_ratios = _compute_prevalence_ratios(
+        selected_values=selected_rs_diff,
+        nonselected_values=nonselected_rs_diff,
+        percentiles=list(args.percentile_thresholds),
+    )
+    rs_diff_resampled_means, rs_diff_resample_replace = _resample_nonselected_means(
+        nonselected_values=nonselected_rs_diff,
+        sample_size=selected_rs_diff.size,
+        num_resamples=args.num_resamples,
+        rng=rng,
+    )
+    rs_diff_selected_mean = float(np.mean(selected_rs_diff))
+    rs_diff_p_lower = (1.0 + float(np.count_nonzero(rs_diff_resampled_means <= rs_diff_selected_mean))) / (1.0 + float(args.num_resamples))
+
+    rs_var_thresholds, rs_var_prevalence_ratios = _compute_prevalence_ratios(
+        selected_values=selected_rs_var,
+        nonselected_values=nonselected_rs_var,
+        percentiles=list(args.percentile_thresholds),
+    )
+    rs_var_resampled_means, rs_var_resample_replace = _resample_nonselected_means(
+        nonselected_values=nonselected_rs_var,
+        sample_size=selected_rs_var.size,
+        num_resamples=args.num_resamples,
+        rng=rng,
+    )
+    rs_var_selected_mean = float(np.mean(selected_rs_var))
+    rs_var_p_lower = (1.0 + float(np.count_nonzero(rs_var_resampled_means <= rs_var_selected_mean))) / (1.0 + float(args.num_resamples))
+
     diff_png_path = args.output_dir / f"{args.output_stem}.png"
     var_png_path = args.output_dir / f"{args.output_stem}_variance.png"
     cv_png_path = args.output_dir / f"{args.output_stem}_cv.png"
+    norm_diff_png_path = args.output_dir / f"{args.output_stem}_norm_diff.png"
+    rs_diff_png_path = args.output_dir / f"{args.output_stem}_runscaled_diff.png"
+    rs_var_png_path = args.output_dir / f"{args.output_stem}_runscaled_variance.png"
     summary_json_path = args.output_dir / f"{args.output_stem}_summary.json"
     analysis_npz_path = args.output_dir / f"{args.output_stem}_analysis_data.npz"
 
     print(
-        f"Saving figures to {diff_png_path}, {var_png_path}, and {cv_png_path}",
+        f"Saving figures to {diff_png_path}, {var_png_path}, {cv_png_path}, "
+        f"{norm_diff_png_path}, {rs_diff_png_path}, {rs_var_png_path}",
         flush=True,
     )
     _plot_summary_figure(
@@ -986,6 +1104,45 @@ def main() -> None:
         rng=rng,
         kde_max_points=int(args.kde_max_points),
         metric_name="Coefficient of Variation (std/|mean|)",
+    )
+    _plot_summary_figure(
+        figure_path=norm_diff_png_path,
+        selected_metric=selected_norm_diff,
+        nonselected_metric=nonselected_norm_diff,
+        percentile_labels=list(args.percentile_thresholds),
+        prevalence_ratios=norm_diff_prevalence_ratios,
+        resampled_means=norm_diff_resampled_means,
+        p_lower=norm_diff_p_lower,
+        num_resamples=int(args.num_resamples),
+        rng=rng,
+        kde_max_points=int(args.kde_max_points),
+        metric_name="Normalized |Delta| (raw_diff / |voxel_mean|)",
+    )
+    _plot_summary_figure(
+        figure_path=rs_diff_png_path,
+        selected_metric=selected_rs_diff,
+        nonselected_metric=nonselected_rs_diff,
+        percentile_labels=list(args.percentile_thresholds),
+        prevalence_ratios=rs_diff_prevalence_ratios,
+        resampled_means=rs_diff_resampled_means,
+        p_lower=rs_diff_p_lower,
+        num_resamples=int(args.num_resamples),
+        rng=rng,
+        kde_max_points=int(args.kde_max_points),
+        metric_name="Per-Run-Scaled Mean |Delta| (beta / std_run)",
+    )
+    _plot_summary_figure(
+        figure_path=rs_var_png_path,
+        selected_metric=selected_rs_var,
+        nonselected_metric=nonselected_rs_var,
+        percentile_labels=list(args.percentile_thresholds),
+        prevalence_ratios=rs_var_prevalence_ratios,
+        resampled_means=rs_var_resampled_means,
+        p_lower=rs_var_p_lower,
+        num_resamples=int(args.num_resamples),
+        rng=rng,
+        kde_max_points=int(args.kde_max_points),
+        metric_name="Per-Run-Scaled Variance (beta / std_run)",
     )
 
     summary = {
@@ -1031,7 +1188,7 @@ def main() -> None:
         "var_resample_ci_97p5": float(np.percentile(var_resampled_means, 97.5)),
         "var_resample_p_lower_or_equal_selected": float(var_p_lower),
         "var_resample_with_replacement": bool(var_resample_replace),
-        "normalization_applied": True,
+        "normalization_applied": "per_run_std",
         "selected_count_cv_valid": int(selected_cv.size),
         "nonselected_count_cv_valid": int(nonselected_cv.size),
         "selected_mean_cv": float(np.mean(selected_cv)),
@@ -1044,11 +1201,32 @@ def main() -> None:
         "cv_resample_ci_97p5": float(np.percentile(cv_resampled_means, 97.5)),
         "cv_resample_p_lower_or_equal_selected": float(cv_p_lower),
         "cv_resample_with_replacement": bool(cv_resample_replace),
+        "selected_count_norm_diff_valid": int(selected_norm_diff.size),
+        "nonselected_count_norm_diff_valid": int(nonselected_norm_diff.size),
+        "selected_mean_norm_diff": float(np.mean(selected_norm_diff)),
+        "nonselected_mean_norm_diff": float(np.mean(nonselected_norm_diff)),
+        "norm_diff_resample_p_lower_or_equal_selected": float(norm_diff_p_lower),
+        "norm_diff_resample_with_replacement": bool(norm_diff_resample_replace),
+        "selected_count_rs_diff_valid": int(selected_rs_diff.size),
+        "nonselected_count_rs_diff_valid": int(nonselected_rs_diff.size),
+        "selected_mean_rs_diff": float(np.mean(selected_rs_diff)),
+        "nonselected_mean_rs_diff": float(np.mean(nonselected_rs_diff)),
+        "rs_diff_resample_p_lower_or_equal_selected": float(rs_diff_p_lower),
+        "rs_diff_resample_with_replacement": bool(rs_diff_resample_replace),
+        "selected_count_rs_var_valid": int(selected_rs_var.size),
+        "nonselected_count_rs_var_valid": int(nonselected_rs_var.size),
+        "selected_mean_rs_var": float(np.mean(selected_rs_var)),
+        "nonselected_mean_rs_var": float(np.mean(nonselected_rs_var)),
+        "rs_var_resample_p_lower_or_equal_selected": float(rs_var_p_lower),
+        "rs_var_resample_with_replacement": bool(rs_var_resample_replace),
         "num_resamples": int(args.num_resamples),
         "random_seed": int(args.random_seed),
         "diff_png_path": str(diff_png_path),
         "variance_png_path": str(var_png_path),
         "cv_png_path": str(cv_png_path),
+        "norm_diff_png_path": str(norm_diff_png_path),
+        "rs_diff_png_path": str(rs_diff_png_path),
+        "rs_var_png_path": str(rs_var_png_path),
         "motor_region_figure_path": str(motor_region_figure),
     }
     with summary_json_path.open("w", encoding="utf-8") as handle:
@@ -1085,6 +1263,17 @@ def main() -> None:
         cv_prevalence_thresholds=cv_thresholds.astype(np.float32, copy=False),
         cv_prevalence_ratios=cv_prevalence_ratios.astype(np.float32, copy=False),
         resampled_nonselected_cv_means=cv_resampled_means.astype(np.float32, copy=False),
+        selected_norm_diff=selected_norm_diff.astype(np.float32, copy=False),
+        nonselected_norm_diff=nonselected_norm_diff.astype(np.float32, copy=False),
+        selected_flat_indices_norm_diff=selected_flat_norm_diff_valid.astype(np.int64, copy=False),
+        nonselected_flat_indices_norm_diff=nonselected_flat_norm_diff_valid.astype(np.int64, copy=False),
+        norm_diff_prevalence_thresholds=norm_diff_thresholds.astype(np.float32, copy=False),
+        norm_diff_prevalence_ratios=norm_diff_prevalence_ratios.astype(np.float32, copy=False),
+        resampled_nonselected_norm_diff_means=norm_diff_resampled_means.astype(np.float32, copy=False),
+        selected_runscaled_diff=selected_rs_diff.astype(np.float32, copy=False),
+        nonselected_runscaled_diff=nonselected_rs_diff.astype(np.float32, copy=False),
+        selected_runscaled_variance=selected_rs_var.astype(np.float32, copy=False),
+        nonselected_runscaled_variance=nonselected_rs_var.astype(np.float32, copy=False),
     )
 
     print(f"Saved summary JSON: {summary_json_path}", flush=True)
