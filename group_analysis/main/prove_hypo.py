@@ -474,19 +474,61 @@ def _finalize_subject_nanmean(
     return out, count_buffer
 
 
+def _compute_file_normalization_stats(
+    flat_view: np.ndarray,
+    target_flat: np.ndarray,
+    keep_mask: np.ndarray,
+    row_chunk_size: int,
+) -> tuple[float, float]:
+    n_voxels = int(target_flat.size)
+    run_sum = 0.0
+    run_count = 0
+    for start in range(0, n_voxels, row_chunk_size):
+        stop = min(start + row_chunk_size, n_voxels)
+        pre_chunk = np.asarray(flat_view[target_flat[start:stop]][:, keep_mask], dtype=np.float64)
+        finite = np.isfinite(pre_chunk)
+        run_count += int(finite.sum())
+        if np.any(finite):
+            safe = np.where(finite, pre_chunk, 0.0)
+            run_sum += float(safe.sum())
+
+    if run_count <= 0:
+        return 0.0, 1.0
+    run_mean = run_sum / run_count
+    run_max_abs = 0.0
+    for start in range(0, n_voxels, row_chunk_size):
+        stop = min(start + row_chunk_size, n_voxels)
+        pre_chunk = np.asarray(flat_view[target_flat[start:stop]][:, keep_mask], dtype=np.float64)
+        centered = pre_chunk - run_mean
+        finite = np.isfinite(centered)
+        if np.any(finite):
+            chunk_max = float(np.max(np.abs(centered[finite])))
+            if chunk_max > run_max_abs:
+                run_max_abs = chunk_max
+
+    if run_max_abs <= 0.0 or not np.isfinite(run_max_abs):
+        return float(run_mean), 1.0
+    return float(run_mean), float(run_max_abs)
+
+
 def _accumulate_consecutive_diff_and_variance_metrics(
     target_flat: np.ndarray,
     manifest_rows: list[ManifestRow],
     row_chunk_size: int,
     per_run_normalization: bool = False,
+    pre_normalize_each_file: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Accumulate raw (or per-run-scaled) variability metrics across all runs.
+    """Accumulate variability metrics across runs.
 
     When per_run_normalization=True, each run's betas are divided by the run-level
     std (computed across all target voxels × kept trials in that run). This removes
     between-run amplitude differences while preserving relative voxel ordering within
     each run. Mean is NOT subtracted because Var(beta - c) = Var(beta) — subtracting
     a constant never changes variance or |delta|.
+
+    When pre_normalize_each_file=True, each manifest beta file is first centered
+    and max-scaled: (x - mean_file) / maxabs_file, where stats are computed over
+    (target voxels × kept trials) from that same file.
     """
     n_voxels = int(target_flat.size)
     pair_counts = np.zeros(n_voxels, dtype=np.int64)
@@ -515,6 +557,15 @@ def _accumulate_consecutive_diff_and_variance_metrics(
             f"Run {run_idx}/{total_runs}: {row.cleaned_beta.name} | kept trials = {int(np.count_nonzero(keep_mask))}",
             flush=True,
         )
+        file_mean = 0.0
+        file_std = 1.0
+        if pre_normalize_each_file:
+            file_mean, file_std = _compute_file_normalization_stats(
+                flat_view=flat_view,
+                target_flat=target_flat,
+                keep_mask=keep_mask,
+                row_chunk_size=row_chunk_size,
+            )
         # Adjacency mask: True only for pairs that are consecutive in the original run.
         # Computed once per run, broadcast across voxel chunks.
         kept_idx = np.flatnonzero(keep_mask)
@@ -530,7 +581,9 @@ def _accumulate_consecutive_diff_and_variance_metrics(
             run_count = 0
             for start in range(0, n_voxels, row_chunk_size):
                 stop = min(start + row_chunk_size, n_voxels)
-                pre_chunk = flat_view[target_flat[start:stop]][:, keep_mask].astype(np.float64)
+                pre_chunk = np.asarray(flat_view[target_flat[start:stop]][:, keep_mask], dtype=np.float64)
+                if pre_normalize_each_file:
+                    pre_chunk = (pre_chunk - file_mean) / file_std
                 fin = np.isfinite(pre_chunk)
                 run_count += int(fin.sum())
                 safe = np.where(fin, pre_chunk, 0.0)
@@ -548,6 +601,8 @@ def _accumulate_consecutive_diff_and_variance_metrics(
             chunk = np.asarray(flat_view[target_flat[start:stop]][:, keep_mask], dtype=np.float32)
             if chunk.shape[1] == 0:
                 continue
+            if pre_normalize_each_file:
+                chunk = (chunk - np.float32(file_mean)) / np.float32(file_std)
 
             if per_run_normalization and run_scale != 1.0:
                 chunk = chunk / np.float32(run_scale)
@@ -590,6 +645,7 @@ def _compute_per_voxel_mean_std(
     target_flat: np.ndarray,
     manifest_rows: list[ManifestRow],
     row_chunk_size: int,
+    pre_normalize_each_file: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Pass 1: compute per-voxel mean and std across all kept trials in all runs.
 
@@ -615,12 +671,23 @@ def _compute_per_voxel_mean_std(
             f"  Pass 1 run {run_idx}/{total_runs}: {row.cleaned_beta.name} | kept = {int(np.count_nonzero(keep_mask))}",
             flush=True,
         )
+        file_mean = 0.0
+        file_std = 1.0
+        if pre_normalize_each_file:
+            file_mean, file_std = _compute_file_normalization_stats(
+                flat_view=flat_view,
+                target_flat=target_flat,
+                keep_mask=keep_mask,
+                row_chunk_size=row_chunk_size,
+            )
 
         for start in range(0, n_voxels, row_chunk_size):
             stop = min(start + row_chunk_size, n_voxels)
             chunk = np.asarray(flat_view[target_flat[start:stop]][:, keep_mask], dtype=np.float32)
             if chunk.shape[1] == 0:
                 continue
+            if pre_normalize_each_file:
+                chunk = (chunk - np.float32(file_mean)) / np.float32(file_std)
             finite = np.isfinite(chunk)
             counts[start:stop] += np.sum(finite, axis=1, dtype=np.int64)
             safe = np.where(finite, chunk.astype(np.float64), 0.0)
@@ -953,11 +1020,18 @@ def main() -> None:
     session_groups = _group_manifest_rows_by_subject_session(manifest_rows)
     n_sessions = len(session_groups)
     n_voxels = int(target_flat.size)
+    pre_normalize_each_file = True
     print(
         "Subject-session metric mode: compute per subject-session then average across subject-sessions "
         f"(units={n_sessions}).",
         flush=True,
     )
+    if pre_normalize_each_file:
+        print(
+            "Pre-normalization enabled: each manifest beta file is transformed as "
+            "(x - mean_file) / maxabs_file over (target voxels x kept trials) before metric computation.",
+            flush=True,
+        )
 
     diff_subject_sum = np.zeros(n_voxels, dtype=np.float64)
     diff_subject_n = np.zeros(n_voxels, dtype=np.int64)
@@ -985,6 +1059,7 @@ def main() -> None:
             target_flat=target_flat,
             manifest_rows=session_rows,
             row_chunk_size=args.row_chunk_size,
+            pre_normalize_each_file=pre_normalize_each_file,
         )
         print(f"Session-unit {session_idx}/{n_sessions}: accumulating raw metrics...", flush=True)
         sub_metric_values, sub_pair_counts, sub_variance_values, sub_trial_counts = _accumulate_consecutive_diff_and_variance_metrics(
@@ -992,6 +1067,7 @@ def main() -> None:
             manifest_rows=session_rows,
             row_chunk_size=args.row_chunk_size,
             per_run_normalization=False,
+            pre_normalize_each_file=pre_normalize_each_file,
         )
         print(f"Session-unit {session_idx}/{n_sessions}: accumulating per-run-scaled metrics...", flush=True)
         sub_rs_metric_values, _, sub_rs_variance_values, _ = _accumulate_consecutive_diff_and_variance_metrics(
@@ -999,6 +1075,7 @@ def main() -> None:
             manifest_rows=session_rows,
             row_chunk_size=args.row_chunk_size,
             per_run_normalization=True,
+            pre_normalize_each_file=pre_normalize_each_file,
         )
         with np.errstate(divide="ignore", invalid="ignore"):
             sub_cv_values = np.where(
@@ -1342,6 +1419,8 @@ def main() -> None:
         "manifest_path": str(args.manifest_path),
         "aggregation_mode": "subject_sessionwise_voxelwise_nanmean",
         "subject_session_count_total": int(n_sessions),
+        "pre_normalize_each_file": bool(pre_normalize_each_file),
+        "pre_normalization_mode": "demean_then_divide_by_maxabs_per_manifest_file_over_target_voxels_and_kept_trials",
         "motor_mask_source": str(args.motor_mask_path) if args.motor_mask_path is not None else "harvard_oxford_auto",
         "motor_label_patterns": list(_split_csv_patterns(args.motor_label_patterns)),
         "motor_region_names": motor_region_names,
@@ -1382,7 +1461,7 @@ def main() -> None:
         "var_resample_ci_97p5": float(np.percentile(var_resampled_means, 97.5)),
         "var_resample_p_lower_or_equal_selected": float(var_p_lower),
         "var_resample_with_replacement": bool(var_resample_replace),
-        "normalization_applied": "per_run_std",
+        "normalization_applied": "per_run_std_after_pre_file_demean_maxabs",
         "selected_count_cv_valid": int(selected_cv.size),
         "nonselected_count_cv_valid": int(nonselected_cv.size),
         "selected_mean_cv": float(np.mean(selected_cv)),
