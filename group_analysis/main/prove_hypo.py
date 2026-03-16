@@ -43,6 +43,8 @@ DEFAULT_MOTOR_LABEL_PATTERNS = [
 
 @dataclass
 class ManifestRow:
+    sub_tag: str
+    ses: int
     cleaned_beta: Path
     trial_keep_path: Path | None
     n_trials_source: int
@@ -403,6 +405,13 @@ def _load_manifest_rows(manifest_path: Path) -> list[ManifestRow]:
     with manifest_path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         for row in reader:
+            sub_tag = str(row.get("sub_tag", "") or "").strip()
+            if not sub_tag:
+                raise ValueError(f"Manifest row missing sub_tag: {manifest_path}")
+            ses_text = str(row.get("ses", "") or "").strip()
+            if not ses_text:
+                raise ValueError(f"Manifest row missing ses for {sub_tag}: {manifest_path}")
+            ses = int(ses_text)
             cleaned_beta = Path(str(row["cleaned_beta"]).strip())
             if not cleaned_beta.exists():
                 raise FileNotFoundError(f"Missing cleaned beta volume: {cleaned_beta}")
@@ -411,6 +420,8 @@ def _load_manifest_rows(manifest_path: Path) -> list[ManifestRow]:
             n_trials_source = int(row.get("n_trials_source", 0) or 0)
             rows.append(
                 ManifestRow(
+                    sub_tag=sub_tag,
+                    ses=ses,
                     cleaned_beta=cleaned_beta,
                     trial_keep_path=trial_keep_path,
                     n_trials_source=n_trials_source,
@@ -430,6 +441,37 @@ def _load_trial_keep_mask(row: ManifestRow, n_trials_source: int) -> np.ndarray:
             f"trial_keep length mismatch for {row.trial_keep_path}: {keep.size} vs {n_trials_source}"
         )
     return keep
+
+
+def _group_manifest_rows_by_subject_session(manifest_rows: list[ManifestRow]) -> list[tuple[str, list[ManifestRow]]]:
+    grouped: dict[tuple[str, int], list[ManifestRow]] = {}
+    for row in manifest_rows:
+        key = (row.sub_tag, int(row.ses))
+        grouped.setdefault(key, []).append(row)
+    ordered_keys = sorted(grouped, key=lambda item: (item[0], item[1]))
+    return [(f"{sub_tag}-ses{ses}", grouped[(sub_tag, ses)]) for sub_tag, ses in ordered_keys]
+
+
+def _accumulate_subject_nanmean(
+    sum_buffer: np.ndarray,
+    count_buffer: np.ndarray,
+    values: np.ndarray,
+) -> None:
+    finite = np.isfinite(values)
+    if np.any(finite):
+        sum_buffer[finite] += values[finite]
+        count_buffer[finite] += 1
+
+
+def _finalize_subject_nanmean(
+    sum_buffer: np.ndarray,
+    count_buffer: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    out = np.full(sum_buffer.shape, np.nan, dtype=np.float64)
+    valid = count_buffer > 0
+    if np.any(valid):
+        out[valid] = sum_buffer[valid] / count_buffer[valid]
+    return out, count_buffer
 
 
 def _accumulate_consecutive_diff_and_variance_metrics(
@@ -796,6 +838,64 @@ def _plot_summary_figure(
     plt.close(fig)
 
 
+def _plot_cv_log_density_all_subjects(
+    figure_path: Path,
+    unit_cv_records: list[dict[str, object]],
+    random_seed: int,
+    kde_max_points: int,
+) -> None:
+    if not unit_cv_records:
+        return
+
+    n_units = len(unit_cv_records)
+    ncols = 5 if n_units >= 5 else n_units
+    nrows = int(np.ceil(n_units / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.8 * ncols, 3.0 * nrows), constrained_layout=True)
+    axes_arr = np.atleast_1d(axes).ravel()
+    rng = np.random.default_rng(int(random_seed))
+
+    for idx, record in enumerate(unit_cv_records):
+        ax = axes_arr[idx]
+        unit_label = str(record["unit_label"])
+        n_runs = int(record["n_runs"])
+        selected_cv = np.asarray(record["selected_cv"], dtype=np.float64)
+        nonselected_cv = np.asarray(record["nonselected_cv"], dtype=np.float64)
+
+        positive = np.concatenate([selected_cv, nonselected_cv])
+        positive = positive[np.isfinite(positive) & (positive > 0)]
+        log_eps = 1e-12
+        if positive.size:
+            log_eps = max(float(np.min(positive)) * 0.5, log_eps)
+
+        selected_log = np.log10(np.clip(selected_cv, log_eps, None))
+        nonselected_log = np.log10(np.clip(nonselected_cv, log_eps, None))
+
+        xs_sel, ys_sel = _density_curve(selected_log, rng, kde_max_points)
+        xs_non, ys_non = _density_curve(nonselected_log, rng, kde_max_points)
+        ax.fill_between(xs_sel, ys_sel, color=SELECTED_COLOR, alpha=0.26)
+        ax.plot(xs_sel, ys_sel, color=SELECTED_COLOR, linewidth=1.6)
+        ax.fill_between(xs_non, ys_non, color=NONSELECTED_COLOR, alpha=0.22)
+        ax.plot(xs_non, ys_non, color=NONSELECTED_COLOR, linewidth=1.6)
+        ax.axvline(float(np.mean(selected_log)), linestyle="--", linewidth=1.2, color=SELECTED_COLOR)
+        ax.axvline(float(np.mean(nonselected_log)), linestyle="--", linewidth=1.2, color=NONSELECTED_COLOR)
+        ax.set_title(f"{unit_label} (runs={n_runs})", fontsize=9)
+        ax.set_xlabel("Log10(CV)")
+        ax.set_ylabel("Density")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    for idx in range(n_units, axes_arr.size):
+        axes_arr[idx].set_axis_off()
+
+    fig.suptitle(
+        "Subject-session-wise Log10(CV) Density (Selected vs Motor Non-selected Voxels)",
+        fontsize=13,
+        y=1.02,
+    )
+    fig.savefig(figure_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> None:
     args = _parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -842,6 +942,7 @@ def main() -> None:
         raise ValueError("No motor voxels remain after removing selected set. Cannot form baseline non-selected pool.")
     nonselected_flat = np.setdiff1d(motor_flat, selected_flat, assume_unique=False)
 
+    n_selected = int(selected_flat.size)
     target_flat = np.concatenate([selected_flat, nonselected_flat]).astype(np.int64, copy=False)
     print(
         f"Selected voxels: {selected_flat.size} | motor non-selected voxels: {nonselected_flat.size} | "
@@ -849,30 +950,100 @@ def main() -> None:
         f"runs in manifest: {len(manifest_rows)}",
         flush=True,
     )
-    # Pass 1: per-voxel raw mean and std (used for CV and normalized metrics only).
-    norm_mean, norm_std = _compute_per_voxel_mean_std(
-        target_flat=target_flat,
-        manifest_rows=manifest_rows,
-        row_chunk_size=args.row_chunk_size,
-    )
-    # Pass 2: raw metrics on untouched betas (adjacency fix applied).
-    print("Pass 2 (raw): accumulating variability metrics on raw betas...", flush=True)
-    metric_values, pair_counts, variance_values, trial_counts = _accumulate_consecutive_diff_and_variance_metrics(
-        target_flat=target_flat,
-        manifest_rows=manifest_rows,
-        row_chunk_size=args.row_chunk_size,
-        per_run_normalization=False,
-    )
-    # Pass 3: per-run std-scaled metrics (same relative voxel ordering, comparable across runs).
-    print("Pass 3 (per-run scaled): accumulating variability metrics with run-level std scaling...", flush=True)
-    rs_metric_values, rs_pair_counts, rs_variance_values, rs_trial_counts = _accumulate_consecutive_diff_and_variance_metrics(
-        target_flat=target_flat,
-        manifest_rows=manifest_rows,
-        row_chunk_size=args.row_chunk_size,
-        per_run_normalization=True,
+    session_groups = _group_manifest_rows_by_subject_session(manifest_rows)
+    n_sessions = len(session_groups)
+    n_voxels = int(target_flat.size)
+    print(
+        "Subject-session metric mode: compute per subject-session then average across subject-sessions "
+        f"(units={n_sessions}).",
+        flush=True,
     )
 
-    n_selected = int(selected_flat.size)
+    diff_subject_sum = np.zeros(n_voxels, dtype=np.float64)
+    diff_subject_n = np.zeros(n_voxels, dtype=np.int64)
+    var_subject_sum = np.zeros(n_voxels, dtype=np.float64)
+    var_subject_n = np.zeros(n_voxels, dtype=np.int64)
+    cv_subject_sum = np.zeros(n_voxels, dtype=np.float64)
+    cv_subject_n = np.zeros(n_voxels, dtype=np.int64)
+    norm_diff_subject_sum = np.zeros(n_voxels, dtype=np.float64)
+    norm_diff_subject_n = np.zeros(n_voxels, dtype=np.int64)
+    rs_diff_subject_sum = np.zeros(n_voxels, dtype=np.float64)
+    rs_diff_subject_n = np.zeros(n_voxels, dtype=np.int64)
+    rs_var_subject_sum = np.zeros(n_voxels, dtype=np.float64)
+    rs_var_subject_n = np.zeros(n_voxels, dtype=np.int64)
+
+    pair_counts = np.zeros(n_voxels, dtype=np.int64)
+    trial_counts = np.zeros(n_voxels, dtype=np.int64)
+    session_cv_records: list[dict[str, object]] = []
+
+    for session_idx, (session_label, session_rows) in enumerate(session_groups, start=1):
+        print(
+            f"Session-unit {session_idx}/{n_sessions}: {session_label} | runs = {len(session_rows)}",
+            flush=True,
+        )
+        sub_norm_mean, sub_norm_std = _compute_per_voxel_mean_std(
+            target_flat=target_flat,
+            manifest_rows=session_rows,
+            row_chunk_size=args.row_chunk_size,
+        )
+        print(f"Session-unit {session_idx}/{n_sessions}: accumulating raw metrics...", flush=True)
+        sub_metric_values, sub_pair_counts, sub_variance_values, sub_trial_counts = _accumulate_consecutive_diff_and_variance_metrics(
+            target_flat=target_flat,
+            manifest_rows=session_rows,
+            row_chunk_size=args.row_chunk_size,
+            per_run_normalization=False,
+        )
+        print(f"Session-unit {session_idx}/{n_sessions}: accumulating per-run-scaled metrics...", flush=True)
+        sub_rs_metric_values, _, sub_rs_variance_values, _ = _accumulate_consecutive_diff_and_variance_metrics(
+            target_flat=target_flat,
+            manifest_rows=session_rows,
+            row_chunk_size=args.row_chunk_size,
+            per_run_normalization=True,
+        )
+        with np.errstate(divide="ignore", invalid="ignore"):
+            sub_cv_values = np.where(
+                np.abs(sub_norm_mean) > 1e-8,
+                sub_norm_std / np.abs(sub_norm_mean),
+                np.nan,
+            )
+            sub_norm_diff_values = np.where(
+                np.abs(sub_norm_mean) > 1e-8,
+                sub_metric_values / np.abs(sub_norm_mean),
+                np.nan,
+            )
+        sub_selected_cv = np.asarray(sub_cv_values[:n_selected], dtype=np.float64)
+        sub_nonselected_cv = np.asarray(sub_cv_values[n_selected:], dtype=np.float64)
+        sub_selected_cv = sub_selected_cv[np.isfinite(sub_selected_cv)]
+        sub_nonselected_cv = sub_nonselected_cv[np.isfinite(sub_nonselected_cv)]
+        if sub_selected_cv.size > 0 and sub_nonselected_cv.size > 0:
+            session_cv_records.append(
+                {
+                    "unit_label": session_label,
+                    "n_runs": len(session_rows),
+                    "selected_cv": sub_selected_cv,
+                    "nonselected_cv": sub_nonselected_cv,
+                }
+            )
+
+        _accumulate_subject_nanmean(diff_subject_sum, diff_subject_n, sub_metric_values)
+        _accumulate_subject_nanmean(var_subject_sum, var_subject_n, sub_variance_values)
+        _accumulate_subject_nanmean(cv_subject_sum, cv_subject_n, sub_cv_values)
+        _accumulate_subject_nanmean(norm_diff_subject_sum, norm_diff_subject_n, sub_norm_diff_values)
+        _accumulate_subject_nanmean(rs_diff_subject_sum, rs_diff_subject_n, sub_rs_metric_values)
+        _accumulate_subject_nanmean(rs_var_subject_sum, rs_var_subject_n, sub_rs_variance_values)
+
+        pair_counts += sub_pair_counts
+        trial_counts += sub_trial_counts
+
+    metric_values, metric_subject_counts = _finalize_subject_nanmean(diff_subject_sum, diff_subject_n)
+    variance_values, variance_subject_counts = _finalize_subject_nanmean(var_subject_sum, var_subject_n)
+    cv_values, cv_subject_counts = _finalize_subject_nanmean(cv_subject_sum, cv_subject_n)
+    norm_diff_values, norm_diff_subject_counts = _finalize_subject_nanmean(
+        norm_diff_subject_sum, norm_diff_subject_n
+    )
+    rs_metric_values, rs_diff_subject_counts = _finalize_subject_nanmean(rs_diff_subject_sum, rs_diff_subject_n)
+    rs_variance_values, rs_var_subject_counts = _finalize_subject_nanmean(rs_var_subject_sum, rs_var_subject_n)
+
     selected_diff_all = np.asarray(metric_values[:n_selected], dtype=np.float64)
     nonselected_diff_all = np.asarray(metric_values[n_selected:], dtype=np.float64)
     selected_variance_all = np.asarray(variance_values[:n_selected], dtype=np.float64)
@@ -881,6 +1052,10 @@ def main() -> None:
     nonselected_counts_all = np.asarray(pair_counts[n_selected:], dtype=np.int64)
     selected_trial_counts_all = np.asarray(trial_counts[:n_selected], dtype=np.int64)
     nonselected_trial_counts_all = np.asarray(trial_counts[n_selected:], dtype=np.int64)
+    selected_diff_subject_counts_all = np.asarray(metric_subject_counts[:n_selected], dtype=np.int64)
+    nonselected_diff_subject_counts_all = np.asarray(metric_subject_counts[n_selected:], dtype=np.int64)
+    selected_variance_subject_counts_all = np.asarray(variance_subject_counts[:n_selected], dtype=np.int64)
+    nonselected_variance_subject_counts_all = np.asarray(variance_subject_counts[n_selected:], dtype=np.int64)
 
     selected_diff_valid = np.isfinite(selected_diff_all)
     nonselected_diff_valid = np.isfinite(nonselected_diff_all)
@@ -891,10 +1066,14 @@ def main() -> None:
     nonselected_metric = nonselected_diff_all[nonselected_diff_valid]
     selected_counts = selected_counts_all[selected_diff_valid]
     nonselected_counts = nonselected_counts_all[nonselected_diff_valid]
+    selected_diff_subject_counts = selected_diff_subject_counts_all[selected_diff_valid]
+    nonselected_diff_subject_counts = nonselected_diff_subject_counts_all[nonselected_diff_valid]
     selected_variance = selected_variance_all[selected_variance_valid]
     nonselected_variance = nonselected_variance_all[nonselected_variance_valid]
     selected_trial_counts = selected_trial_counts_all[selected_variance_valid]
     nonselected_trial_counts = nonselected_trial_counts_all[nonselected_variance_valid]
+    selected_variance_subject_counts = selected_variance_subject_counts_all[selected_variance_valid]
+    nonselected_variance_subject_counts = nonselected_variance_subject_counts_all[nonselected_variance_valid]
     selected_flat_variance_valid = selected_flat[selected_variance_valid]
     nonselected_flat_variance_valid = nonselected_flat[nonselected_variance_valid]
 
@@ -910,19 +1089,16 @@ def main() -> None:
     if nonselected_variance.size == 0:
         raise ValueError("Motor non-selected voxels have no finite trial-variance estimates.")
 
-    # Coefficient of variation: scale-free metric derived from Pass 1 statistics.
-    # CV = std / |mean|; undefined (nan) where |mean| is near zero.
-    cv_values = np.where(
-        np.abs(norm_mean) > 1e-8,
-        norm_std / np.abs(norm_mean),
-        np.nan,
-    )
     selected_cv_all = np.asarray(cv_values[:n_selected], dtype=np.float64)
     nonselected_cv_all = np.asarray(cv_values[n_selected:], dtype=np.float64)
+    selected_cv_subject_counts_all = np.asarray(cv_subject_counts[:n_selected], dtype=np.int64)
+    nonselected_cv_subject_counts_all = np.asarray(cv_subject_counts[n_selected:], dtype=np.int64)
     selected_cv_valid = np.isfinite(selected_cv_all)
     nonselected_cv_valid = np.isfinite(nonselected_cv_all)
     selected_cv = selected_cv_all[selected_cv_valid]
     nonselected_cv = nonselected_cv_all[nonselected_cv_valid]
+    selected_cv_subject_counts = selected_cv_subject_counts_all[selected_cv_valid]
+    nonselected_cv_subject_counts = nonselected_cv_subject_counts_all[nonselected_cv_valid]
     selected_flat_cv_valid = selected_flat[selected_cv_valid]
     nonselected_flat_cv_valid = nonselected_flat[nonselected_cv_valid]
     if selected_cv.size == 0:
@@ -930,19 +1106,16 @@ def main() -> None:
     if nonselected_cv.size == 0:
         raise ValueError("Motor non-selected voxels have no finite coefficient-of-variation estimates.")
 
-    # Normalized |Δ| = raw_mean_abs_diff / |per_voxel_mean|  (scale-free temporal stability).
-    # Equivalent to the temporal version of CV: "how large is a typical step relative to activation level?"
-    norm_diff_values = np.where(
-        np.abs(norm_mean) > 1e-8,
-        metric_values / np.abs(norm_mean),
-        np.nan,
-    )
     selected_norm_diff_all = np.asarray(norm_diff_values[:n_selected], dtype=np.float64)
     nonselected_norm_diff_all = np.asarray(norm_diff_values[n_selected:], dtype=np.float64)
+    selected_norm_diff_subject_counts_all = np.asarray(norm_diff_subject_counts[:n_selected], dtype=np.int64)
+    nonselected_norm_diff_subject_counts_all = np.asarray(norm_diff_subject_counts[n_selected:], dtype=np.int64)
     selected_norm_diff_valid = np.isfinite(selected_norm_diff_all)
     nonselected_norm_diff_valid = np.isfinite(nonselected_norm_diff_all)
     selected_norm_diff = selected_norm_diff_all[selected_norm_diff_valid]
     nonselected_norm_diff = nonselected_norm_diff_all[nonselected_norm_diff_valid]
+    selected_norm_diff_subject_counts = selected_norm_diff_subject_counts_all[selected_norm_diff_valid]
+    nonselected_norm_diff_subject_counts = nonselected_norm_diff_subject_counts_all[nonselected_norm_diff_valid]
     selected_flat_norm_diff_valid = selected_flat[selected_norm_diff_valid]
     nonselected_flat_norm_diff_valid = nonselected_flat[nonselected_norm_diff_valid]
     if selected_norm_diff.size == 0:
@@ -955,6 +1128,10 @@ def main() -> None:
     nonselected_rs_diff_all = np.asarray(rs_metric_values[n_selected:], dtype=np.float64)
     selected_rs_var_all = np.asarray(rs_variance_values[:n_selected], dtype=np.float64)
     nonselected_rs_var_all = np.asarray(rs_variance_values[n_selected:], dtype=np.float64)
+    selected_rs_diff_subject_counts_all = np.asarray(rs_diff_subject_counts[:n_selected], dtype=np.int64)
+    nonselected_rs_diff_subject_counts_all = np.asarray(rs_diff_subject_counts[n_selected:], dtype=np.int64)
+    selected_rs_var_subject_counts_all = np.asarray(rs_var_subject_counts[:n_selected], dtype=np.int64)
+    nonselected_rs_var_subject_counts_all = np.asarray(rs_var_subject_counts[n_selected:], dtype=np.int64)
     selected_rs_diff_valid = np.isfinite(selected_rs_diff_all)
     nonselected_rs_diff_valid = np.isfinite(nonselected_rs_diff_all)
     selected_rs_var_valid = np.isfinite(selected_rs_var_all)
@@ -963,6 +1140,10 @@ def main() -> None:
     nonselected_rs_diff = nonselected_rs_diff_all[nonselected_rs_diff_valid]
     selected_rs_var = selected_rs_var_all[selected_rs_var_valid]
     nonselected_rs_var = nonselected_rs_var_all[nonselected_rs_var_valid]
+    selected_rs_diff_subject_counts = selected_rs_diff_subject_counts_all[selected_rs_diff_valid]
+    nonselected_rs_diff_subject_counts = nonselected_rs_diff_subject_counts_all[nonselected_rs_diff_valid]
+    selected_rs_var_subject_counts = selected_rs_var_subject_counts_all[selected_rs_var_valid]
+    nonselected_rs_var_subject_counts = nonselected_rs_var_subject_counts_all[nonselected_rs_var_valid]
     if selected_rs_diff.size == 0 or nonselected_rs_diff.size == 0:
         raise ValueError("Per-run-scaled |delta| has empty valid set for selected or non-selected voxels.")
     if selected_rs_var.size == 0 or nonselected_rs_var.size == 0:
@@ -1058,12 +1239,13 @@ def main() -> None:
     norm_diff_png_path = args.output_dir / f"{args.output_stem}_norm_diff.png"
     rs_diff_png_path = args.output_dir / f"{args.output_stem}_runscaled_diff.png"
     rs_var_png_path = args.output_dir / f"{args.output_stem}_runscaled_variance.png"
+    cv_subjects_log_png_path = args.output_dir / f"{args.output_stem}_cv_subjects_log_panel.png"
     summary_json_path = args.output_dir / f"{args.output_stem}_summary.json"
     analysis_npz_path = args.output_dir / f"{args.output_stem}_analysis_data.npz"
 
     print(
         f"Saving figures to {diff_png_path}, {var_png_path}, {cv_png_path}, "
-        f"{norm_diff_png_path}, {rs_diff_png_path}, {rs_var_png_path}",
+        f"{norm_diff_png_path}, {rs_diff_png_path}, {rs_var_png_path}, {cv_subjects_log_png_path}",
         flush=True,
     )
     _plot_summary_figure(
@@ -1144,6 +1326,12 @@ def main() -> None:
         kde_max_points=int(args.kde_max_points),
         metric_name="Per-Run-Scaled Variance (beta / std_run)",
     )
+    _plot_cv_log_density_all_subjects(
+        figure_path=cv_subjects_log_png_path,
+        unit_cv_records=session_cv_records,
+        random_seed=int(args.random_seed),
+        kde_max_points=int(args.kde_max_points),
+    )
 
     summary = {
         "selected_source": selected_source,
@@ -1152,6 +1340,8 @@ def main() -> None:
         "selected_csv_path": str(args.selected_csv_path) if args.selected_csv_path is not None else None,
         "anat_path": str(args.anat_path),
         "manifest_path": str(args.manifest_path),
+        "aggregation_mode": "subject_sessionwise_voxelwise_nanmean",
+        "subject_session_count_total": int(n_sessions),
         "motor_mask_source": str(args.motor_mask_path) if args.motor_mask_path is not None else "harvard_oxford_auto",
         "motor_label_patterns": list(_split_csv_patterns(args.motor_label_patterns)),
         "motor_region_names": motor_region_names,
@@ -1166,6 +1356,8 @@ def main() -> None:
         "nonselected_mean_abs_consecutive_trial_diff": float(np.mean(nonselected_metric)),
         "selected_median_abs_consecutive_trial_diff": float(np.median(selected_metric)),
         "nonselected_median_abs_consecutive_trial_diff": float(np.median(nonselected_metric)),
+        "selected_min_units_per_voxel_diff": int(np.min(selected_diff_subject_counts)),
+        "nonselected_min_units_per_voxel_diff": int(np.min(nonselected_diff_subject_counts)),
         "selected_min_finite_consecutive_pairs": int(np.min(selected_counts)),
         "nonselected_min_finite_consecutive_pairs": int(np.min(nonselected_counts)),
         "selected_count_variance_valid": int(selected_variance.size),
@@ -1174,6 +1366,8 @@ def main() -> None:
         "nonselected_mean_trial_variance": float(np.mean(nonselected_variance)),
         "selected_median_trial_variance": float(np.median(selected_variance)),
         "nonselected_median_trial_variance": float(np.median(nonselected_variance)),
+        "selected_min_units_per_voxel_variance": int(np.min(selected_variance_subject_counts)),
+        "nonselected_min_units_per_voxel_variance": int(np.min(nonselected_variance_subject_counts)),
         "selected_min_finite_trials": int(np.min(selected_trial_counts)),
         "nonselected_min_finite_trials": int(np.min(nonselected_trial_counts)),
         "diff_resample_mean": float(np.mean(diff_resampled_means)),
@@ -1195,6 +1389,8 @@ def main() -> None:
         "nonselected_mean_cv": float(np.mean(nonselected_cv)),
         "selected_median_cv": float(np.median(selected_cv)),
         "nonselected_median_cv": float(np.median(nonselected_cv)),
+        "selected_min_units_per_voxel_cv": int(np.min(selected_cv_subject_counts)),
+        "nonselected_min_units_per_voxel_cv": int(np.min(nonselected_cv_subject_counts)),
         "cv_resample_mean": float(np.mean(cv_resampled_means)),
         "cv_resample_std": float(np.std(cv_resampled_means, ddof=1)),
         "cv_resample_ci_2p5": float(np.percentile(cv_resampled_means, 2.5)),
@@ -1205,18 +1401,24 @@ def main() -> None:
         "nonselected_count_norm_diff_valid": int(nonselected_norm_diff.size),
         "selected_mean_norm_diff": float(np.mean(selected_norm_diff)),
         "nonselected_mean_norm_diff": float(np.mean(nonselected_norm_diff)),
+        "selected_min_units_per_voxel_norm_diff": int(np.min(selected_norm_diff_subject_counts)),
+        "nonselected_min_units_per_voxel_norm_diff": int(np.min(nonselected_norm_diff_subject_counts)),
         "norm_diff_resample_p_lower_or_equal_selected": float(norm_diff_p_lower),
         "norm_diff_resample_with_replacement": bool(norm_diff_resample_replace),
         "selected_count_rs_diff_valid": int(selected_rs_diff.size),
         "nonselected_count_rs_diff_valid": int(nonselected_rs_diff.size),
         "selected_mean_rs_diff": float(np.mean(selected_rs_diff)),
         "nonselected_mean_rs_diff": float(np.mean(nonselected_rs_diff)),
+        "selected_min_units_per_voxel_rs_diff": int(np.min(selected_rs_diff_subject_counts)),
+        "nonselected_min_units_per_voxel_rs_diff": int(np.min(nonselected_rs_diff_subject_counts)),
         "rs_diff_resample_p_lower_or_equal_selected": float(rs_diff_p_lower),
         "rs_diff_resample_with_replacement": bool(rs_diff_resample_replace),
         "selected_count_rs_var_valid": int(selected_rs_var.size),
         "nonselected_count_rs_var_valid": int(nonselected_rs_var.size),
         "selected_mean_rs_var": float(np.mean(selected_rs_var)),
         "nonselected_mean_rs_var": float(np.mean(nonselected_rs_var)),
+        "selected_min_units_per_voxel_rs_var": int(np.min(selected_rs_var_subject_counts)),
+        "nonselected_min_units_per_voxel_rs_var": int(np.min(nonselected_rs_var_subject_counts)),
         "rs_var_resample_p_lower_or_equal_selected": float(rs_var_p_lower),
         "rs_var_resample_with_replacement": bool(rs_var_resample_replace),
         "num_resamples": int(args.num_resamples),
@@ -1224,6 +1426,7 @@ def main() -> None:
         "diff_png_path": str(diff_png_path),
         "variance_png_path": str(var_png_path),
         "cv_png_path": str(cv_png_path),
+        "cv_subjects_log_panel_png_path": str(cv_subjects_log_png_path),
         "norm_diff_png_path": str(norm_diff_png_path),
         "rs_diff_png_path": str(rs_diff_png_path),
         "rs_var_png_path": str(rs_var_png_path),
@@ -1238,6 +1441,8 @@ def main() -> None:
         nonselected_flat_indices=nonselected_flat_valid.astype(np.int64, copy=False),
         selected_mean_abs_consecutive_trial_diff=selected_metric.astype(np.float32, copy=False),
         nonselected_mean_abs_consecutive_trial_diff=nonselected_metric.astype(np.float32, copy=False),
+        selected_subject_count_diff=selected_diff_subject_counts.astype(np.int16, copy=False),
+        nonselected_subject_count_diff=nonselected_diff_subject_counts.astype(np.int16, copy=False),
         selected_finite_consecutive_pair_counts=selected_counts.astype(np.int32, copy=False),
         nonselected_finite_consecutive_pair_counts=nonselected_counts.astype(np.int32, copy=False),
         prevalence_thresholds=diff_thresholds.astype(np.float32, copy=False),
@@ -1245,6 +1450,8 @@ def main() -> None:
         resampled_nonselected_means=diff_resampled_means.astype(np.float32, copy=False),
         selected_trial_variance=selected_variance.astype(np.float32, copy=False),
         nonselected_trial_variance=nonselected_variance.astype(np.float32, copy=False),
+        selected_subject_count_variance=selected_variance_subject_counts.astype(np.int16, copy=False),
+        nonselected_subject_count_variance=nonselected_variance_subject_counts.astype(np.int16, copy=False),
         selected_finite_trial_counts=selected_trial_counts.astype(np.int32, copy=False),
         nonselected_finite_trial_counts=nonselected_trial_counts.astype(np.int32, copy=False),
         selected_flat_indices_variance=selected_flat_variance_valid.astype(np.int64, copy=False),
@@ -1258,6 +1465,8 @@ def main() -> None:
         motor_region_patterns=np.array(motor_patterns, dtype=object),
         selected_cv=selected_cv.astype(np.float32, copy=False),
         nonselected_cv=nonselected_cv.astype(np.float32, copy=False),
+        selected_subject_count_cv=selected_cv_subject_counts.astype(np.int16, copy=False),
+        nonselected_subject_count_cv=nonselected_cv_subject_counts.astype(np.int16, copy=False),
         selected_flat_indices_cv=selected_flat_cv_valid.astype(np.int64, copy=False),
         nonselected_flat_indices_cv=nonselected_flat_cv_valid.astype(np.int64, copy=False),
         cv_prevalence_thresholds=cv_thresholds.astype(np.float32, copy=False),
@@ -1265,6 +1474,8 @@ def main() -> None:
         resampled_nonselected_cv_means=cv_resampled_means.astype(np.float32, copy=False),
         selected_norm_diff=selected_norm_diff.astype(np.float32, copy=False),
         nonselected_norm_diff=nonselected_norm_diff.astype(np.float32, copy=False),
+        selected_subject_count_norm_diff=selected_norm_diff_subject_counts.astype(np.int16, copy=False),
+        nonselected_subject_count_norm_diff=nonselected_norm_diff_subject_counts.astype(np.int16, copy=False),
         selected_flat_indices_norm_diff=selected_flat_norm_diff_valid.astype(np.int64, copy=False),
         nonselected_flat_indices_norm_diff=nonselected_flat_norm_diff_valid.astype(np.int64, copy=False),
         norm_diff_prevalence_thresholds=norm_diff_thresholds.astype(np.float32, copy=False),
@@ -1272,8 +1483,12 @@ def main() -> None:
         resampled_nonselected_norm_diff_means=norm_diff_resampled_means.astype(np.float32, copy=False),
         selected_runscaled_diff=selected_rs_diff.astype(np.float32, copy=False),
         nonselected_runscaled_diff=nonselected_rs_diff.astype(np.float32, copy=False),
+        selected_subject_count_rs_diff=selected_rs_diff_subject_counts.astype(np.int16, copy=False),
+        nonselected_subject_count_rs_diff=nonselected_rs_diff_subject_counts.astype(np.int16, copy=False),
         selected_runscaled_variance=selected_rs_var.astype(np.float32, copy=False),
         nonselected_runscaled_variance=nonselected_rs_var.astype(np.float32, copy=False),
+        selected_subject_count_rs_var=selected_rs_var_subject_counts.astype(np.int16, copy=False),
+        nonselected_subject_count_rs_var=nonselected_rs_var_subject_counts.astype(np.int16, copy=False),
     )
 
     print(f"Saved summary JSON: {summary_json_path}", flush=True)
