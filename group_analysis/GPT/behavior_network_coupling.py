@@ -424,6 +424,19 @@ def _all_outputs_exist(out_dir: Path) -> bool:
     return all(path.exists() for path in legacy_expected)
 
 
+def _ensure_behavior_weight_file(loadings_path: Path, behavior_weight_path: Path) -> None:
+    if behavior_weight_path.exists() or not loadings_path.exists():
+        return
+    loadings_df = pd.read_csv(loadings_path)
+    behavior_weight_df = (
+        loadings_df[loadings_df["set"] == "Y"]
+        .assign(abs_weight=lambda df: df["weight"].abs())
+        .sort_values("abs_weight", ascending=False)
+        .reset_index(drop=True)
+    )
+    behavior_weight_df.to_csv(behavior_weight_path, index=False)
+
+
 def run_behavior_network_coupling(
     out_dir: Path,
     dcm_subject_parameters_path: Path,
@@ -467,6 +480,10 @@ def run_behavior_network_coupling(
     legacy_merged = behavior_df.merge(legacy_neural_df, on="subject", how="inner")
 
     if _all_outputs_exist(out_dir):
+        _ensure_behavior_weight_file(
+            out_dir / "behavioral_pls_loadings.csv",
+            out_dir / "behavioral_pls_behavior_weights.csv",
+        )
         legacy_results = {
             "subjects": legacy_merged.dropna(
                 subset=legacy_feature_cols + legacy_behavior_cols
