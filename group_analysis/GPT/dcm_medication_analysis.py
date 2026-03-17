@@ -21,19 +21,32 @@ from common_io import (
     load_subject_dcm_vector,
     paired_delta_stats,
     read_json,
-    safe_slug,
     to_serializable,
     write_json,
 )
 
 
-def _reduce_to_circuit(matrix: np.ndarray, labels: list[str]) -> tuple[np.ndarray, list[str]]:
-    reduced, reduced_labels, _ = aggregate_matrix_by_base_roi(
-        matrix,
-        labels,
-        include_base_rois=CIRCUIT_BASE_ROIS,
-    )
-    return reduced, reduced_labels
+def _select_analysis_matrix(
+    matrix: np.ndarray,
+    labels: list[str],
+    analysis_rois: list[str],
+    aggregate_to_base_rois: bool,
+) -> tuple[np.ndarray, list[str]]:
+    if aggregate_to_base_rois:
+        reduced, reduced_labels, _ = aggregate_matrix_by_base_roi(
+            matrix,
+            labels,
+            include_base_rois=analysis_rois,
+        )
+        return reduced, reduced_labels
+
+    label_to_idx = {label: idx for idx, label in enumerate(labels)}
+    missing = [label for label in analysis_rois if label not in label_to_idx]
+    if missing:
+        raise ValueError(f"Requested ROI labels were not found in DCM labels: {missing}")
+    keep_idx = [label_to_idx[label] for label in analysis_rois]
+    selected = np.asarray(matrix, dtype=float)[np.ix_(keep_idx, keep_idx)]
+    return selected, list(analysis_rois)
 
 
 def _plot_circuit_matrices(
@@ -44,15 +57,25 @@ def _plot_circuit_matrices(
     labels: list[str],
     out_path: Path,
 ) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.8), constrained_layout=True)
+    n_labels = len(labels)
+    annotate_cells = n_labels <= 12
+    axis_fontsize = 9 if n_labels <= 12 else 6
+    panel_width = max(4.8, 0.42 * n_labels + 2.5)
+    fig_height = max(4.8, 0.32 * n_labels + 1.5)
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(panel_width * 3, fig_height),
+        constrained_layout=True,
+    )
     shared_lim = float(
         np.nanmax(np.abs(np.concatenate([off_mean.ravel(), on_mean.ravel()])))
     )
     delta_lim = float(np.nanmax(np.abs(delta_mean))) or 1.0
     panels = [
-        (off_mean, "Circuit Mean OFF", shared_lim),
-        (on_mean, "Circuit Mean ON", shared_lim),
-        (delta_mean, "Circuit Mean ON - OFF", delta_lim),
+        (off_mean, "Mean OFF", shared_lim),
+        (on_mean, "Mean ON", shared_lim),
+        (delta_mean, "Mean ON - OFF", delta_lim),
     ]
 
     for ax, (matrix, title, vmax) in zip(axes, panels):
@@ -60,23 +83,24 @@ def _plot_circuit_matrices(
         ax.set_title(title)
         ax.set_xticks(range(len(labels)))
         ax.set_yticks(range(len(labels)))
-        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=9)
-        ax.set_yticklabels(labels, fontsize=9)
-        for row in range(matrix.shape[0]):
-            for col in range(matrix.shape[1]):
-                mark = ""
-                if title == "Circuit Mean ON - OFF" and np.isfinite(q_matrix[row, col]):
-                    if q_matrix[row, col] < 0.05:
-                        mark = "*"
-                ax.text(
-                    col,
-                    row,
-                    f"{matrix[row, col]:.2f}{mark}",
-                    ha="center",
-                    va="center",
-                    fontsize=7,
-                    color="black",
-                )
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=axis_fontsize)
+        ax.set_yticklabels(labels, fontsize=axis_fontsize)
+        if annotate_cells:
+            for row in range(matrix.shape[0]):
+                for col in range(matrix.shape[1]):
+                    mark = ""
+                    if title == "Mean ON - OFF" and np.isfinite(q_matrix[row, col]):
+                        if q_matrix[row, col] < 0.05:
+                            mark = "*"
+                    ax.text(
+                        col,
+                        row,
+                        f"{matrix[row, col]:.2f}{mark}",
+                        ha="center",
+                        va="center",
+                        fontsize=7,
+                        color="black",
+                    )
         fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
@@ -85,10 +109,15 @@ def _plot_circuit_matrices(
 def run_dcm_medication_analysis(
     out_dir: Path,
     circuit_rois: list[str] | None = None,
+    aggregate_to_base_rois: bool = True,
 ) -> dict:
     out_dir = ensure_dir(Path(out_dir))
-    circuit_rois = circuit_rois or CIRCUIT_BASE_ROIS
     dcm_labels = load_dcm_labels()
+    analysis_rois = (
+        list(circuit_rois)
+        if circuit_rois is not None
+        else (list(CIRCUIT_BASE_ROIS) if aggregate_to_base_rois else list(dcm_labels))
+    )
     group_summary = read_json(TMP_DCM_ROOT / "group_level" / "group_summary.json")
     subjects = list_paired_dcm_subjects()
 
@@ -108,11 +137,36 @@ def run_dcm_medication_analysis(
         intrinsic_full = load_subject_dcm_matrix(subject, "dcm_intrinsic_session1_off.npy")
         constant_drive_full = load_subject_dcm_vector(subject, "dcm_constant_drive.npy")
 
-        off, labels = _reduce_to_circuit(off_full, dcm_labels)
-        on, _ = _reduce_to_circuit(on_full, dcm_labels)
-        delta, _ = _reduce_to_circuit(delta_full, dcm_labels)
-        modulatory, _ = _reduce_to_circuit(modulatory_full, dcm_labels)
-        intrinsic, _ = _reduce_to_circuit(intrinsic_full, dcm_labels)
+        off, labels = _select_analysis_matrix(
+            off_full,
+            dcm_labels,
+            analysis_rois=analysis_rois,
+            aggregate_to_base_rois=aggregate_to_base_rois,
+        )
+        on, _ = _select_analysis_matrix(
+            on_full,
+            dcm_labels,
+            analysis_rois=analysis_rois,
+            aggregate_to_base_rois=aggregate_to_base_rois,
+        )
+        delta, _ = _select_analysis_matrix(
+            delta_full,
+            dcm_labels,
+            analysis_rois=analysis_rois,
+            aggregate_to_base_rois=aggregate_to_base_rois,
+        )
+        modulatory, _ = _select_analysis_matrix(
+            modulatory_full,
+            dcm_labels,
+            analysis_rois=analysis_rois,
+            aggregate_to_base_rois=aggregate_to_base_rois,
+        )
+        intrinsic, _ = _select_analysis_matrix(
+            intrinsic_full,
+            dcm_labels,
+            analysis_rois=analysis_rois,
+            aggregate_to_base_rois=aggregate_to_base_rois,
+        )
         off_mats.append(off)
         on_mats.append(on)
         delta_mats.append(delta)
@@ -133,8 +187,11 @@ def run_dcm_medication_analysis(
                     }
                 )
 
-        constant_drive_matrix, constant_drive_labels = _reduce_to_circuit(
-            np.diag(constant_drive_full), dcm_labels
+        constant_drive_matrix, constant_drive_labels = _select_analysis_matrix(
+            np.diag(constant_drive_full),
+            dcm_labels,
+            analysis_rois=analysis_rois,
+            aggregate_to_base_rois=aggregate_to_base_rois,
         )
         for idx, roi in enumerate(constant_drive_labels):
             subject_rows.append(
@@ -154,8 +211,8 @@ def run_dcm_medication_analysis(
     subject_df = pd.DataFrame(subject_rows)
     coupling_df = subject_df[subject_df["parameter_type"] == "coupling"].copy()
 
-    for target_roi in circuit_rois:
-        for source_roi in circuit_rois:
+    for target_roi in analysis_rois:
+        for source_roi in analysis_rois:
             edge_df = coupling_df[
                 (coupling_df["target_roi"] == target_roi)
                 & (coupling_df["source_roi"] == source_roi)
@@ -199,20 +256,23 @@ def run_dcm_medication_analysis(
     delta_mean = np.mean(np.stack(delta_mats, axis=0), axis=0)
     q_matrix = np.full_like(delta_mean, np.nan, dtype=float)
     for _, row in comparison_df.iterrows():
-        tgt = circuit_rois.index(row["target_roi"])
-        src = circuit_rois.index(row["source_roi"])
+        tgt = analysis_rois.index(row["target_roi"])
+        src = analysis_rois.index(row["source_roi"])
         q_matrix[tgt, src] = row["q_fdr"]
-    _plot_circuit_matrices(off_mean, on_mean, delta_mean, q_matrix, circuit_rois, fig_path)
+    _plot_circuit_matrices(off_mean, on_mean, delta_mean, q_matrix, analysis_rois, fig_path)
 
     summary = {
         "analysis_note": (
-            "This module re-summarizes the precomputed bilinear neuronal-state "
-            "model saved under results/connectivity/tmp/dynamic_causal_modeling; "
-            "it does not refit a classical hemodynamic DCM."
+            "This module re-summarizes the precomputed bilinear neuronal-state model "
+            "saved under results/connectivity/tmp/dynamic_causal_modeling; it does not "
+            "refit a classical hemodynamic DCM."
         ),
+        "aggregation_mode": "base_roi_average" if aggregate_to_base_rois else "full_roi",
         "input_root": TMP_DCM_ROOT,
         "n_subjects": len(subjects),
-        "circuit_rois": circuit_rois,
+        "analysis_rois": analysis_rois,
+        "n_rois": len(analysis_rois),
+        "circuit_rois": analysis_rois if aggregate_to_base_rois else [],
         "session_definition": group_summary.get("session_definition", {}),
         "matrix_convention": group_summary.get("matrix_convention"),
         "group_mean_abs_offdiag_off": group_summary.get("global_mean_abs_offdiag_off"),
@@ -239,7 +299,8 @@ def run_dcm_medication_analysis(
 
     return {
         "subjects": subjects,
-        "circuit_rois": circuit_rois,
+        "analysis_rois": analysis_rois,
+        "circuit_rois": analysis_rois,
         "subject_parameters_path": subject_path,
         "group_comparison_path": group_path,
         "group_comparison_fdr_path": group_fdr_path,
