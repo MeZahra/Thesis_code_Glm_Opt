@@ -13,24 +13,31 @@ Outputs kept:
 14) Per-subject pooled-trial normalized RMSSD (J) CSV and bar plot (session 1 vs 2).
 15) Per-subject consecutive-trial metrics CSV (MAD error, RMSE error, lag-1 correlation).
 16) Group-level consecutive-trial Wilcoxon summary CSV with rank-biserial effect size and 95% CI.
+17) Subject-wise lag-1 correlation bar plot with medication OFF/ON split (session 1/2).
 """
 
 import argparse
 import hashlib
 import os
 import re
+import sys
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 from matplotlib.ticker import MaxNLocator
 import nibabel as nib
 import numpy as np
 import pandas as pd
 from scipy.stats import gaussian_kde
 from scipy.stats import combine_pvalues, ks_2samp, rankdata, wilcoxon
+
+# Allow direct script execution without requiring PYTHONPATH setup.
+if __package__ in {None, ""}:
+    _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
 
 from group_analysis.main.motor_brain_com import (
     DEFAULT_MANIFEST_PATH,
@@ -289,7 +296,7 @@ def _bootstrap_j_delta_stats(
     p_two_sided = min(1.0, 2.0 * min(p_pos, p_neg))
     tail = 100.0 * (float(alpha) / 2.0)
     ci_low, ci_high = np.percentile(deltas, [tail, 100.0 - tail])
-    is_significant = bool(np.isfinite(p_two_sided) and p_two_sided < float(alpha))
+    is_significant = bool(np.isfinite(p_two_sided) and p_two_sided <= float(alpha))
     return (
         float(p_two_sided),
         float(ci_low),
@@ -1343,6 +1350,31 @@ def _plot_subject_consecutive_trial_scatter(
 
     selected_subjects = [str(sub_tag) for sub_tag in paired_subjects]
 
+    # Use one common axis range across all selected subjects (both sessions)
+    # so visual comparisons are on the same scale.
+    global_chunks = []
+    for sub_tag in selected_subjects:
+        values_a = pooled.get((sub_tag, int(session_a)), np.array([], dtype=np.float64))
+        values_b = pooled.get((sub_tag, int(session_b)), np.array([], dtype=np.float64))
+        if values_a.size > 0:
+            global_chunks.append(values_a)
+        if values_b.size > 0:
+            global_chunks.append(values_b)
+    if len(global_chunks) > 0:
+        global_values = np.concatenate(global_chunks).astype(np.float64, copy=False)
+        global_values = global_values[np.isfinite(global_values)]
+    else:
+        global_values = np.array([], dtype=np.float64)
+
+    if global_values.size > 0:
+        gmin = float(np.min(global_values))
+        gmax = float(np.max(global_values))
+        grange = gmax - gmin
+        gpad = (0.08 * grange) if grange > 0 else max(1e-6, 0.08 * max(abs(gmin), 1.0))
+        global_lims = (gmin - gpad, gmax + gpad)
+    else:
+        global_lims = (-1.0, 1.0)
+
     os.makedirs(out_dir, exist_ok=True)
     output_paths = []
     for sub_tag in selected_subjects:
@@ -1354,16 +1386,7 @@ def _plot_subject_consecutive_trial_scatter(
         x_b = values_b[:-1]
         y_b = values_b[1:]
 
-        combined = np.concatenate([values_a, values_b]).astype(np.float64, copy=False)
-        finite_combined = combined[np.isfinite(combined)]
-        if finite_combined.size > 0:
-            vmin = float(np.min(finite_combined))
-            vmax = float(np.max(finite_combined))
-            vrange = vmax - vmin
-            pad = (0.08 * vrange) if vrange > 0 else max(1e-6, 0.08 * max(abs(vmin), 1.0))
-            lims = (vmin - pad, vmax + pad)
-        else:
-            lims = (-1.0, 1.0)
+        lims = global_lims
 
         fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.8), sharex=True, sharey=True)
         session_specs = [
@@ -1421,8 +1444,15 @@ def _plot_subject_session_j_barplot(subject_j_df, out_path, session_a=1, session
 
     df = subject_j_df.copy()
     df["sub_tag"] = df["sub_tag"].astype(str)
+    df = df[df["sub_tag"] != "sub-pd017"].copy()
     df["_order"] = df["sub_tag"].map(_subject_order)
     df = df.sort_values(["_order", "sub_tag"]).reset_index(drop=True)
+    if df.empty:
+        ax.text(0.5, 0.5, "No pooled J data after exclusions", ha="center", va="center", transform=ax.transAxes)
+        ax.set_axis_off()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
 
     if "session_a_j_projection" not in df.columns or "session_b_j_projection" not in df.columns:
         ax.text(0.5, 0.5, "Missing pooled J columns", ha="center", va="center", transform=ax.transAxes)
@@ -1508,9 +1538,13 @@ def _plot_subject_session_j_barplot(subject_j_df, out_path, session_a=1, session
                 zorder=2,
             )
 
-    sig_col = f"j_projection_significant_bootstrap_alpha_{float(J_BOOTSTRAP_ALPHA):g}"
     sig_mask = np.zeros(len(df), dtype=bool)
-    if sig_col in df.columns:
+    p_col = "j_projection_bootstrap_p_two_sided"
+    sig_col = f"j_projection_significant_bootstrap_alpha_{float(J_BOOTSTRAP_ALPHA):g}"
+    if p_col in df.columns:
+        p_values = pd.to_numeric(df[p_col], errors="coerce").to_numpy(dtype=np.float64)
+        sig_mask = np.isfinite(p_values) & (p_values <= float(J_BOOTSTRAP_ALPHA))
+    elif sig_col in df.columns:
         raw_sig = df[sig_col].to_numpy()
         sig_mask = np.array(
             [bool(v) if isinstance(v, (bool, np.bool_)) else False for v in raw_sig],
@@ -1543,24 +1577,139 @@ def _plot_subject_session_j_barplot(subject_j_df, out_path, session_a=1, session
     ax.set_ylabel("J = RMSSD(x(i+1)-x(i)) / std(x)")
     ax.set_title("Subject-wise pooled-trial J by session (runs 1+2)")
     ax.grid(axis="y", alpha=0.2)
-    legend_handles, legend_labels = ax.get_legend_handles_labels()
+    ax.legend(loc="upper left", ncol=2, fontsize=8, frameon=False)
     if np.any(sig_pair_mask):
-        legend_handles.append(
-            Line2D(
-                [0],
-                [0],
-                marker="*",
-                color="black",
-                linestyle="None",
-                markersize=10,
-                label=f"Subject-wise bootstrap p < {float(J_BOOTSTRAP_ALPHA):g}",
-            )
+        ax.text(
+            0.01,
+            0.90,
+            f"* : subject-wise bootstrap p <= {float(J_BOOTSTRAP_ALPHA):g}",
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+            color="black",
         )
-        legend_labels.append(f"Subject-wise bootstrap p < {float(J_BOOTSTRAP_ALPHA):g}")
-    ax.legend(legend_handles, legend_labels, loc="upper right")
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
+
+
+def _plot_subject_consecutive_lag1_corr_barplot(subject_consecutive_df, out_path, session_a=1, session_b=2):
+    fig, ax = plt.subplots(1, 1, figsize=(15.2, 6.0))
+
+    if subject_consecutive_df is None or subject_consecutive_df.empty:
+        ax.text(
+            0.5,
+            0.5,
+            "No subject consecutive-trial metrics",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
+
+    df = subject_consecutive_df.copy()
+    df["sub_tag"] = df["sub_tag"].astype(str)
+    df = df[df["sub_tag"] != "sub-pd017"].copy()
+    df["_order"] = df["sub_tag"].map(_subject_order)
+    df = df.sort_values(["_order", "sub_tag"]).reset_index(drop=True)
+    if df.empty:
+        ax.text(
+            0.5,
+            0.5,
+            "No lag-1 correlation data after exclusions",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
+
+    col_a = "session_a_consecutive_lag1_corr"
+    col_b = "session_b_consecutive_lag1_corr"
+    if col_a not in df.columns or col_b not in df.columns:
+        ax.text(
+            0.5,
+            0.5,
+            "Missing lag-1 correlation columns",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
+
+    value_a = pd.to_numeric(df[col_a], errors="coerce").to_numpy(dtype=np.float64)
+    value_b = pd.to_numeric(df[col_b], errors="coerce").to_numpy(dtype=np.float64)
+    finite_any = np.isfinite(value_a) | np.isfinite(value_b)
+    if not np.any(finite_any):
+        ax.text(
+            0.5,
+            0.5,
+            "No finite lag-1 correlation values",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        fig.savefig(out_path, dpi=200)
+        plt.close(fig)
+        return
+
+    x = np.arange(len(df), dtype=np.float64)
+    width = 0.38
+    finite_a = np.isfinite(value_a)
+    finite_b = np.isfinite(value_b)
+
+    ax.bar(
+        x[finite_a] - (width / 2.0),
+        value_a[finite_a],
+        width=width,
+        color="tab:blue",
+        alpha=0.88,
+        edgecolor="black",
+        linewidth=0.3,
+        label=f"Medication OFF (session {int(session_a)})",
+    )
+    ax.bar(
+        x[finite_b] + (width / 2.0),
+        value_b[finite_b],
+        width=width,
+        color="tab:red",
+        alpha=0.82,
+        edgecolor="black",
+        linewidth=0.3,
+        label=f"Medication ON (session {int(session_b)})",
+    )
+
+    finite_vals = np.concatenate([value_a[finite_a], value_b[finite_b]]).astype(np.float64, copy=False)
+    y_min = float(np.min(finite_vals))
+    y_max = float(np.max(finite_vals))
+    y_span = y_max - y_min
+    y_pad = (0.08 * y_span) if y_span > 0 else max(0.05, 0.08 * max(abs(y_min), 1.0))
+    ax.set_ylim(y_min - y_pad, y_max + y_pad)
+    ax.axhline(0.0, color="black", linewidth=0.9, linestyle="--", alpha=0.6)
+
+    labels = df["sub_tag"].tolist()
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.set_xlabel("Subject")
+    ax.set_ylabel("corr(Y_t, Y_{t+1})")
+    ax.set_title("Subject-wise consecutive-trial lag-1 correlation by medication state (runs 1+2 pooled)")
+    ax.legend(loc="upper left", ncol=2, fontsize=8, frameon=False)
+    ax.grid(axis="y", alpha=0.2)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
 
 def _read_subject_list_file(path):
     subjects = []
@@ -1891,6 +2040,10 @@ def main():
         for spec in POOLED_METRIC_SPECS
     }
     pooled_j_plot_path = os.path.join(out_dir, f"{stem}_sub_session12_pooled_j_subject_barplot.png")
+    consecutive_corr_barplot_path = os.path.join(
+        out_dir,
+        f"{stem}_sub_session12_consecutive_lag1_corr_med_on_off_barplot.png",
+    )
     consecutive_trial_scatter_dir = os.path.join(
         out_dir,
         f"{stem}_sub_session12_consecutive_trial_scatter_all_subjects",
@@ -1965,6 +2118,12 @@ def main():
         session_a=1,
         session_b=2,
     )
+    _plot_subject_consecutive_lag1_corr_barplot(
+        consecutive_metrics_subject_df,
+        out_path=consecutive_corr_barplot_path,
+        session_a=1,
+        session_b=2,
+    )
 
     print(f"Projection length: {projection.size}")
     print(f"Projection source path: {resolved_projection_path}")
@@ -1988,6 +2147,7 @@ def main():
     print(f"Saved group consecutive-metric Wilcoxon CSV: {consecutive_metrics_group_csv_path}")
     print(f"Saved KS figure:         {ks_plot_path}")
     print(f"Saved pooled J subject bar-plot figure: {pooled_j_plot_path}")
+    print(f"Saved lag-1 correlation med OFF/ON bar-plot figure: {consecutive_corr_barplot_path}")
     print(
         "Saved consecutive-trial scatter directory: "
         f"{consecutive_trial_scatter_dir}"

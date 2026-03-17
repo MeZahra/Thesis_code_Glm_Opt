@@ -824,6 +824,45 @@ def _resample_nonselected_means(
     return out, replace
 
 
+def _plot_prevalence_panel(
+    ax: plt.Axes,
+    percentile_labels: list[float],
+    prevalence_ratios: np.ndarray,
+    panel_label: str,
+) -> None:
+    colors = [SELECTED_COLOR if value >= 1.0 else NONSELECTED_COLOR for value in prevalence_ratios]
+    tick_labels = [f"{int(round(p))}%" for p in percentile_labels]
+    ax.bar(tick_labels, prevalence_ratios, color=colors, edgecolor="white", linewidth=1.0)
+    ax.axhline(1.0, linestyle="--", color="0.5", linewidth=1.6)
+    ax.set_ylabel("Relative Prevalence\n(Selected / Non-selected)")
+    ax.set_xlabel("Variability Percentile Threshold")
+    ax.text(-0.02, 1.03, panel_label, transform=ax.transAxes, fontsize=18, fontweight="bold")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+
+def _plot_resample_panel(
+    ax: plt.Axes,
+    selected_mean: float,
+    resampled_means: np.ndarray,
+    metric_name: str,
+    panel_label: str,
+) -> None:
+    ax.hist(resampled_means, bins=40, density=True, color=NULL_COLOR, edgecolor="white", alpha=0.95)
+    resample_mean = float(np.mean(resampled_means))
+    ci_low, ci_high = np.percentile(resampled_means, [2.5, 97.5])
+    ax.axvline(selected_mean, linestyle="--", linewidth=2.0, color=SELECTED_COLOR, label=f"Selected mean = {selected_mean:.4g}")
+    ax.axvline(resample_mean, linestyle="--", linewidth=1.6, color="0.45", label=f"Resample mean = {resample_mean:.4g}")
+    ax.axvline(ci_low, linestyle="--", linewidth=1.4, color="0.55")
+    ax.axvline(ci_high, linestyle="--", linewidth=1.4, color="0.55", label=f"95% CI = [{ci_low:.4g}, {ci_high:.4g}]")
+    ax.set_xlabel(metric_name)
+    ax.set_ylabel("Density")
+    ax.text(-0.02, 1.03, panel_label, transform=ax.transAxes, fontsize=18, fontweight="bold")
+    ax.legend(frameon=True, fontsize=9, loc="upper right")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+
 def _plot_summary_figure(
     figure_path: Path,
     selected_metric: np.ndarray,
@@ -867,30 +906,19 @@ def _plot_summary_figure(
         xlabel=f"Log10({metric_name})",
         panel_label="b",
     )
-
-    colors = [SELECTED_COLOR if value >= 1.0 else NONSELECTED_COLOR for value in prevalence_ratios]
-    tick_labels = [f"{int(round(p))}%" for p in percentile_labels]
-    ax_c.bar(tick_labels, prevalence_ratios, color=colors, edgecolor="white", linewidth=1.0)
-    ax_c.axhline(1.0, linestyle="--", color="0.5", linewidth=1.6)
-    ax_c.set_ylabel("Relative Prevalence\n(Selected / Non-selected)")
-    ax_c.set_xlabel("Variability Percentile Threshold")
-    ax_c.text(-0.02, 1.03, "c", transform=ax_c.transAxes, fontsize=18, fontweight="bold")
-    ax_c.spines["top"].set_visible(False)
-    ax_c.spines["right"].set_visible(False)
-
-    ax_d.hist(resampled_means, bins=40, density=True, color=NULL_COLOR, edgecolor="white", alpha=0.95)
-    resample_mean = float(np.mean(resampled_means))
-    ci_low, ci_high = np.percentile(resampled_means, [2.5, 97.5])
-    ax_d.axvline(selected_mean, linestyle="--", linewidth=2.0, color=SELECTED_COLOR, label=f"Selected mean = {selected_mean:.4g}")
-    ax_d.axvline(resample_mean, linestyle="--", linewidth=1.6, color="0.45", label=f"Resample mean = {resample_mean:.4g}")
-    ax_d.axvline(ci_low, linestyle="--", linewidth=1.4, color="0.55")
-    ax_d.axvline(ci_high, linestyle="--", linewidth=1.4, color="0.55", label=f"95% CI = [{ci_low:.4g}, {ci_high:.4g}]")
-    ax_d.set_xlabel(f"{metric_name} (non-selected voxels)")
-    ax_d.set_ylabel("Density")
-    ax_d.text(-0.02, 1.03, "d", transform=ax_d.transAxes, fontsize=18, fontweight="bold")
-    ax_d.legend(frameon=True, fontsize=9, loc="upper right")
-    ax_d.spines["top"].set_visible(False)
-    ax_d.spines["right"].set_visible(False)
+    _plot_prevalence_panel(
+        ax_c,
+        percentile_labels=percentile_labels,
+        prevalence_ratios=prevalence_ratios,
+        panel_label="c",
+    )
+    _plot_resample_panel(
+        ax_d,
+        selected_mean=selected_mean,
+        resampled_means=resampled_means,
+        metric_name=metric_name,
+        panel_label="d",
+    )
 
     fig.suptitle(
         (
@@ -901,6 +929,37 @@ def _plot_summary_figure(
         fontsize=14,
         y=1.02,
     )
+    fig.savefig(figure_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_tail_summary_figure(
+    figure_path: Path,
+    selected_metric: np.ndarray,
+    percentile_labels: list[float],
+    prevalence_ratios: np.ndarray,
+    resampled_means: np.ndarray,
+    metric_name: str,
+) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), constrained_layout=True)
+    ax_c, ax_d = axes.ravel()
+    selected_mean = float(np.mean(selected_metric))
+
+    _plot_prevalence_panel(
+        ax_c,
+        percentile_labels=percentile_labels,
+        prevalence_ratios=prevalence_ratios,
+        panel_label="c",
+    )
+    _plot_resample_panel(
+        ax_d,
+        selected_mean=selected_mean,
+        resampled_means=resampled_means,
+        metric_name=metric_name,
+        panel_label="d",
+    )
+
+    fig.suptitle("selected vs motor area non-selected voxels", fontsize=14, y=1.02)
     fig.savefig(figure_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
@@ -1033,21 +1092,11 @@ def main() -> None:
             flush=True,
         )
 
-    diff_subject_sum = np.zeros(n_voxels, dtype=np.float64)
-    diff_subject_n = np.zeros(n_voxels, dtype=np.int64)
-    var_subject_sum = np.zeros(n_voxels, dtype=np.float64)
-    var_subject_n = np.zeros(n_voxels, dtype=np.int64)
     cv_subject_sum = np.zeros(n_voxels, dtype=np.float64)
     cv_subject_n = np.zeros(n_voxels, dtype=np.int64)
     norm_diff_subject_sum = np.zeros(n_voxels, dtype=np.float64)
     norm_diff_subject_n = np.zeros(n_voxels, dtype=np.int64)
-    rs_diff_subject_sum = np.zeros(n_voxels, dtype=np.float64)
-    rs_diff_subject_n = np.zeros(n_voxels, dtype=np.int64)
-    rs_var_subject_sum = np.zeros(n_voxels, dtype=np.float64)
-    rs_var_subject_n = np.zeros(n_voxels, dtype=np.int64)
 
-    pair_counts = np.zeros(n_voxels, dtype=np.int64)
-    trial_counts = np.zeros(n_voxels, dtype=np.int64)
     session_cv_records: list[dict[str, object]] = []
 
     for session_idx, (session_label, session_rows) in enumerate(session_groups, start=1):
@@ -1061,28 +1110,22 @@ def main() -> None:
             row_chunk_size=args.row_chunk_size,
             pre_normalize_each_file=pre_normalize_each_file,
         )
-        print(f"Session-unit {session_idx}/{n_sessions}: accumulating raw metrics...", flush=True)
-        sub_metric_values, sub_pair_counts, sub_variance_values, sub_trial_counts = _accumulate_consecutive_diff_and_variance_metrics(
+        print(f"Session-unit {session_idx}/{n_sessions}: accumulating metrics...", flush=True)
+        sub_metric_values, _sub_pair_counts, _sub_variance_values, _sub_trial_counts = _accumulate_consecutive_diff_and_variance_metrics(
             target_flat=target_flat,
             manifest_rows=session_rows,
             row_chunk_size=args.row_chunk_size,
             per_run_normalization=False,
             pre_normalize_each_file=pre_normalize_each_file,
         )
-        print(f"Session-unit {session_idx}/{n_sessions}: accumulating per-run-scaled metrics...", flush=True)
-        sub_rs_metric_values, _, sub_rs_variance_values, _ = _accumulate_consecutive_diff_and_variance_metrics(
-            target_flat=target_flat,
-            manifest_rows=session_rows,
-            row_chunk_size=args.row_chunk_size,
-            per_run_normalization=True,
-            pre_normalize_each_file=pre_normalize_each_file,
-        )
         with np.errstate(divide="ignore", invalid="ignore"):
+            # CV = std / |mean|: variability normalised by signal amplitude.
             sub_cv_values = np.where(
                 np.abs(sub_norm_mean) > 1e-8,
                 sub_norm_std / np.abs(sub_norm_mean),
                 np.nan,
             )
+            # norm_diff = consecutive |diff| / |mean|: trial-change normalised by signal amplitude.
             sub_norm_diff_values = np.where(
                 np.abs(sub_norm_mean) > 1e-8,
                 sub_metric_values / np.abs(sub_norm_mean),
@@ -1102,69 +1145,13 @@ def main() -> None:
                 }
             )
 
-        _accumulate_subject_nanmean(diff_subject_sum, diff_subject_n, sub_metric_values)
-        _accumulate_subject_nanmean(var_subject_sum, var_subject_n, sub_variance_values)
         _accumulate_subject_nanmean(cv_subject_sum, cv_subject_n, sub_cv_values)
         _accumulate_subject_nanmean(norm_diff_subject_sum, norm_diff_subject_n, sub_norm_diff_values)
-        _accumulate_subject_nanmean(rs_diff_subject_sum, rs_diff_subject_n, sub_rs_metric_values)
-        _accumulate_subject_nanmean(rs_var_subject_sum, rs_var_subject_n, sub_rs_variance_values)
 
-        pair_counts += sub_pair_counts
-        trial_counts += sub_trial_counts
-
-    metric_values, metric_subject_counts = _finalize_subject_nanmean(diff_subject_sum, diff_subject_n)
-    variance_values, variance_subject_counts = _finalize_subject_nanmean(var_subject_sum, var_subject_n)
     cv_values, cv_subject_counts = _finalize_subject_nanmean(cv_subject_sum, cv_subject_n)
     norm_diff_values, norm_diff_subject_counts = _finalize_subject_nanmean(
         norm_diff_subject_sum, norm_diff_subject_n
     )
-    rs_metric_values, rs_diff_subject_counts = _finalize_subject_nanmean(rs_diff_subject_sum, rs_diff_subject_n)
-    rs_variance_values, rs_var_subject_counts = _finalize_subject_nanmean(rs_var_subject_sum, rs_var_subject_n)
-
-    selected_diff_all = np.asarray(metric_values[:n_selected], dtype=np.float64)
-    nonselected_diff_all = np.asarray(metric_values[n_selected:], dtype=np.float64)
-    selected_variance_all = np.asarray(variance_values[:n_selected], dtype=np.float64)
-    nonselected_variance_all = np.asarray(variance_values[n_selected:], dtype=np.float64)
-    selected_counts_all = np.asarray(pair_counts[:n_selected], dtype=np.int64)
-    nonselected_counts_all = np.asarray(pair_counts[n_selected:], dtype=np.int64)
-    selected_trial_counts_all = np.asarray(trial_counts[:n_selected], dtype=np.int64)
-    nonselected_trial_counts_all = np.asarray(trial_counts[n_selected:], dtype=np.int64)
-    selected_diff_subject_counts_all = np.asarray(metric_subject_counts[:n_selected], dtype=np.int64)
-    nonselected_diff_subject_counts_all = np.asarray(metric_subject_counts[n_selected:], dtype=np.int64)
-    selected_variance_subject_counts_all = np.asarray(variance_subject_counts[:n_selected], dtype=np.int64)
-    nonselected_variance_subject_counts_all = np.asarray(variance_subject_counts[n_selected:], dtype=np.int64)
-
-    selected_diff_valid = np.isfinite(selected_diff_all)
-    nonselected_diff_valid = np.isfinite(nonselected_diff_all)
-    selected_variance_valid = np.isfinite(selected_variance_all)
-    nonselected_variance_valid = np.isfinite(nonselected_variance_all)
-
-    selected_metric = selected_diff_all[selected_diff_valid]
-    nonselected_metric = nonselected_diff_all[nonselected_diff_valid]
-    selected_counts = selected_counts_all[selected_diff_valid]
-    nonselected_counts = nonselected_counts_all[nonselected_diff_valid]
-    selected_diff_subject_counts = selected_diff_subject_counts_all[selected_diff_valid]
-    nonselected_diff_subject_counts = nonselected_diff_subject_counts_all[nonselected_diff_valid]
-    selected_variance = selected_variance_all[selected_variance_valid]
-    nonselected_variance = nonselected_variance_all[nonselected_variance_valid]
-    selected_trial_counts = selected_trial_counts_all[selected_variance_valid]
-    nonselected_trial_counts = nonselected_trial_counts_all[nonselected_variance_valid]
-    selected_variance_subject_counts = selected_variance_subject_counts_all[selected_variance_valid]
-    nonselected_variance_subject_counts = nonselected_variance_subject_counts_all[nonselected_variance_valid]
-    selected_flat_variance_valid = selected_flat[selected_variance_valid]
-    nonselected_flat_variance_valid = nonselected_flat[nonselected_variance_valid]
-
-    selected_flat_valid = selected_flat[selected_diff_valid]
-    nonselected_flat_valid = nonselected_flat[nonselected_diff_valid]
-
-    if selected_metric.size == 0:
-        raise ValueError("Selected voxels have no finite consecutive-trial difference estimates.")
-    if nonselected_metric.size == 0:
-        raise ValueError("Motor non-selected voxels have no finite consecutive-trial difference estimates.")
-    if selected_variance.size == 0:
-        raise ValueError("Selected voxels have no finite trial-variance estimates.")
-    if nonselected_variance.size == 0:
-        raise ValueError("Motor non-selected voxels have no finite trial-variance estimates.")
 
     selected_cv_all = np.asarray(cv_values[:n_selected], dtype=np.float64)
     nonselected_cv_all = np.asarray(cv_values[n_selected:], dtype=np.float64)
@@ -1200,60 +1187,6 @@ def main() -> None:
     if nonselected_norm_diff.size == 0:
         raise ValueError("Motor non-selected voxels have no finite normalized-|delta| estimates.")
 
-    # Per-run-scaled metrics: slice from rs_metric_values and rs_variance_values.
-    selected_rs_diff_all = np.asarray(rs_metric_values[:n_selected], dtype=np.float64)
-    nonselected_rs_diff_all = np.asarray(rs_metric_values[n_selected:], dtype=np.float64)
-    selected_rs_var_all = np.asarray(rs_variance_values[:n_selected], dtype=np.float64)
-    nonselected_rs_var_all = np.asarray(rs_variance_values[n_selected:], dtype=np.float64)
-    selected_rs_diff_subject_counts_all = np.asarray(rs_diff_subject_counts[:n_selected], dtype=np.int64)
-    nonselected_rs_diff_subject_counts_all = np.asarray(rs_diff_subject_counts[n_selected:], dtype=np.int64)
-    selected_rs_var_subject_counts_all = np.asarray(rs_var_subject_counts[:n_selected], dtype=np.int64)
-    nonselected_rs_var_subject_counts_all = np.asarray(rs_var_subject_counts[n_selected:], dtype=np.int64)
-    selected_rs_diff_valid = np.isfinite(selected_rs_diff_all)
-    nonselected_rs_diff_valid = np.isfinite(nonselected_rs_diff_all)
-    selected_rs_var_valid = np.isfinite(selected_rs_var_all)
-    nonselected_rs_var_valid = np.isfinite(nonselected_rs_var_all)
-    selected_rs_diff = selected_rs_diff_all[selected_rs_diff_valid]
-    nonselected_rs_diff = nonselected_rs_diff_all[nonselected_rs_diff_valid]
-    selected_rs_var = selected_rs_var_all[selected_rs_var_valid]
-    nonselected_rs_var = nonselected_rs_var_all[nonselected_rs_var_valid]
-    selected_rs_diff_subject_counts = selected_rs_diff_subject_counts_all[selected_rs_diff_valid]
-    nonselected_rs_diff_subject_counts = nonselected_rs_diff_subject_counts_all[nonselected_rs_diff_valid]
-    selected_rs_var_subject_counts = selected_rs_var_subject_counts_all[selected_rs_var_valid]
-    nonselected_rs_var_subject_counts = nonselected_rs_var_subject_counts_all[nonselected_rs_var_valid]
-    if selected_rs_diff.size == 0 or nonselected_rs_diff.size == 0:
-        raise ValueError("Per-run-scaled |delta| has empty valid set for selected or non-selected voxels.")
-    if selected_rs_var.size == 0 or nonselected_rs_var.size == 0:
-        raise ValueError("Per-run-scaled variance has empty valid set for selected or non-selected voxels.")
-
-    diff_thresholds, diff_prevalence_ratios = _compute_prevalence_ratios(
-        selected_values=selected_metric,
-        nonselected_values=nonselected_metric,
-        percentiles=list(args.percentile_thresholds),
-    )
-    diff_resampled_means, diff_resample_replace = _resample_nonselected_means(
-        nonselected_values=nonselected_metric,
-        sample_size=selected_metric.size,
-        num_resamples=args.num_resamples,
-        rng=rng,
-    )
-    diff_selected_mean = float(np.mean(selected_metric))
-    diff_p_lower = (1.0 + float(np.count_nonzero(diff_resampled_means <= diff_selected_mean))) / (1.0 + float(args.num_resamples))
-
-    var_thresholds, var_prevalence_ratios = _compute_prevalence_ratios(
-        selected_values=selected_variance,
-        nonselected_values=nonselected_variance,
-        percentiles=list(args.percentile_thresholds),
-    )
-    var_resampled_means, var_resample_replace = _resample_nonselected_means(
-        nonselected_values=nonselected_variance,
-        sample_size=selected_variance.size,
-        num_resamples=args.num_resamples,
-        rng=rng,
-    )
-    var_selected_mean = float(np.mean(selected_variance))
-    var_p_lower = (1.0 + float(np.count_nonzero(var_resampled_means <= var_selected_mean))) / (1.0 + float(args.num_resamples))
-
     cv_thresholds, cv_prevalence_ratios = _compute_prevalence_ratios(
         selected_values=selected_cv,
         nonselected_values=nonselected_cv,
@@ -1282,74 +1215,20 @@ def main() -> None:
     norm_diff_selected_mean = float(np.mean(selected_norm_diff))
     norm_diff_p_lower = (1.0 + float(np.count_nonzero(norm_diff_resampled_means <= norm_diff_selected_mean))) / (1.0 + float(args.num_resamples))
 
-    rs_diff_thresholds, rs_diff_prevalence_ratios = _compute_prevalence_ratios(
-        selected_values=selected_rs_diff,
-        nonselected_values=nonselected_rs_diff,
-        percentiles=list(args.percentile_thresholds),
-    )
-    rs_diff_resampled_means, rs_diff_resample_replace = _resample_nonselected_means(
-        nonselected_values=nonselected_rs_diff,
-        sample_size=selected_rs_diff.size,
-        num_resamples=args.num_resamples,
-        rng=rng,
-    )
-    rs_diff_selected_mean = float(np.mean(selected_rs_diff))
-    rs_diff_p_lower = (1.0 + float(np.count_nonzero(rs_diff_resampled_means <= rs_diff_selected_mean))) / (1.0 + float(args.num_resamples))
-
-    rs_var_thresholds, rs_var_prevalence_ratios = _compute_prevalence_ratios(
-        selected_values=selected_rs_var,
-        nonselected_values=nonselected_rs_var,
-        percentiles=list(args.percentile_thresholds),
-    )
-    rs_var_resampled_means, rs_var_resample_replace = _resample_nonselected_means(
-        nonselected_values=nonselected_rs_var,
-        sample_size=selected_rs_var.size,
-        num_resamples=args.num_resamples,
-        rng=rng,
-    )
-    rs_var_selected_mean = float(np.mean(selected_rs_var))
-    rs_var_p_lower = (1.0 + float(np.count_nonzero(rs_var_resampled_means <= rs_var_selected_mean))) / (1.0 + float(args.num_resamples))
-
-    diff_png_path = args.output_dir / f"{args.output_stem}.png"
-    var_png_path = args.output_dir / f"{args.output_stem}_variance.png"
     cv_png_path = args.output_dir / f"{args.output_stem}_cv.png"
     norm_diff_png_path = args.output_dir / f"{args.output_stem}_norm_diff.png"
-    rs_diff_png_path = args.output_dir / f"{args.output_stem}_runscaled_diff.png"
-    rs_var_png_path = args.output_dir / f"{args.output_stem}_runscaled_variance.png"
+    cv_tail_png_path = args.output_dir / f"{args.output_stem}_cv_cd.png"
+    norm_diff_tail_png_path = args.output_dir / f"{args.output_stem}_norm_diff_cd.png"
     cv_subjects_log_png_path = args.output_dir / f"{args.output_stem}_cv_subjects_log_panel.png"
     summary_json_path = args.output_dir / f"{args.output_stem}_summary.json"
     analysis_npz_path = args.output_dir / f"{args.output_stem}_analysis_data.npz"
 
     print(
-        f"Saving figures to {diff_png_path}, {var_png_path}, {cv_png_path}, "
-        f"{norm_diff_png_path}, {rs_diff_png_path}, {rs_var_png_path}, {cv_subjects_log_png_path}",
+        (
+            f"Saving figures to {cv_png_path}, {norm_diff_png_path}, "
+            f"{cv_tail_png_path}, {norm_diff_tail_png_path}, {cv_subjects_log_png_path}"
+        ),
         flush=True,
-    )
-    _plot_summary_figure(
-        figure_path=diff_png_path,
-        selected_metric=selected_metric,
-        nonselected_metric=nonselected_metric,
-        percentile_labels=list(args.percentile_thresholds),
-        prevalence_ratios=diff_prevalence_ratios,
-        resampled_means=diff_resampled_means,
-        p_lower=diff_p_lower,
-        num_resamples=int(args.num_resamples),
-        rng=rng,
-        kde_max_points=int(args.kde_max_points),
-        metric_name="Mean |Delta| Consecutive Trials",
-    )
-    _plot_summary_figure(
-        figure_path=var_png_path,
-        selected_metric=selected_variance,
-        nonselected_metric=nonselected_variance,
-        percentile_labels=list(args.percentile_thresholds),
-        prevalence_ratios=var_prevalence_ratios,
-        resampled_means=var_resampled_means,
-        p_lower=var_p_lower,
-        num_resamples=int(args.num_resamples),
-        rng=rng,
-        kde_max_points=int(args.kde_max_points),
-        metric_name="Variance Across Kept Trials",
     )
     _plot_summary_figure(
         figure_path=cv_png_path,
@@ -1364,6 +1243,14 @@ def main() -> None:
         kde_max_points=int(args.kde_max_points),
         metric_name="Coefficient of Variation (std/|mean|)",
     )
+    _plot_tail_summary_figure(
+        figure_path=cv_tail_png_path,
+        selected_metric=selected_cv,
+        percentile_labels=list(args.percentile_thresholds),
+        prevalence_ratios=cv_prevalence_ratios,
+        resampled_means=cv_resampled_means,
+        metric_name="Coefficient of Variation (std/|mean|)",
+    )
     _plot_summary_figure(
         figure_path=norm_diff_png_path,
         selected_metric=selected_norm_diff,
@@ -1375,33 +1262,15 @@ def main() -> None:
         num_resamples=int(args.num_resamples),
         rng=rng,
         kde_max_points=int(args.kde_max_points),
-        metric_name="Normalized |Delta| (raw_diff / |voxel_mean|)",
+        metric_name="Normalized |Delta| (consecutive diff / |voxel_mean|)",
     )
-    _plot_summary_figure(
-        figure_path=rs_diff_png_path,
-        selected_metric=selected_rs_diff,
-        nonselected_metric=nonselected_rs_diff,
+    _plot_tail_summary_figure(
+        figure_path=norm_diff_tail_png_path,
+        selected_metric=selected_norm_diff,
         percentile_labels=list(args.percentile_thresholds),
-        prevalence_ratios=rs_diff_prevalence_ratios,
-        resampled_means=rs_diff_resampled_means,
-        p_lower=rs_diff_p_lower,
-        num_resamples=int(args.num_resamples),
-        rng=rng,
-        kde_max_points=int(args.kde_max_points),
-        metric_name="Per-Run-Scaled Mean |Delta| (beta / std_run)",
-    )
-    _plot_summary_figure(
-        figure_path=rs_var_png_path,
-        selected_metric=selected_rs_var,
-        nonselected_metric=nonselected_rs_var,
-        percentile_labels=list(args.percentile_thresholds),
-        prevalence_ratios=rs_var_prevalence_ratios,
-        resampled_means=rs_var_resampled_means,
-        p_lower=rs_var_p_lower,
-        num_resamples=int(args.num_resamples),
-        rng=rng,
-        kde_max_points=int(args.kde_max_points),
-        metric_name="Per-Run-Scaled Variance (beta / std_run)",
+        prevalence_ratios=norm_diff_prevalence_ratios,
+        resampled_means=norm_diff_resampled_means,
+        metric_name="Normalized |Delta| (consecutive diff / |voxel_mean|)",
     )
     _plot_cv_log_density_all_subjects(
         figure_path=cv_subjects_log_png_path,
@@ -1429,39 +1298,7 @@ def main() -> None:
         "selected_in_motor_count": int(np.count_nonzero(np.isin(selected_flat, motor_flat))),
         "selected_count_total": int(selected_flat.size),
         "nonselected_count_total": int(nonselected_flat.size),
-        "selected_count_valid": int(selected_metric.size),
-        "nonselected_count_valid": int(nonselected_metric.size),
-        "selected_mean_abs_consecutive_trial_diff": float(np.mean(selected_metric)),
-        "nonselected_mean_abs_consecutive_trial_diff": float(np.mean(nonselected_metric)),
-        "selected_median_abs_consecutive_trial_diff": float(np.median(selected_metric)),
-        "nonselected_median_abs_consecutive_trial_diff": float(np.median(nonselected_metric)),
-        "selected_min_units_per_voxel_diff": int(np.min(selected_diff_subject_counts)),
-        "nonselected_min_units_per_voxel_diff": int(np.min(nonselected_diff_subject_counts)),
-        "selected_min_finite_consecutive_pairs": int(np.min(selected_counts)),
-        "nonselected_min_finite_consecutive_pairs": int(np.min(nonselected_counts)),
-        "selected_count_variance_valid": int(selected_variance.size),
-        "nonselected_count_variance_valid": int(nonselected_variance.size),
-        "selected_mean_trial_variance": float(np.mean(selected_variance)),
-        "nonselected_mean_trial_variance": float(np.mean(nonselected_variance)),
-        "selected_median_trial_variance": float(np.median(selected_variance)),
-        "nonselected_median_trial_variance": float(np.median(nonselected_variance)),
-        "selected_min_units_per_voxel_variance": int(np.min(selected_variance_subject_counts)),
-        "nonselected_min_units_per_voxel_variance": int(np.min(nonselected_variance_subject_counts)),
-        "selected_min_finite_trials": int(np.min(selected_trial_counts)),
-        "nonselected_min_finite_trials": int(np.min(nonselected_trial_counts)),
-        "diff_resample_mean": float(np.mean(diff_resampled_means)),
-        "diff_resample_std": float(np.std(diff_resampled_means, ddof=1)),
-        "diff_resample_ci_2p5": float(np.percentile(diff_resampled_means, 2.5)),
-        "diff_resample_ci_97p5": float(np.percentile(diff_resampled_means, 97.5)),
-        "diff_resample_p_lower_or_equal_selected": float(diff_p_lower),
-        "diff_resample_with_replacement": bool(diff_resample_replace),
-        "var_resample_mean": float(np.mean(var_resampled_means)),
-        "var_resample_std": float(np.std(var_resampled_means, ddof=1)),
-        "var_resample_ci_2p5": float(np.percentile(var_resampled_means, 2.5)),
-        "var_resample_ci_97p5": float(np.percentile(var_resampled_means, 97.5)),
-        "var_resample_p_lower_or_equal_selected": float(var_p_lower),
-        "var_resample_with_replacement": bool(var_resample_replace),
-        "normalization_applied": "per_run_std_after_pre_file_demean_maxabs",
+        # Coefficient of Variation (CV = std / |mean|) — signal-normalised variability
         "selected_count_cv_valid": int(selected_cv.size),
         "nonselected_count_cv_valid": int(nonselected_cv.size),
         "selected_mean_cv": float(np.mean(selected_cv)),
@@ -1476,39 +1313,28 @@ def main() -> None:
         "cv_resample_ci_97p5": float(np.percentile(cv_resampled_means, 97.5)),
         "cv_resample_p_lower_or_equal_selected": float(cv_p_lower),
         "cv_resample_with_replacement": bool(cv_resample_replace),
+        # Normalised |Delta| (norm_diff = consecutive |diff| / |voxel_mean|)
         "selected_count_norm_diff_valid": int(selected_norm_diff.size),
         "nonselected_count_norm_diff_valid": int(nonselected_norm_diff.size),
         "selected_mean_norm_diff": float(np.mean(selected_norm_diff)),
         "nonselected_mean_norm_diff": float(np.mean(nonselected_norm_diff)),
+        "selected_median_norm_diff": float(np.median(selected_norm_diff)),
+        "nonselected_median_norm_diff": float(np.median(nonselected_norm_diff)),
         "selected_min_units_per_voxel_norm_diff": int(np.min(selected_norm_diff_subject_counts)),
         "nonselected_min_units_per_voxel_norm_diff": int(np.min(nonselected_norm_diff_subject_counts)),
+        "norm_diff_resample_mean": float(np.mean(norm_diff_resampled_means)),
+        "norm_diff_resample_std": float(np.std(norm_diff_resampled_means, ddof=1)),
+        "norm_diff_resample_ci_2p5": float(np.percentile(norm_diff_resampled_means, 2.5)),
+        "norm_diff_resample_ci_97p5": float(np.percentile(norm_diff_resampled_means, 97.5)),
         "norm_diff_resample_p_lower_or_equal_selected": float(norm_diff_p_lower),
         "norm_diff_resample_with_replacement": bool(norm_diff_resample_replace),
-        "selected_count_rs_diff_valid": int(selected_rs_diff.size),
-        "nonselected_count_rs_diff_valid": int(nonselected_rs_diff.size),
-        "selected_mean_rs_diff": float(np.mean(selected_rs_diff)),
-        "nonselected_mean_rs_diff": float(np.mean(nonselected_rs_diff)),
-        "selected_min_units_per_voxel_rs_diff": int(np.min(selected_rs_diff_subject_counts)),
-        "nonselected_min_units_per_voxel_rs_diff": int(np.min(nonselected_rs_diff_subject_counts)),
-        "rs_diff_resample_p_lower_or_equal_selected": float(rs_diff_p_lower),
-        "rs_diff_resample_with_replacement": bool(rs_diff_resample_replace),
-        "selected_count_rs_var_valid": int(selected_rs_var.size),
-        "nonselected_count_rs_var_valid": int(nonselected_rs_var.size),
-        "selected_mean_rs_var": float(np.mean(selected_rs_var)),
-        "nonselected_mean_rs_var": float(np.mean(nonselected_rs_var)),
-        "selected_min_units_per_voxel_rs_var": int(np.min(selected_rs_var_subject_counts)),
-        "nonselected_min_units_per_voxel_rs_var": int(np.min(nonselected_rs_var_subject_counts)),
-        "rs_var_resample_p_lower_or_equal_selected": float(rs_var_p_lower),
-        "rs_var_resample_with_replacement": bool(rs_var_resample_replace),
         "num_resamples": int(args.num_resamples),
         "random_seed": int(args.random_seed),
-        "diff_png_path": str(diff_png_path),
-        "variance_png_path": str(var_png_path),
         "cv_png_path": str(cv_png_path),
+        "cv_cd_png_path": str(cv_tail_png_path),
         "cv_subjects_log_panel_png_path": str(cv_subjects_log_png_path),
         "norm_diff_png_path": str(norm_diff_png_path),
-        "rs_diff_png_path": str(rs_diff_png_path),
-        "rs_var_png_path": str(rs_var_png_path),
+        "norm_diff_cd_png_path": str(norm_diff_tail_png_path),
         "motor_region_figure_path": str(motor_region_figure),
     }
     with summary_json_path.open("w", encoding="utf-8") as handle:
@@ -1516,28 +1342,6 @@ def main() -> None:
 
     np.savez_compressed(
         analysis_npz_path,
-        selected_flat_indices=selected_flat_valid.astype(np.int64, copy=False),
-        nonselected_flat_indices=nonselected_flat_valid.astype(np.int64, copy=False),
-        selected_mean_abs_consecutive_trial_diff=selected_metric.astype(np.float32, copy=False),
-        nonselected_mean_abs_consecutive_trial_diff=nonselected_metric.astype(np.float32, copy=False),
-        selected_subject_count_diff=selected_diff_subject_counts.astype(np.int16, copy=False),
-        nonselected_subject_count_diff=nonselected_diff_subject_counts.astype(np.int16, copy=False),
-        selected_finite_consecutive_pair_counts=selected_counts.astype(np.int32, copy=False),
-        nonselected_finite_consecutive_pair_counts=nonselected_counts.astype(np.int32, copy=False),
-        prevalence_thresholds=diff_thresholds.astype(np.float32, copy=False),
-        prevalence_ratios=diff_prevalence_ratios.astype(np.float32, copy=False),
-        resampled_nonselected_means=diff_resampled_means.astype(np.float32, copy=False),
-        selected_trial_variance=selected_variance.astype(np.float32, copy=False),
-        nonselected_trial_variance=nonselected_variance.astype(np.float32, copy=False),
-        selected_subject_count_variance=selected_variance_subject_counts.astype(np.int16, copy=False),
-        nonselected_subject_count_variance=nonselected_variance_subject_counts.astype(np.int16, copy=False),
-        selected_finite_trial_counts=selected_trial_counts.astype(np.int32, copy=False),
-        nonselected_finite_trial_counts=nonselected_trial_counts.astype(np.int32, copy=False),
-        selected_flat_indices_variance=selected_flat_variance_valid.astype(np.int64, copy=False),
-        nonselected_flat_indices_variance=nonselected_flat_variance_valid.astype(np.int64, copy=False),
-        variance_prevalence_thresholds=var_thresholds.astype(np.float32, copy=False),
-        variance_prevalence_ratios=var_prevalence_ratios.astype(np.float32, copy=False),
-        resampled_nonselected_variance_means=var_resampled_means.astype(np.float32, copy=False),
         motor_flat_indices=motor_flat.astype(np.int64, copy=False),
         motor_region_names=np.array(motor_region_names, dtype=object),
         motor_region_counts=np.asarray(motor_region_counts, dtype=np.int32),
@@ -1560,14 +1364,6 @@ def main() -> None:
         norm_diff_prevalence_thresholds=norm_diff_thresholds.astype(np.float32, copy=False),
         norm_diff_prevalence_ratios=norm_diff_prevalence_ratios.astype(np.float32, copy=False),
         resampled_nonselected_norm_diff_means=norm_diff_resampled_means.astype(np.float32, copy=False),
-        selected_runscaled_diff=selected_rs_diff.astype(np.float32, copy=False),
-        nonselected_runscaled_diff=nonselected_rs_diff.astype(np.float32, copy=False),
-        selected_subject_count_rs_diff=selected_rs_diff_subject_counts.astype(np.int16, copy=False),
-        nonselected_subject_count_rs_diff=nonselected_rs_diff_subject_counts.astype(np.int16, copy=False),
-        selected_runscaled_variance=selected_rs_var.astype(np.float32, copy=False),
-        nonselected_runscaled_variance=nonselected_rs_var.astype(np.float32, copy=False),
-        selected_subject_count_rs_var=selected_rs_var_subject_counts.astype(np.int16, copy=False),
-        nonselected_subject_count_rs_var=nonselected_rs_var_subject_counts.astype(np.int16, copy=False),
     )
 
     print(f"Saved summary JSON: {summary_json_path}", flush=True)
