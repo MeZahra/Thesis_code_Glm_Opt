@@ -36,7 +36,11 @@ CIRCUIT_BASE_ROIS = [
     "Thalamus",
     "Cerebellum",
 ]
-DEFAULT_DROP_LABEL_PATTERNS = ("Brain-Stem",)
+DEFAULT_DROP_LABEL_PATTERNS = ("brain stem", "brain-stem", "cerebral white matter")
+EXCLUDED_BASE_ROIS = (
+    "Brain-Stem (relative)",
+    "Cerebral White Matter (relative)",
+)
 ANATOMICAL_SYSTEM_ORDER = [
     "cognitive_control",
     "motor_sensorimotor",
@@ -158,9 +162,11 @@ def drop_labels_and_matrix(
     matrix: np.ndarray,
     drop_patterns: Iterable[str] = DEFAULT_DROP_LABEL_PATTERNS,
 ) -> tuple[np.ndarray, list[str], np.ndarray]:
+    patterns = [str(pattern).strip().lower() for pattern in drop_patterns if str(pattern).strip()]
     keep_mask = np.ones(len(labels), dtype=bool)
     for idx, label in enumerate(labels):
-        if any(pattern in label for pattern in drop_patterns):
+        label_lower = str(label).lower()
+        if any(pattern in label_lower for pattern in patterns):
             keep_mask[idx] = False
     kept_labels = [label for label, keep in zip(labels, keep_mask) if keep]
     keep_idx = np.where(keep_mask)[0]

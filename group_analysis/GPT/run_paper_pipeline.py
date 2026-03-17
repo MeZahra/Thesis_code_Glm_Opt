@@ -11,7 +11,6 @@ from behavior_network_coupling import run_behavior_network_coupling
 from common_io import (
     BENCHMARK_METRICS,
     GPT_RESULTS_ROOT,
-    PRIMARY_METRIC,
     REPO_ROOT,
     TMP_DCM_ROOT,
     ensure_dir,
@@ -24,8 +23,13 @@ from common_io import (
 )
 from dcm_medication_analysis import run_dcm_medication_analysis
 from metric_benchmark import run_metric_benchmark
-from roi_graph_reorganization import run_roi_graph_reorganization
+from roi_graph_base_reorganization import (
+    DEFAULT_RUN_LEVEL_METRICS_ROOT,
+    run_base_roi_graph_reorganization,
+)
 from supplementary_ksg_summary import run_supplementary_ksg_summary
+
+DEFAULT_GRAPH_PRIMARY_METRIC = "partial_correlation"
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,8 +43,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--primary-metric",
         type=str,
-        default=PRIMARY_METRIC,
+        default=DEFAULT_GRAPH_PRIMARY_METRIC,
         help="Primary ROI-connectivity metric for graph analyses.",
+    )
+    parser.add_argument(
+        "--graph-run-level-metrics-root",
+        type=Path,
+        default=DEFAULT_RUN_LEVEL_METRICS_ROOT,
+        help="Optional root of run-level advanced metric folders for repeated-measures graph inference.",
     )
     parser.add_argument(
         "--pls-permutations",
@@ -88,11 +98,12 @@ def build_paper_tables(
     ]
 
     graph_df = pd.read_csv(graph_results["node_tests_path"]).head(12)
+    graph_p_col = "p_primary" if "p_primary" in graph_df.columns else "p_signflip"
     graph_table = graph_df.assign(
         analysis_family="roi_graph_reorganization",
         effect_name=graph_df["roi"] + " | " + graph_df["metric"],
         estimate=graph_df["mean_delta"],
-        p_value=graph_df["p_signflip"],
+        p_value=graph_df[graph_p_col],
         q_value=graph_df["q_fdr_within_metric"],
         effect_size=graph_df["cohen_dz"],
     )[
@@ -153,7 +164,11 @@ def main() -> None:
     table_dir = ensure_dir(output_root / "paper_summary_tables")
 
     dcm_results = run_dcm_medication_analysis(effective_dir)
-    graph_results = run_roi_graph_reorganization(graph_dir, metric=args.primary_metric)
+    graph_results = run_base_roi_graph_reorganization(
+        graph_dir,
+        metric=args.primary_metric,
+        run_level_metrics_root=args.graph_run_level_metrics_root,
+    )
     behavior_results = run_behavior_network_coupling(
         behavior_dir,
         dcm_results["subject_parameters_path"],
@@ -188,10 +203,20 @@ def main() -> None:
         "repo_root": REPO_ROOT,
         "output_root": output_root,
         "primary_metric": args.primary_metric,
+        "graph_run_level_metrics_root": (
+            str(args.graph_run_level_metrics_root)
+            if args.graph_run_level_metrics_root is not None
+            else None
+        ),
         "benchmark_metrics": list(BENCHMARK_METRICS),
         "session_mapping": {"session_1": "OFF", "session_2": "ON"},
         "included_subjects": included_subjects,
-        "excluded_nodes": ["L Brain-Stem (relative)", "R Brain-Stem (relative)"],
+        "excluded_nodes": [
+            "L Brain-Stem (relative)",
+            "R Brain-Stem (relative)",
+            "L Cerebral White Matter (relative)",
+            "R Cerebral White Matter (relative)",
+        ],
         "dcm_input_root": TMP_DCM_ROOT,
         "analysis_outputs": {
             "effective_connectivity": dcm_results,

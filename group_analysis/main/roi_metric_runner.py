@@ -35,6 +35,9 @@ ALWAYS_EXCLUDED_ROI_PATTERNS = (
     "ventricular csf",
     "ventrical csf",
     "lateral ventricle",
+    "brain stem",
+    "brain-stem",
+    "cerebral white matter",
 )
 
 

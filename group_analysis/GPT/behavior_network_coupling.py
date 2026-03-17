@@ -14,6 +14,7 @@ from sklearn.cross_decomposition import PLSRegression
 from common_io import (
     ANATOMICAL_SYSTEM_ORDER,
     CIRCUIT_BASE_ROIS,
+    EXCLUDED_BASE_ROIS,
     TASK_BEHAVIOR_COLUMN_SPECS,
     aggregate_matrix_by_base_roi,
     base_roi_name,
@@ -134,7 +135,13 @@ def _build_dcm_features_from_raw(base_rois: list[str] | None = None) -> pd.DataF
     resolved_base_rois = (
         list(base_rois)
         if base_rois is not None
-        else sorted({base_roi_name(label) for label in labels})
+        else sorted(
+            {
+                base_roi_name(label)
+                for label in labels
+                if base_roi_name(label) not in EXCLUDED_BASE_ROIS
+            }
+        )
     )
     rows = []
     for subject in list_paired_dcm_subjects():
@@ -167,7 +174,13 @@ def _build_graph_features(
     resolved_base_rois = (
         list(base_rois)
         if base_rois is not None
-        else sorted(node_delta_df["base_roi"].dropna().unique().tolist())
+        else sorted(
+            [
+                base_roi
+                for base_roi in node_delta_df["base_roi"].dropna().unique().tolist()
+                if base_roi not in EXCLUDED_BASE_ROIS
+            ]
+        )
     )
     rows = []
     for subject, group in node_delta_df.groupby("subject", sort=True):

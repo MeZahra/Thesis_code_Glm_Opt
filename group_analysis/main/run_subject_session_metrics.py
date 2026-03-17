@@ -66,7 +66,7 @@ DEFAULT_METRICS = ",".join(
     ]
 )
 
-LABEL_RE = re.compile(r"^(sub-[^_]+)_ses-(\d+)$")
+LABEL_RE = re.compile(r"^(sub-[^_]+)_ses-(\d+)(?:_run-(\d+))?$")
 
 
 @dataclass
@@ -76,6 +76,7 @@ class SubjectSessionSplit:
     session: int
     runs: list[int]
     columns: np.ndarray
+    run: int | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -134,6 +135,11 @@ def parse_args() -> argparse.Namespace:
         "--allow-partial-runs",
         action="store_true",
         help="Include subject-session labels with only one run. Default requires run1 and run2.",
+    )
+    parser.add_argument(
+        "--preserve-runs",
+        action="store_true",
+        help="Write one split beta file per subject-session-run instead of concatenating runs.",
     )
     parser.add_argument(
         "--skip-connectivity",
@@ -209,11 +215,12 @@ def build_subject_session_splits(
     manifest_path: Path,
     n_trials_total: int,
     allow_partial_runs: bool,
+    preserve_runs: bool,
 ) -> list[SubjectSessionSplit]:
     manifest_df = pd.read_csv(manifest_path, sep="\t")
     needed = {"offset_start", "offset_end", "sub_tag", "ses", "run"}
     coverage = np.zeros(n_trials_total, dtype=np.int16)
-    store: dict[tuple[str, int], dict[str, list[int] | set[int]]] = {}
+    store: dict[tuple[str, ...], dict[str, list[int] | set[int]]] = {}
 
     for row in manifest_df.itertuples(index=False):
         start = int(row.offset_start)
@@ -222,7 +229,7 @@ def build_subject_session_splits(
         ses = int(row.ses)
         run = int(row.run)
 
-        key = (sub, ses)
+        key = (sub, str(ses), str(run)) if preserve_runs else (sub, str(ses))
         if key not in store:
             store[key] = {"cols": [], "runs": set()}
         run_cols = np.arange(start, end, dtype=np.int64)
@@ -231,14 +238,27 @@ def build_subject_session_splits(
         coverage[run_cols] += 1
 
     splits: list[SubjectSessionSplit] = []
-    for (sub, ses), payload in sorted(store.items(), key=lambda x: (x[0][0], x[0][1])):
+    for key, payload in sorted(
+        store.items(),
+        key=lambda item: (
+            item[0][0],
+            int(item[0][1]),
+            int(item[0][2]) if preserve_runs and len(item[0]) > 2 else 0,
+        ),
+    ):
+        sub = str(key[0])
+        ses = int(key[1])
+        run = int(key[2]) if preserve_runs and len(key) > 2 else None
         runs = sorted(list(payload["runs"]))  # type: ignore[arg-type]
-        if (not allow_partial_runs) and (set(runs) != {1, 2}):
+        if preserve_runs:
+            if (not allow_partial_runs) and (len(runs) != 1):
+                continue
+        elif (not allow_partial_runs) and (set(runs) != {1, 2}):
             continue
         cols = np.asarray(payload["cols"], dtype=np.int64)  # type: ignore[arg-type]
         if cols.size > 1 and np.any(cols[1:] < cols[:-1]):
             cols = np.sort(cols)
-        label = f"{sub}_ses-{ses}"
+        label = f"{sub}_ses-{ses}_run-{run}" if run is not None else f"{sub}_ses-{ses}"
         splits.append(
             SubjectSessionSplit(
                 label=label,
@@ -246,6 +266,7 @@ def build_subject_session_splits(
                 session=ses,
                 runs=runs,
                 columns=cols,
+                run=run,
             )
         )
     return splits
@@ -292,7 +313,12 @@ def write_split_files(
         # Optional traceability output. Skip by default to avoid writing files that are not
         # required by the ROI-edge stage.
         index_map = {split.label: split.columns for split in splits}
-        np.savez(data_dir / "selected_beta_trials_subject_session_column_indices.npz", **index_map)
+        map_name = (
+            "selected_beta_trials_subject_session_run_column_indices.npz"
+            if any(split.run is not None for split in splits)
+            else "selected_beta_trials_subject_session_column_indices.npz"
+        )
+        np.savez(data_dir / map_name, **index_map)
 
 
 def ensure_voxel_indices_npz(
@@ -422,6 +448,7 @@ def run_connectivity_pipeline(
     out_dir: Path,
     advanced_metrics: str,
     voxel_weight_img: Path | None,
+    beta_pattern: str,
 ) -> None:
     cmd = [
         sys.executable,
@@ -431,7 +458,7 @@ def run_connectivity_pipeline(
         "--data-dir",
         str(data_dir),
         "--beta-pattern",
-        "selected_beta_trials_sub-*_ses-*.npy",
+        str(beta_pattern),
         "--voxel-indices-path",
         str(voxel_indices_path),
         "--out-dir",
@@ -591,6 +618,7 @@ def main() -> None:
         manifest_path=manifest_path,
         n_trials_total=int(n_trials),
         allow_partial_runs=bool(args.allow_partial_runs),
+        preserve_runs=bool(args.preserve_runs),
     )
 
     split_df = pd.DataFrame(
@@ -657,9 +685,16 @@ def main() -> None:
             out_dir=roi_out_dir,
             advanced_metrics=args.advanced_metrics,
             voxel_weight_img=voxel_weight_img,
+            beta_pattern=(
+                "selected_beta_trials_sub-*_ses-*_run-*.npy"
+                if args.preserve_runs
+                else "selected_beta_trials_sub-*_ses-*.npy"
+            ),
         )
 
     do_session_average = bool(args.run_session_average and not args.skip_session_average)
+    if args.preserve_runs and do_session_average:
+        print("Run-preserving mode: session averages will pool all runs within each session.")
     if do_session_average:
         average_over_subjects_per_session(
             advanced_root=roi_out_dir / "advanced_metrics",
@@ -679,6 +714,7 @@ def main() -> None:
         "advanced_metrics": str(args.advanced_metrics),
         "voxel_weight_img": str(voxel_weight_img) if voxel_weight_img is not None else None,
         "allow_partial_runs": bool(args.allow_partial_runs),
+        "preserve_runs": bool(args.preserve_runs),
         "skip_connectivity": bool(args.skip_connectivity),
         "skip_session_average": bool(args.skip_session_average),
     }
