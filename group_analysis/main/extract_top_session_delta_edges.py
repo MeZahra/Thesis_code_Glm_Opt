@@ -147,6 +147,10 @@ def _edge_name(node_labels: list[str], i: int, j: int) -> str:
     return f"{node_labels[i]} -- {node_labels[j]}"
 
 
+def _display_edge_label(edge_label: str) -> str:
+    return edge_label.replace(" (relative)", "")
+
+
 def _rank_scores(delta_edges: np.ndarray, rank_by: str) -> np.ndarray:
     if rank_by == "mean_abs_delta":
         return np.mean(np.abs(delta_edges), axis=0)
@@ -256,7 +260,8 @@ def _plot_top_edge_heatmap(
         x_fontsize = 6
     else:
         x_fontsize = 5
-    ax.set_xticklabels(edge_labels, rotation=80, ha="right", fontsize=x_fontsize)
+    display_edge_labels = [_display_edge_label(label) for label in edge_labels]
+    ax.set_xticklabels(display_edge_labels, rotation=80, ha="right", fontsize=x_fontsize)
     ax.set_yticklabels(subject_labels, fontsize=10)
     ax.set_title(
         f"{metric} | {selection_label} edge deltas (Session2 - Session1)",

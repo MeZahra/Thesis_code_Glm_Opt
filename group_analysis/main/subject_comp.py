@@ -1350,31 +1350,6 @@ def _plot_subject_consecutive_trial_scatter(
 
     selected_subjects = [str(sub_tag) for sub_tag in paired_subjects]
 
-    # Use one common axis range across all selected subjects (both sessions)
-    # so visual comparisons are on the same scale.
-    global_chunks = []
-    for sub_tag in selected_subjects:
-        values_a = pooled.get((sub_tag, int(session_a)), np.array([], dtype=np.float64))
-        values_b = pooled.get((sub_tag, int(session_b)), np.array([], dtype=np.float64))
-        if values_a.size > 0:
-            global_chunks.append(values_a)
-        if values_b.size > 0:
-            global_chunks.append(values_b)
-    if len(global_chunks) > 0:
-        global_values = np.concatenate(global_chunks).astype(np.float64, copy=False)
-        global_values = global_values[np.isfinite(global_values)]
-    else:
-        global_values = np.array([], dtype=np.float64)
-
-    if global_values.size > 0:
-        gmin = float(np.min(global_values))
-        gmax = float(np.max(global_values))
-        grange = gmax - gmin
-        gpad = (0.08 * grange) if grange > 0 else max(1e-6, 0.08 * max(abs(gmin), 1.0))
-        global_lims = (gmin - gpad, gmax + gpad)
-    else:
-        global_lims = (-1.0, 1.0)
-
     os.makedirs(out_dir, exist_ok=True)
     output_paths = []
     for sub_tag in selected_subjects:
@@ -1386,9 +1361,7 @@ def _plot_subject_consecutive_trial_scatter(
         x_b = values_b[:-1]
         y_b = values_b[1:]
 
-        lims = global_lims
-
-        fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.8), sharex=True, sharey=True)
+        fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.8))
         session_specs = [
             (axes[0], x_a, y_a, int(session_a), "tab:blue"),
             (axes[1], x_b, y_b, int(session_b), "tab:red"),
@@ -1406,9 +1379,18 @@ def _plot_subject_consecutive_trial_scatter(
                     alpha=0.9,
                     edgecolors="none",
                 )
-            ax.plot(lims, lims, linestyle="--", color=color, linewidth=1.0, alpha=0.85)
-            ax.set_xlim(lims)
-            ax.set_ylim(lims)
+                x_limits = ax.get_xlim()
+                y_limits = ax.get_ylim()
+                diag_min = min(float(x_limits[0]), float(y_limits[0]))
+                diag_max = max(float(x_limits[1]), float(y_limits[1]))
+                ax.plot(
+                    [diag_min, diag_max],
+                    [diag_min, diag_max],
+                    linestyle="--",
+                    color=color,
+                    linewidth=1.0,
+                    alpha=0.85,
+                )
             ax.set_title(f"Session {ses} (n pairs={x_vals.size})")
             ax.set_xlabel("trial(i)")
             ax.set_ylabel("tria(i+1)")
