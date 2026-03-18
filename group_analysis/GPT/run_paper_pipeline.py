@@ -23,9 +23,9 @@ from common_io import (
 )
 from dcm_medication_analysis import run_dcm_medication_analysis
 from metric_benchmark import run_metric_benchmark
-from roi_graph_base_reorganization import (
-    DEFAULT_RUN_LEVEL_METRICS_ROOT,
-    run_base_roi_graph_reorganization,
+from roi_graph_runaveraged_analysis import (
+    RUN_LEVEL_ROOT as DEFAULT_RUN_LEVEL_METRICS_ROOT,
+    run_roi_graph_runaveraged as run_base_roi_graph_reorganization,
 )
 from supplementary_ksg_summary import run_supplementary_ksg_summary
 
@@ -166,8 +166,7 @@ def main() -> None:
     dcm_results = run_dcm_medication_analysis(effective_dir)
     graph_results = run_base_roi_graph_reorganization(
         graph_dir,
-        metric=args.primary_metric,
-        run_level_metrics_root=args.graph_run_level_metrics_root,
+        metrics_root=args.graph_run_level_metrics_root,
     )
     behavior_results = run_behavior_network_coupling(
         behavior_dir,
