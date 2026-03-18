@@ -6,14 +6,17 @@ from pathlib import Path
 import pandas as pd
 
 from behavior_network_coupling import _run_pls_analysis
-from common_io import TASK_BEHAVIOR_COLUMN_SPECS, ensure_dir, safe_slug, write_json
+from common_io import (
+    DEPENDENT_CONSECUTIVE_BEHAVIOR_COLS,
+    TASK_BEHAVIOR_COLUMN_SPECS,
+    behavior_subset_passes_dependency_rule,
+    ensure_dir,
+    safe_slug,
+    write_json,
+)
 
 
-LEGACY_BEHAVIOR_COLS = [
-    "behavior_vigor_delta",
-    "behavior_lag1_corr_delta",
-    "behavior_consistency_improvement_delta",
-]
+LEGACY_BEHAVIOR_COLS = list(DEPENDENT_CONSECUTIVE_BEHAVIOR_COLS)
 
 
 def parse_args() -> argparse.Namespace:
@@ -133,6 +136,8 @@ def run_family_level_model_exports(
     for rank, row in enumerate(selected_df.itertuples(index=False), start=1):
         feature_cols = _resolve_selected_columns(row.brain_set, brain_family_cols)
         behavior_cols = _resolve_selected_columns(row.behavior_set, behavior_group_cols)
+        if not behavior_subset_passes_dependency_rule(behavior_cols):
+            continue
         model_dir = ensure_dir(
             out_dir / f"{rank:02d}_{safe_slug(row.brain_set)}__{safe_slug(row.behavior_set)}"
         )

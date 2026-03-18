@@ -57,6 +57,11 @@ TASK_BEHAVIOR_COLUMN_SPECS = (
     {"index": 4, "label": "Vmax", "key": "task_vmax"},
     {"index": 5, "label": "Pmax", "key": "task_pmax"},
 )
+DEPENDENT_CONSECUTIVE_BEHAVIOR_COLS = (
+    "behavior_vigor_delta",
+    "behavior_lag1_corr_delta",
+    "behavior_consistency_improvement_delta",
+)
 RAW_TASK_BEHAVIOR_FILE_RE = re.compile(
     r"^PSPD(?P<subject>\d+)_ses_(?P<session>\d+)_run_(?P<run>\d+)\.npy$"
 )
@@ -76,6 +81,21 @@ def write_json(path: Path, payload: dict) -> None:
     ensure_dir(path.parent)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def count_dependent_consecutive_behavior_metrics(behavior_cols: Iterable[str]) -> int:
+    dependent = set(DEPENDENT_CONSECUTIVE_BEHAVIOR_COLS)
+    return sum(col in dependent for col in behavior_cols)
+
+
+def behavior_subset_passes_dependency_rule(
+    behavior_cols: Iterable[str],
+    max_dependent_consecutive_metrics: int = 1,
+) -> bool:
+    return (
+        count_dependent_consecutive_behavior_metrics(behavior_cols)
+        <= int(max_dependent_consecutive_metrics)
+    )
 
 
 def state_from_session(session: int) -> str:

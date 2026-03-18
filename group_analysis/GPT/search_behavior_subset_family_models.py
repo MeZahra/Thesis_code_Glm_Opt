@@ -9,14 +9,15 @@ import pandas as pd
 from scipy import stats
 from sklearn.cross_decomposition import PLSRegression
 
-from common_io import ensure_dir, write_json
+from common_io import (
+    DEPENDENT_CONSECUTIVE_BEHAVIOR_COLS,
+    behavior_subset_passes_dependency_rule,
+    ensure_dir,
+    write_json,
+)
 
 
-LEGACY_BEHAVIOR_COLS = [
-    "behavior_vigor_delta",
-    "behavior_lag1_corr_delta",
-    "behavior_consistency_improvement_delta",
-]
+LEGACY_BEHAVIOR_COLS = list(DEPENDENT_CONSECUTIVE_BEHAVIOR_COLS)
 
 TIMING_BEHAVIOR_COLS = [
     "task_1_pt_delta",
@@ -73,6 +74,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=2000,
         help="Number of Y-row permutations for the best brain family model per behavior subset.",
+    )
+    parser.add_argument(
+        "--max-dependent-consecutive-behavior-metrics",
+        type=int,
+        default=1,
+        help=(
+            "Maximum number of jointly included behavior metrics derived from the same "
+            "consecutive-trial summary family."
+        ),
     )
     return parser.parse_args()
 
@@ -150,10 +160,17 @@ def _iter_behavior_subsets(
     behavior_cols: list[str],
     min_size: int,
     max_size: int,
+    max_dependent_consecutive_behavior_metrics: int,
 ):
     upper = min(max_size, len(behavior_cols))
     for size in range(max(min_size, 1), upper + 1):
-        yield from combinations(behavior_cols, size)
+        for subset in combinations(behavior_cols, size):
+            if not behavior_subset_passes_dependency_rule(
+                subset,
+                max_dependent_consecutive_metrics=max_dependent_consecutive_behavior_metrics,
+            ):
+                continue
+            yield subset
 
 
 def _iter_brain_sets(group_map: dict[str, list[str]]):
@@ -193,6 +210,7 @@ def run_behavior_subset_family_search(
     min_behavior_subset_size: int,
     max_behavior_subset_size: int,
     n_permutations: int,
+    max_dependent_consecutive_behavior_metrics: int,
 ) -> dict:
     out_dir = ensure_dir(out_dir)
 
@@ -208,14 +226,26 @@ def run_behavior_subset_family_search(
 
     brain_group_map = _build_brain_family_columns(neural_df)
     brain_sets = list(_iter_brain_sets(brain_group_map))
+    all_behavior_subsets = [
+        subset
+        for subset in _iter_behavior_subsets(
+            available_behavior_cols,
+            min_size=min_behavior_subset_size,
+            max_size=max_behavior_subset_size,
+            max_dependent_consecutive_behavior_metrics=max_dependent_consecutive_behavior_metrics,
+        )
+    ]
+    max_subset_upper = min(max_behavior_subset_size, len(available_behavior_cols))
+    unconstrained_subset_count = int(
+        sum(
+            len(list(combinations(available_behavior_cols, size)))
+            for size in range(max(min_behavior_subset_size, 1), max_subset_upper + 1)
+        )
+    )
 
     observed_rows = []
     best_rows = []
-    for behavior_subset in _iter_behavior_subsets(
-        available_behavior_cols,
-        min_size=min_behavior_subset_size,
-        max_size=max_behavior_subset_size,
-    ):
+    for behavior_subset in all_behavior_subsets:
         behavior_cols = list(behavior_subset)
         subset_counts = _count_subset_membership(behavior_cols)
         subset_key = "|".join(behavior_cols)
@@ -305,6 +335,56 @@ def run_behavior_subset_family_search(
     permutation_path = out_dir / "best_brain_set_per_behavior_subset_permutation.csv"
     permutation_df.to_csv(permutation_path, index=False)
 
+    significant_subset_rows = []
+    for row in permutation_df[permutation_df["permutation_p_two_sided"] < 0.05].itertuples(index=False):
+        behavior_cols = row.behavior_subset.split("|")
+        for brain_set_name, neural_cols in brain_sets:
+            usable = merged.dropna(subset=neural_cols + behavior_cols).reset_index(drop=True)
+            if usable.empty:
+                continue
+            observed, pvalue = _pls_permutation_pvalue(
+                usable,
+                neural_cols=neural_cols,
+                behavior_cols=behavior_cols,
+                permutations=permutations,
+            )
+            significant_subset_rows.append(
+                {
+                    "behavior_subset": row.behavior_subset,
+                    "brain_set": brain_set_name,
+                    "n_behavior_features": len(behavior_cols),
+                    "n_brain_features": len(neural_cols),
+                    "n_subjects": int(usable.shape[0]),
+                    "observed_score_correlation": observed,
+                    "permutation_p_two_sided": pvalue,
+                }
+            )
+
+    significant_subset_df = (
+        pd.DataFrame(significant_subset_rows)
+        .sort_values(
+            ["behavior_subset", "permutation_p_two_sided", "observed_score_correlation"],
+            ascending=[True, True, False],
+        )
+        .reset_index(drop=True)
+    )
+    significant_subset_path = out_dir / "significant_subset_all_brain_families_permutation.csv"
+    significant_subset_df.to_csv(significant_subset_path, index=False)
+
+    category_recheck_df = pd.DataFrame(
+        columns=[
+            "behavior_subset",
+            "brain_set",
+            "n_behavior_features",
+            "n_brain_features",
+            "n_subjects",
+            "observed_score_correlation",
+            "permutation_p_two_sided",
+        ]
+    )
+    category_recheck_path = out_dir / "category_recheck_brain_family_permutation.csv"
+    category_recheck_df.to_csv(category_recheck_path, index=False)
+
     summary = {
         "analysis_dir": str(analysis_dir),
         "n_subjects": int(merged.shape[0]),
@@ -314,7 +394,14 @@ def run_behavior_subset_family_search(
         "brain_family_feature_counts": {key: len(value) for key, value in brain_group_map.items()},
         "n_brain_family_combinations": len(brain_sets),
         "min_behavior_subset_size": int(min_behavior_subset_size),
-        "max_behavior_subset_size": int(min(max_behavior_subset_size, len(available_behavior_cols))),
+        "max_behavior_subset_size": int(max_subset_upper),
+        "max_dependent_consecutive_behavior_metrics": int(
+            max_dependent_consecutive_behavior_metrics
+        ),
+        "n_behavior_subsets_before_dependency_filter": unconstrained_subset_count,
+        "n_behavior_subsets_skipped_dependency_filter": int(
+            unconstrained_subset_count - len(all_behavior_subsets)
+        ),
         "n_behavior_subsets_tested": int(best_df.shape[0]),
         "n_observed_models": int(observed_df.shape[0]),
         "n_permutations": int(n_permutations),
@@ -329,12 +416,15 @@ def run_behavior_subset_family_search(
         "note": (
             "Permutation p-values are computed only for the best brain family combination "
             "picked separately for each behavior subset. They remain exploratory because "
-            "brain-family selection is data-driven."
+            "brain-family selection is data-driven. Behavior subsets that jointly include "
+            "multiple consecutive-trial-derived metrics are excluded."
         ),
         "output_files": {
             "observed_all_models": str(observed_path),
             "best_brain_set_per_behavior_subset": str(best_observed_path),
             "best_brain_set_per_behavior_subset_permutation": str(permutation_path),
+            "significant_subset_all_brain_families_permutation": str(significant_subset_path),
+            "category_recheck_brain_family_permutation": str(category_recheck_path),
         },
     }
     write_json(out_dir / "summary.json", summary)
@@ -349,6 +439,9 @@ def main() -> None:
         min_behavior_subset_size=args.min_behavior_subset_size,
         max_behavior_subset_size=args.max_behavior_subset_size,
         n_permutations=args.n_permutations,
+        max_dependent_consecutive_behavior_metrics=(
+            args.max_dependent_consecutive_behavior_metrics
+        ),
     )
 
 
