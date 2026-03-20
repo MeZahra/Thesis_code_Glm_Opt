@@ -31,6 +31,10 @@ if str(GROUP_ANALYSIS_MAIN_DIR) not in sys.path:
 
 from roi_metrics import METRIC_REGISTRY, normalize_metric_list  # noqa: E402
 from roi_metric_runner import _metric_kwargs  # noqa: E402
+from analyze_pairwise_metric_separation import (  # noqa: E402
+    _laplacian_spectral_distance,
+    _signed_normalized_laplacian_spectrum,
+)
 
 
 LABEL_RE = re.compile(r"^(sub-[^_]+)_ses-(\d+)$")
@@ -163,7 +167,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--graph-distance",
-        choices=["frobenius"],
+        choices=["frobenius", "laplacian_spectral_distance_signed"],
         default="frobenius",
         help="Whole-graph distance used to compare subject/session matrices.",
     )
@@ -663,6 +667,13 @@ def _frobenius_distance(a: np.ndarray, b: np.ndarray) -> float:
 def _graph_distance(a: np.ndarray, b: np.ndarray, kind: str) -> float:
     if kind == "frobenius":
         return _frobenius_distance(a, b)
+    if kind == "laplacian_spectral_distance_signed":
+        return float(
+            _laplacian_spectral_distance(
+                _signed_normalized_laplacian_spectrum(_prepare_matrix(a)),
+                _signed_normalized_laplacian_spectrum(_prepare_matrix(b)),
+            )
+        )
     raise ValueError(f"Unsupported graph distance: {kind}")
 
 
@@ -762,13 +773,27 @@ def _pairwise_distance_matrix(
     labels = sorted(matrices_by_label.keys())
     display_labels = [f"{label_meta[label]['subject']}-ses{label_meta[label]['session']}" for label in labels]
     pairwise_matrix = np.zeros((len(labels), len(labels)), dtype=np.float64)
+    spectra_by_label: dict[str, np.ndarray] | None = None
+    if graph_distance == "laplacian_spectral_distance_signed":
+        spectra_by_label = {
+            label: _signed_normalized_laplacian_spectrum(_prepare_matrix(matrices_by_label[label]))
+            for label in labels
+        }
     rows: list[dict[str, Any]] = []
     for idx_a, label_a in enumerate(labels):
         meta_a = label_meta[label_a]
         for idx_b in range(idx_a + 1, len(labels)):
             label_b = labels[idx_b]
             meta_b = label_meta[label_b]
-            value = _graph_distance(matrices_by_label[label_a], matrices_by_label[label_b], kind=graph_distance)
+            if spectra_by_label is None:
+                value = _graph_distance(matrices_by_label[label_a], matrices_by_label[label_b], kind=graph_distance)
+            else:
+                value = float(
+                    _laplacian_spectral_distance(
+                        spectra_by_label[label_a],
+                        spectra_by_label[label_b],
+                    )
+                )
             pairwise_matrix[idx_a, idx_b] = value
             pairwise_matrix[idx_b, idx_a] = value
             pair_label = (

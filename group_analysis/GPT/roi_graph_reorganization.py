@@ -203,16 +203,56 @@ def _compute_group_pair_rows(
 
 
 def _plot_hub_reorganization(node_tests: pd.DataFrame, out_path: Path) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
+    def _format_pvalue(value: float) -> str:
+        if not np.isfinite(value):
+            return "NA"
+        if value < 1e-3:
+            return f"{value:.1e}"
+        return f"{value:.3f}"
+
+    fig, axes = plt.subplots(1, 2, figsize=(17, 6), constrained_layout=True)
     for ax, metric in zip(axes, ["node_strength_abs", "participation_coeff"]):
         metric_df = node_tests[node_tests["metric"] == metric].copy()
         metric_df["abs_mean_delta"] = metric_df["mean_delta"].abs()
         metric_df = metric_df.sort_values("abs_mean_delta", ascending=False).head(12)
-        ax.barh(metric_df["roi"], metric_df["mean_delta"], color="#4c78a8")
+        q_col = "q_fdr_within_metric"
+        p_col = "p_primary"
+        metric_df["is_primary_significant"] = metric_df[q_col].fillna(np.inf) < 0.05
+        colors = metric_df["is_primary_significant"].map(
+            {True: "#2c7fb8", False: "#bdbdbd"}
+        )
+        ax.barh(metric_df["roi"], metric_df["mean_delta"], color=colors)
         ax.axvline(0.0, color="black", linewidth=1)
         ax.set_title(metric.replace("_", " ").title())
         ax.set_xlabel("Mean ON - OFF")
         ax.invert_yaxis()
+
+        max_abs = max(float(metric_df["abs_mean_delta"].max()), 1e-6)
+        margin = max_abs * 0.65
+        xmin = min(float(metric_df["mean_delta"].min()), 0.0) - margin
+        xmax = max(float(metric_df["mean_delta"].max()), 0.0) + margin
+        ax.set_xlim(xmin, xmax)
+
+        for ypos, row in enumerate(metric_df.itertuples(index=False)):
+            annotation = f"p={_format_pvalue(getattr(row, p_col))}\nq={_format_pvalue(getattr(row, q_col))}"
+            delta = float(row.mean_delta)
+            text_offset = max_abs * 0.04
+            if delta >= 0.0:
+                text_x = delta + text_offset
+                ha = "left"
+            else:
+                text_x = delta - text_offset
+                ha = "right"
+            ax.text(
+                text_x,
+                ypos,
+                annotation,
+                va="center",
+                ha=ha,
+                fontsize=8,
+                color="#1f1f1f",
+            )
+
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
 
