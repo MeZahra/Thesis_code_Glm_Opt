@@ -59,6 +59,8 @@ DEFAULT_OUT_DIR = Path(
     "random_graph_distance_null_laplacian/mutual_information_ksg/"
     "permutation_test"
 )
+DEFAULT_CONNECTIVITY_METRIC = "mutual_information_ksg"
+DEFAULT_COMPARISON_METRIC = "laplacian_spectral_distance_signed"
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +142,71 @@ def run_exhaustive_permutations(df: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
 
     perm_df = pd.DataFrame(perm_rows)
     return observed, perm_df
+
+
+def _load_pairwise_distances(
+    csv_path: Path,
+    connectivity_metric: str,
+    comparison_metric: str,
+) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+
+    if "distance" in df.columns:
+        required = {
+            "subject_a",
+            "subject_b",
+            "session_a",
+            "session_b",
+            "same_subject",
+            "pair_label",
+            "distance",
+        }
+        missing = sorted(required.difference(df.columns))
+        if missing:
+            raise ValueError(f"{csv_path} is missing required columns: {missing}")
+        return df.copy()
+
+    required = {
+        "connectivity_metric",
+        "comparison_metric",
+        "subject_a",
+        "subject_b",
+        "session_a",
+        "session_b",
+        "same_subject",
+        "pair_label",
+        "raw_score",
+    }
+    missing = sorted(required.difference(df.columns))
+    if missing:
+        raise ValueError(f"{csv_path} is missing required columns: {missing}")
+
+    filtered = df.loc[
+        (df["connectivity_metric"].astype(str) == str(connectivity_metric))
+        & (df["comparison_metric"].astype(str) == str(comparison_metric))
+    ].copy()
+    if filtered.empty:
+        raise ValueError(
+            f"No rows found in {csv_path} for connectivity_metric={connectivity_metric!r} "
+            f"and comparison_metric={comparison_metric!r}."
+        )
+
+    filtered = filtered.rename(columns={"raw_score": "distance"})
+    keep_cols = [
+        "label_a",
+        "label_b",
+        "subject_a",
+        "subject_b",
+        "session_a",
+        "session_b",
+        "state_a",
+        "state_b",
+        "same_subject",
+        "pair_label",
+        "distance",
+    ]
+    existing_cols = [col for col in keep_cols if col in filtered.columns]
+    return filtered.loc[:, existing_cols].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +478,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--pairwise-csv", type=Path, default=DEFAULT_PAIRWISE_CSV)
     p.add_argument("--out-dir",      type=Path, default=DEFAULT_OUT_DIR)
     p.add_argument("--metric-label", default="Mutual Information KSG")
+    p.add_argument("--connectivity-metric", default=DEFAULT_CONNECTIVITY_METRIC)
+    p.add_argument("--comparison-metric", default=DEFAULT_COMPARISON_METRIC)
     return p.parse_args()
 
 
@@ -421,7 +490,11 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading pairwise distances from:\n  {csv_path}")
-    df = pd.read_csv(csv_path)
+    df = _load_pairwise_distances(
+        csv_path=csv_path,
+        connectivity_metric=args.connectivity_metric,
+        comparison_metric=args.comparison_metric,
+    )
     n_subjects = df["subject_a"].nunique()
     n_perms = 2 ** n_subjects
     print(f"Subjects: {n_subjects}  →  {n_perms:,} exhaustive permutations")
