@@ -29,6 +29,15 @@ DEFAULT_OUT = "results/ablation/two_networks_overlay_sub9_ses1_thr90.html"
 DEFAULT_CUT_COORDS = [0.0, -20.0, 52.0]
 
 
+def _infer_map_label(path_str: str, fallback: str) -> str:
+    name = Path(path_str).name.lower()
+    if "ses1" in name:
+        return "Medication off (ses1)"
+    if "ses2" in name:
+        return "Medication on (ses2)"
+    return "All states"
+
+
 def _label_cmap() -> ListedColormap:
     return ListedColormap(
         [
@@ -153,6 +162,9 @@ def _save_paper_figure(
     out_png: Path | None,
     out_pdf: Path | None,
     n_cuts: int,
+    map_1_label: str,
+    map_2_label: str,
+    overlap_label: str,
 ) -> None:
     if out_png is None and out_pdf is None:
         return
@@ -190,11 +202,13 @@ def _save_paper_figure(
             annotate=True,
             colorbar=False,
         )
+        # Draw overlap first so session/state contours remain visible on top,
+        # especially when one map is fully contained in the other.
         display.add_contours(
-            map_1_binary_img,
+            overlap_img,
             levels=[0.5],
-            colors=["#db2d2d"],
-            linewidths=1.6,
+            colors=["#8c109c"],
+            linewidths=1.2,
         )
         display.add_contours(
             map_2_binary_img,
@@ -203,17 +217,17 @@ def _save_paper_figure(
             linewidths=1.6,
         )
         display.add_contours(
-            overlap_img,
+            map_1_binary_img,
             levels=[0.5],
-            colors=["#8c109c"],
-            linewidths=2.0,
+            colors=["#db2d2d"],
+            linewidths=1.6,
         )
         ax.set_title(title, fontsize=12, pad=10)
 
     legend_handles = [
-        Line2D([0], [0], color="#db2d2d", lw=2.2, label="Map 1"),
-        Line2D([0], [0], color="#2b6ac5", lw=2.2, label="Map 2"),
-        Line2D([0], [0], color="#8c109c", lw=2.4, label="Overlap"),
+        Line2D([0], [0], color="#db2d2d", lw=2.2, label=map_1_label),
+        Line2D([0], [0], color="#2b6ac5", lw=2.2, label=map_2_label),
+        Line2D([0], [0], color="#8c109c", lw=2.4, label=overlap_label),
     ]
     fig.legend(
         handles=legend_handles,
@@ -278,6 +292,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=7,
         help="Number of slices per plane in the static paper figure.",
     )
+    parser.add_argument(
+        "--map-1-label",
+        default=None,
+        help="Legend/title label for the first map.",
+    )
+    parser.add_argument(
+        "--map-2-label",
+        default=None,
+        help="Legend/title label for the second map.",
+    )
+    parser.add_argument(
+        "--overlap-label",
+        default="Overlap",
+        help="Legend/title label for overlapping voxels.",
+    )
     return parser
 
 
@@ -297,6 +326,9 @@ def main() -> None:
     )
     out_paper_png_path = Path(args.out_paper_png) if args.out_paper_png is not None else None
     out_paper_pdf_path = Path(args.out_paper_pdf) if args.out_paper_pdf is not None else None
+    map_1_label = args.map_1_label or _infer_map_label(args.map_1, "Map 1")
+    map_2_label = args.map_2_label or _infer_map_label(args.map_2, "Map 2")
+    overlap_label = args.overlap_label
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_map_1_path.parent.mkdir(parents=True, exist_ok=True)
     out_map_2_path.parent.mkdir(parents=True, exist_ok=True)
@@ -337,9 +369,7 @@ def main() -> None:
     )
     cut_coords = _resolve_cut_coords(map_2_binary_img, args.cut_coords)
 
-    title = (
-        "Red: map1 | Blue: map2 (postcentral-boosted) | Purple: overlap"
-    )
+    title = f"Red: {map_1_label} | Blue: {map_2_label} | Purple: {overlap_label}"
     view = plotting.view_img(
         combined_img,
         bg_img=anat_img,
@@ -361,7 +391,7 @@ def main() -> None:
         symmetric_cmap=False,
         cmap="Reds",
         colorbar=True,
-        title="Map 1",
+        title=map_1_label,
     )
     map_1_view.save_as_html(str(out_map_1_path))
     map_2_view = plotting.view_img(
@@ -373,7 +403,7 @@ def main() -> None:
         symmetric_cmap=False,
         cmap="Blues",
         colorbar=True,
-        title="Map 2 (postcentral-boosted for display)",
+        title=map_2_label,
     )
     map_2_view.save_as_html(str(out_map_2_path))
     _save_paper_figure(
@@ -384,6 +414,9 @@ def main() -> None:
         out_png=out_paper_png_path,
         out_pdf=out_paper_pdf_path,
         n_cuts=args.paper_slices,
+        map_1_label=map_1_label,
+        map_2_label=map_2_label,
+        overlap_label=overlap_label,
     )
     print(f"Saved HTML viewer: {out_path}")
     print(f"Saved map 1 HTML viewer: {out_map_1_path}")
