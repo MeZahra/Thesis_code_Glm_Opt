@@ -21,6 +21,7 @@ DEFAULT_MAP = (
 DEFAULT_ANAT = "/Data/zahra/anatomy_masks/MNI152_T1_2mm_brain.nii.gz"
 DEFAULT_OUT_PNG = "results/ablation/map1_multiplane_contour_all_regions.png"
 DEFAULT_OUT_PDF = "results/ablation/map1_multiplane_contour_all_regions.pdf"
+DEFAULT_OUT_EPS = "results/ablation/map1_multiplane_contour_all_regions.eps"
 
 
 def _slice_coord_from_index(
@@ -86,18 +87,13 @@ def _cover_all_components_cut_coords(
     return coords
 
 
-def _save_figure(
+def _build_figure(
     roi_img,
     anat_img,
-    out_png: Path | None,
-    out_pdf: Path | None,
+    cut_coords: dict[str, list[float]],
     alpha: float,
     outline_width: float,
-) -> dict[str, list[float]]:
-    if out_png is None and out_pdf is None:
-        raise ValueError("At least one output path must be provided.")
-
-    cut_coords = _cover_all_components_cut_coords(roi_img)
+):
     max_cuts = max(len(cuts) for cuts in cut_coords.values())
     fig_width = max(8.5, 2.35 * max_cuts)
     fig, axes = plt.subplots(3, 1, figsize=(fig_width, 7.9), facecolor="white")
@@ -132,14 +128,64 @@ def _save_figure(
             linewidths=outline_width,
         )
 
-    for out_path in (out_png, out_pdf):
-        if out_path is None:
-            continue
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path, dpi=300, bbox_inches="tight", facecolor="white")
-        print(f"Saved paper figure: {out_path}")
+    return fig
 
-    plt.close(fig)
+
+def _anat_with_white_panel_background(anat_img):
+    anat_data = anat_img.get_fdata().astype("float32")
+    positive_mask = anat_data > 0
+    if not np.any(positive_mask):
+        return anat_img
+
+    white_bg_data = anat_data.copy()
+    white_bg_data[~positive_mask] = float(np.max(anat_data[positive_mask]))
+    return image.new_img_like(anat_img, white_bg_data)
+
+
+def _save_figure(
+    roi_img,
+    anat_img,
+    out_png: Path | None,
+    out_pdf: Path | None,
+    out_eps: Path | None,
+    alpha: float,
+    outline_width: float,
+) -> dict[str, list[float]]:
+    if out_png is None and out_pdf is None and out_eps is None:
+        raise ValueError("At least one output path must be provided.")
+
+    cut_coords = _cover_all_components_cut_coords(roi_img)
+    standard_paths = [path for path in (out_png, out_pdf) if path is not None]
+    if standard_paths:
+        fig = _build_figure(
+            roi_img=roi_img,
+            anat_img=anat_img,
+            cut_coords=cut_coords,
+            alpha=alpha,
+            outline_width=outline_width,
+        )
+        for out_path in standard_paths:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(out_path, dpi=300, bbox_inches="tight", facecolor="white")
+            print(f"Saved paper figure: {out_path}")
+        plt.close(fig)
+
+    if out_eps is not None:
+        # EPS does not support alpha transparency; export contours over anatomy
+        # so the result stays vector-friendly and readable for manuscripts.
+        eps_anat_img = _anat_with_white_panel_background(anat_img)
+        fig = _build_figure(
+            roi_img=roi_img,
+            anat_img=eps_anat_img,
+            cut_coords=cut_coords,
+            alpha=0.0,
+            outline_width=outline_width,
+        )
+        out_eps.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_eps, format="eps", bbox_inches="tight", facecolor="white")
+        print(f"Saved paper figure: {out_eps}")
+        plt.close(fig)
+
     return cut_coords
 
 
@@ -151,6 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--anat", default=DEFAULT_ANAT, help="Path to the anatomical NIfTI.")
     parser.add_argument("--out-png", default=DEFAULT_OUT_PNG, help="Output PNG path.")
     parser.add_argument("--out-pdf", default=DEFAULT_OUT_PDF, help="Output PDF path.")
+    parser.add_argument("--out-eps", default=DEFAULT_OUT_EPS, help="Output EPS path.")
     parser.add_argument(
         "--alpha",
         type=float,
@@ -184,6 +231,7 @@ def main() -> None:
         anat_img=anat_img,
         out_png=Path(args.out_png) if args.out_png else None,
         out_pdf=Path(args.out_pdf) if args.out_pdf else None,
+        out_eps=Path(args.out_eps) if args.out_eps else None,
         alpha=args.alpha,
         outline_width=args.outline_width,
     )
