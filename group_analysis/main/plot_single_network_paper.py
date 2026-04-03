@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import argparse
+from io import BytesIO
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import ListedColormap
-from nilearn import image, plotting
+from nilearn import datasets, image, plotting
 from scipy import ndimage
 
 
@@ -142,6 +143,23 @@ def _anat_with_white_panel_background(anat_img):
     return image.new_img_like(anat_img, white_bg_data)
 
 
+def _save_eps_from_rendered_figure(fig, out_eps: Path, dpi: int = 300) -> None:
+    png_buffer = BytesIO()
+    fig.savefig(png_buffer, format="png", dpi=dpi, bbox_inches="tight", facecolor="white")
+    png_buffer.seek(0)
+    raster = plt.imread(png_buffer)
+    png_buffer.close()
+
+    height, width = raster.shape[:2]
+    eps_fig = plt.figure(figsize=(width / dpi, height / dpi), dpi=dpi, facecolor="white")
+    eps_ax = eps_fig.add_axes([0.0, 0.0, 1.0, 1.0])
+    eps_ax.imshow(raster, interpolation="nearest")
+    eps_ax.axis("off")
+    out_eps.parent.mkdir(parents=True, exist_ok=True)
+    eps_fig.savefig(out_eps, format="eps", dpi=dpi, bbox_inches="tight", facecolor="white")
+    plt.close(eps_fig)
+
+
 def _save_figure(
     roi_img,
     anat_img,
@@ -171,18 +189,14 @@ def _save_figure(
         plt.close(fig)
 
     if out_eps is not None:
-        # EPS does not support alpha transparency; export contours over anatomy
-        # so the result stays vector-friendly and readable for manuscripts.
-        eps_anat_img = _anat_with_white_panel_background(anat_img)
         fig = _build_figure(
             roi_img=roi_img,
-            anat_img=eps_anat_img,
+            anat_img=anat_img,
             cut_coords=cut_coords,
-            alpha=0.0,
+            alpha=alpha,
             outline_width=outline_width,
         )
-        out_eps.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_eps, format="eps", bbox_inches="tight", facecolor="white")
+        _save_eps_from_rendered_figure(fig, out_eps)
         print(f"Saved paper figure: {out_eps}")
         plt.close(fig)
 
@@ -217,6 +231,16 @@ def main() -> None:
     args = build_parser().parse_args()
 
     anat_img = image.load_img(args.anat)
+    paper_anat_img = anat_img
+    if Path(args.anat).name == "MNI152_T1_2mm_brain.nii.gz":
+        full_mni_img = datasets.load_mni152_template(resolution=2)
+        paper_anat_img = image.resample_to_img(
+            full_mni_img,
+            anat_img,
+            interpolation="continuous",
+            force_resample=True,
+            copy_header=True,
+        )
     map_img = image.resample_to_img(
         image.load_img(args.map),
         anat_img,
@@ -228,7 +252,7 @@ def main() -> None:
     roi_img = image.new_img_like(anat_img, roi_img.get_fdata().astype("float32"))
     cut_coords = _save_figure(
         roi_img=roi_img,
-        anat_img=anat_img,
+        anat_img=paper_anat_img,
         out_png=Path(args.out_png) if args.out_png else None,
         out_pdf=Path(args.out_pdf) if args.out_pdf else None,
         out_eps=Path(args.out_eps) if args.out_eps else None,

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from io import BytesIO
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -29,13 +30,30 @@ DEFAULT_OUT = "results/ablation/two_networks_overlay_sub9_ses1_thr90.html"
 DEFAULT_CUT_COORDS = [0.0, -20.0, 52.0]
 
 
-def _infer_map_label(path_str: str, fallback: str) -> str:
-    name = Path(path_str).name.lower()
-    if "ses1" in name:
-        return "Medication off (ses1)"
-    if "ses2" in name:
-        return "Medication on (ses2)"
-    return "All states"
+def _infer_map_labels(map_1_path: str, map_2_path: str) -> tuple[str, str]:
+    name_1 = Path(map_1_path).name.lower()
+    name_2 = Path(map_2_path).name.lower()
+
+    def _condition_label(name: str) -> str | None:
+        if "all_states" in name or "allstates" in name:
+            return "All states"
+        if "ses1" in name:
+            return "Medication off (ses1)"
+        if "ses2" in name:
+            return "Medication on (ses2)"
+        return None
+
+    if "postcentral_boosted" in name_1 and "postcentral_boosted" not in name_2:
+        return "Postcentral-boosted map", "Reference map"
+    if "postcentral_boosted" in name_2 and "postcentral_boosted" not in name_1:
+        return "Reference map", "Postcentral-boosted map"
+
+    label_1 = _condition_label(name_1)
+    label_2 = _condition_label(name_2)
+    if label_1 is not None and label_2 is not None and label_1 != label_2:
+        return label_1, label_2
+
+    return "Map 1", "Map 2"
 
 
 def _label_cmap() -> ListedColormap:
@@ -44,7 +62,7 @@ def _label_cmap() -> ListedColormap:
             (0.0, 0.0, 0.0, 0.0),      # background
             (0.86, 0.18, 0.18, 1.0),   # map 1 only (red)
             (0.17, 0.42, 0.77, 1.0),   # map 2 only (blue)
-            (0.55, 0.00, 0.55, 1.0),   # overlap (purple)
+            (0.55, 0.00, 0.55, 1.0),   # overlap (magenta)
         ]
     )
 
@@ -154,6 +172,17 @@ def _paper_cut_coords(
     return coords
 
 
+def _anat_with_white_panel_background(anat_img: nib.Nifti1Image) -> nib.Nifti1Image:
+    anat_data = anat_img.get_fdata().astype("float32")
+    positive_mask = anat_data > 0
+    if not np.any(positive_mask):
+        return anat_img
+
+    white_bg_data = anat_data.copy()
+    white_bg_data[~positive_mask] = float(np.max(anat_data[positive_mask]))
+    return image.new_img_like(anat_img, white_bg_data)
+
+
 def _save_paper_figure(
     combined_img: nib.Nifti1Image,
     map_1_binary_img: nib.Nifti1Image,
@@ -161,93 +190,199 @@ def _save_paper_figure(
     anat_img: nib.Nifti1Image,
     out_png: Path | None,
     out_pdf: Path | None,
+    out_eps: Path | None,
     n_cuts: int,
     map_1_label: str,
     map_2_label: str,
     overlap_label: str,
 ) -> None:
-    if out_png is None and out_pdf is None:
+    if out_png is None and out_pdf is None and out_eps is None:
         return
 
     cut_coords = _paper_cut_coords(combined_img, n_cuts=n_cuts)
     overlap_img = image.math_img("1.0 * (img == 3)", img=combined_img)
     fig_width = max(13.0, 1.85 * n_cuts)
-    fig, axes = plt.subplots(3, 1, figsize=(fig_width, 9.5), facecolor="white")
-    plt.subplots_adjust(left=0.03, right=0.99, top=0.95, bottom=0.09, hspace=0.18)
+    panel_specs = [("x", "Sagittal sections"), ("y", "Coronal sections"), ("z", "Axial sections")]
 
-    panel_specs = [
-        ("x", "Sagittal sections"),
-        ("y", "Coronal sections"),
-        ("z", "Axial sections"),
-    ]
+    def _render_figure(
+        out_path: Path,
+        *,
+        overlap_fill_alpha: float,
+        overlap_linewidth: float,
+        outline_linewidth: float,
+    ) -> None:
+        fig, axes = plt.subplots(3, 1, figsize=(fig_width, 9.1), facecolor="white")
+        plt.subplots_adjust(left=0.03, right=0.99, top=0.99, bottom=0.09, hspace=0.06)
 
-    for ax, (display_mode, title) in zip(axes, panel_specs):
-        display = plotting.plot_roi(
-            overlap_img,
-            bg_img=anat_img,
-            axes=ax,
-            display_mode=display_mode,
-            cut_coords=cut_coords[display_mode],
-            cmap=ListedColormap(
-                [
-                    (0.0, 0.0, 0.0, 0.0),
-                    (0.55, 0.00, 0.55, 1.0),
-                ]
-            ),
-            threshold=0.5,
-            alpha=0.85,
-            black_bg=False,
-            dim=-0.2,
-            draw_cross=False,
-            annotate=True,
-            colorbar=False,
-        )
-        # Draw overlap first so session/state contours remain visible on top,
-        # especially when one map is fully contained in the other.
-        display.add_contours(
-            overlap_img,
-            levels=[0.5],
-            colors=["#8c109c"],
-            linewidths=1.2,
-        )
-        display.add_contours(
-            map_2_binary_img,
-            levels=[0.5],
-            colors=["#2b6ac5"],
-            linewidths=1.6,
-        )
-        display.add_contours(
-            map_1_binary_img,
-            levels=[0.5],
-            colors=["#db2d2d"],
-            linewidths=1.6,
-        )
-        ax.set_title(title, fontsize=12, pad=10)
+        for ax, (display_mode, _title) in zip(axes, panel_specs):
+            display = plotting.plot_roi(
+                overlap_img,
+                bg_img=anat_img,
+                axes=ax,
+                display_mode=display_mode,
+                cut_coords=cut_coords[display_mode],
+                cmap=ListedColormap(
+                    [
+                        (0.0, 0.0, 0.0, 0.0),
+                        (0.55, 0.00, 0.55, 1.0),
+                    ]
+                ),
+                threshold=0.5,
+                alpha=overlap_fill_alpha,
+                black_bg=False,
+                dim=0.0,
+                draw_cross=False,
+                annotate=False,
+                colorbar=False,
+            )
+            # Draw overlap first so session/state contours remain visible on top,
+            # especially when one map is fully contained in the other.
+            display.add_contours(
+                overlap_img,
+                levels=[0.5],
+                colors=["#8c109c"],
+                linewidths=overlap_linewidth,
+            )
+            display.add_contours(
+                map_2_binary_img,
+                levels=[0.5],
+                colors=["#2b6ac5"],
+                linewidths=outline_linewidth,
+            )
+            display.add_contours(
+                map_1_binary_img,
+                levels=[0.5],
+                colors=["#db2d2d"],
+                linewidths=outline_linewidth,
+            )
 
-    legend_handles = [
-        Line2D([0], [0], color="#db2d2d", lw=2.2, label=map_1_label),
-        Line2D([0], [0], color="#2b6ac5", lw=2.2, label=map_2_label),
-        Line2D([0], [0], color="#8c109c", lw=2.4, label=overlap_label),
-    ]
-    fig.legend(
-        handles=legend_handles,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.015),
-        ncol=3,
-        frameon=False,
-        fontsize=11,
-        handlelength=1.6,
-        columnspacing=2.5,
-    )
+        legend_handles = [
+            Line2D([0], [0], color="#db2d2d", lw=2.2, label=f"{map_1_label} (red)"),
+            Line2D([0], [0], color="#2b6ac5", lw=2.2, label=f"{map_2_label} (blue)"),
+            Line2D([0], [0], color="#8c109c", lw=2.4, label=f"{overlap_label} (magenta)"),
+        ]
+        fig.legend(
+            handles=legend_handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.02),
+            ncol=3,
+            frameon=False,
+            fontsize=11,
+            handlelength=1.6,
+            columnspacing=2.0,
+        )
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        save_kwargs = {"bbox_inches": "tight", "facecolor": "white"}
+        if out_path.suffix.lower() == ".eps":
+            save_kwargs["format"] = "eps"
+        else:
+            save_kwargs["dpi"] = 300
+        fig.savefig(out_path, **save_kwargs)
+        print(f"Saved paper figure: {out_path}")
+        plt.close(fig)
+
+    def _save_eps_from_rendered_figure(
+        *,
+        out_path: Path,
+        overlap_fill_alpha: float,
+        overlap_linewidth: float,
+        outline_linewidth: float,
+    ) -> None:
+        eps_anat_img = _anat_with_white_panel_background(anat_img)
+        fig, axes = plt.subplots(3, 1, figsize=(fig_width, 9.1), facecolor="white")
+        plt.subplots_adjust(left=0.03, right=0.99, top=0.99, bottom=0.09, hspace=0.06)
+
+        for ax, (display_mode, _title) in zip(axes, panel_specs):
+            display = plotting.plot_roi(
+                overlap_img,
+                bg_img=eps_anat_img,
+                axes=ax,
+                display_mode=display_mode,
+                cut_coords=cut_coords[display_mode],
+                cmap=ListedColormap(
+                    [
+                        (0.0, 0.0, 0.0, 0.0),
+                        (0.55, 0.00, 0.55, 1.0),
+                    ]
+                ),
+                threshold=0.5,
+                alpha=overlap_fill_alpha,
+                black_bg=False,
+                dim=0.0,
+                draw_cross=False,
+                annotate=False,
+                colorbar=False,
+            )
+            display.add_contours(
+                overlap_img,
+                levels=[0.5],
+                colors=["#8c109c"],
+                linewidths=overlap_linewidth,
+            )
+            display.add_contours(
+                map_2_binary_img,
+                levels=[0.5],
+                colors=["#2b6ac5"],
+                linewidths=outline_linewidth,
+            )
+            display.add_contours(
+                map_1_binary_img,
+                levels=[0.5],
+                colors=["#db2d2d"],
+                linewidths=outline_linewidth,
+            )
+
+        legend_handles = [
+            Line2D([0], [0], color="#db2d2d", lw=2.2, label=f"{map_1_label} (red)"),
+            Line2D([0], [0], color="#2b6ac5", lw=2.2, label=f"{map_2_label} (blue)"),
+            Line2D([0], [0], color="#8c109c", lw=2.4, label=f"{overlap_label} (magenta)"),
+        ]
+        fig.legend(
+            handles=legend_handles,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.02),
+            ncol=3,
+            frameon=False,
+            fontsize=11,
+            handlelength=1.6,
+            columnspacing=2.0,
+        )
+
+        png_buffer = BytesIO()
+        fig.savefig(png_buffer, format="png", dpi=300, bbox_inches="tight", facecolor="white")
+        png_buffer.seek(0)
+        raster = plt.imread(png_buffer)
+        png_buffer.close()
+        plt.close(fig)
+
+        height, width = raster.shape[:2]
+        eps_fig = plt.figure(figsize=(width / 300.0, height / 300.0), dpi=300, facecolor="white")
+        eps_ax = eps_fig.add_axes([0.0, 0.0, 1.0, 1.0])
+        eps_ax.imshow(raster, interpolation="nearest")
+        eps_ax.axis("off")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        eps_fig.savefig(out_path, format="eps", dpi=300, bbox_inches="tight", facecolor="white")
+        print(f"Saved paper figure: {out_path}")
+        plt.close(eps_fig)
 
     for out_path in (out_png, out_pdf):
         if out_path is None:
             continue
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path, dpi=300, bbox_inches="tight", facecolor="white")
-        print(f"Saved paper figure: {out_path}")
+        _render_figure(
+            out_path,
+            overlap_fill_alpha=0.0,
+            overlap_linewidth=1.25,
+            outline_linewidth=1.6,
+        )
 
-    plt.close(fig)
+    if out_eps is not None:
+        _save_eps_from_rendered_figure(
+            out_path=out_eps,
+            overlap_fill_alpha=0.0,
+            overlap_linewidth=1.35,
+            outline_linewidth=1.7,
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -285,6 +420,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--out-paper-pdf",
         default=None,
         help="Optional output PDF path for a paper-ready static figure.",
+    )
+    parser.add_argument(
+        "--out-paper-eps",
+        default=None,
+        help="Optional output EPS path for a paper-ready static figure.",
     )
     parser.add_argument(
         "--paper-slices",
@@ -326,8 +466,10 @@ def main() -> None:
     )
     out_paper_png_path = Path(args.out_paper_png) if args.out_paper_png is not None else None
     out_paper_pdf_path = Path(args.out_paper_pdf) if args.out_paper_pdf is not None else None
-    map_1_label = args.map_1_label or _infer_map_label(args.map_1, "Map 1")
-    map_2_label = args.map_2_label or _infer_map_label(args.map_2, "Map 2")
+    out_paper_eps_path = Path(args.out_paper_eps) if args.out_paper_eps is not None else None
+    inferred_map_1_label, inferred_map_2_label = _infer_map_labels(args.map_1, args.map_2)
+    map_1_label = args.map_1_label or inferred_map_1_label
+    map_2_label = args.map_2_label or inferred_map_2_label
     overlap_label = args.overlap_label
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_map_1_path.parent.mkdir(parents=True, exist_ok=True)
@@ -336,8 +478,20 @@ def main() -> None:
         out_paper_png_path.parent.mkdir(parents=True, exist_ok=True)
     if out_paper_pdf_path is not None:
         out_paper_pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_paper_eps_path is not None:
+        out_paper_eps_path.parent.mkdir(parents=True, exist_ok=True)
 
     anat_img = image.load_img(args.anat)
+    paper_anat_img = anat_img
+    if Path(args.anat).name == "MNI152_T1_2mm_brain.nii.gz":
+        full_mni_img = datasets.load_mni152_template(resolution=2)
+        paper_anat_img = image.resample_to_img(
+            full_mni_img,
+            anat_img,
+            interpolation="continuous",
+            force_resample=True,
+            copy_header=True,
+        )
     map_1_img = image.resample_to_img(
         image.load_img(args.map_1),
         anat_img,
@@ -369,7 +523,7 @@ def main() -> None:
     )
     cut_coords = _resolve_cut_coords(map_2_binary_img, args.cut_coords)
 
-    title = f"Red: {map_1_label} | Blue: {map_2_label} | Purple: {overlap_label}"
+    title = f"Red: {map_1_label} | Blue: {map_2_label} | Magenta: {overlap_label}"
     view = plotting.view_img(
         combined_img,
         bg_img=anat_img,
@@ -410,9 +564,10 @@ def main() -> None:
         combined_img=combined_img,
         map_1_binary_img=map_1_binary_img,
         map_2_binary_img=map_2_binary_img,
-        anat_img=anat_img,
+        anat_img=paper_anat_img,
         out_png=out_paper_png_path,
         out_pdf=out_paper_pdf_path,
+        out_eps=out_paper_eps_path,
         n_cuts=args.paper_slices,
         map_1_label=map_1_label,
         map_2_label=map_2_label,
