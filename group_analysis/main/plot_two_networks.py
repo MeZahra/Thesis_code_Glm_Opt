@@ -183,6 +183,43 @@ def _anat_with_white_panel_background(anat_img: nib.Nifti1Image) -> nib.Nifti1Im
     return image.new_img_like(anat_img, white_bg_data)
 
 
+def _paper_layout(anat_img: nib.Nifti1Image, n_cuts: int) -> dict[str, object]:
+    left = 0.02
+    right = 0.995
+    top = 0.99
+    bottom = 0.085
+    slice_width = 2.05
+    legend_height = 0.65
+    plane_axes = {
+        "x": (1, 2),  # sagittal: y by z
+        "y": (0, 2),  # coronal: x by z
+        "z": (0, 1),  # axial: x by y
+    }
+    voxel_sizes = nib.affines.voxel_sizes(anat_img.affine)[:3]
+    shape = anat_img.shape[:3]
+    height_ratios: list[float] = []
+    for display_mode in ("x", "y", "z"):
+        width_axis, height_axis = plane_axes[display_mode]
+        plane_width = float(shape[width_axis] * voxel_sizes[width_axis])
+        plane_height = float(shape[height_axis] * voxel_sizes[height_axis])
+        height_ratios.append(max(plane_height / plane_width, 0.6))
+
+    fig_width = max(13.0, n_cuts * slice_width / (right - left))
+    row_content_height = sum(slice_width * ratio for ratio in height_ratios)
+    fig_height = max(9.1, (row_content_height + legend_height) / (top - bottom))
+    return {
+        "figsize": (fig_width, fig_height),
+        "height_ratios": height_ratios,
+        "subplot_adjust": {
+            "left": left,
+            "right": right,
+            "top": top,
+            "bottom": bottom,
+            "hspace": 0.015,
+        },
+    }
+
+
 def _save_paper_figure(
     combined_img: nib.Nifti1Image,
     map_1_binary_img: nib.Nifti1Image,
@@ -201,7 +238,7 @@ def _save_paper_figure(
 
     cut_coords = _paper_cut_coords(combined_img, n_cuts=n_cuts)
     overlap_img = image.math_img("1.0 * (img == 3)", img=combined_img)
-    fig_width = max(13.0, 1.85 * n_cuts)
+    layout = _paper_layout(anat_img, n_cuts=n_cuts)
     panel_specs = [("x", "Sagittal sections"), ("y", "Coronal sections"), ("z", "Axial sections")]
 
     def _render_figure(
@@ -211,8 +248,14 @@ def _save_paper_figure(
         overlap_linewidth: float,
         outline_linewidth: float,
     ) -> None:
-        fig, axes = plt.subplots(3, 1, figsize=(fig_width, 9.1), facecolor="white")
-        plt.subplots_adjust(left=0.03, right=0.99, top=0.99, bottom=0.09, hspace=0.06)
+        fig, axes = plt.subplots(
+            3,
+            1,
+            figsize=layout["figsize"],
+            facecolor="white",
+            gridspec_kw={"height_ratios": layout["height_ratios"]},
+        )
+        plt.subplots_adjust(**layout["subplot_adjust"])
 
         for ax, (display_mode, _title) in zip(axes, panel_specs):
             display = plotting.plot_roi(
@@ -290,8 +333,14 @@ def _save_paper_figure(
         outline_linewidth: float,
     ) -> None:
         eps_anat_img = _anat_with_white_panel_background(anat_img)
-        fig, axes = plt.subplots(3, 1, figsize=(fig_width, 9.1), facecolor="white")
-        plt.subplots_adjust(left=0.03, right=0.99, top=0.99, bottom=0.09, hspace=0.06)
+        fig, axes = plt.subplots(
+            3,
+            1,
+            figsize=layout["figsize"],
+            facecolor="white",
+            gridspec_kw={"height_ratios": layout["height_ratios"]},
+        )
+        plt.subplots_adjust(**layout["subplot_adjust"])
 
         for ax, (display_mode, _title) in zip(axes, panel_specs):
             display = plotting.plot_roi(
