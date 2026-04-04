@@ -20,9 +20,10 @@ import numpy as np
 from scipy.stats import gaussian_kde
 
 
-SELECTED_COLOR = "#e74c5b"
-NONSELECTED_COLOR = "#4c84a6"
-NULL_COLOR = "#b8dfe3"
+SELECTED_COLOR = "#C23B4B"
+NONSELECTED_COLOR = "#4C78A8"
+NULL_COLOR = "#9EC3D8"
+REFERENCE_COLOR = "#7A7A7A"
 FSL_CEREBELLUM_MAXPROB_2MM = Path("/usr/local/fsl/data/atlases/Cerebellum/Cerebellum-MNIfnirt-maxprob-thr25-2mm.nii.gz")
 DEFAULT_MOTOR_LABEL_PATTERNS = [
     "precentral gyrus",
@@ -828,15 +829,16 @@ def _plot_prevalence_panel(
     ax: plt.Axes,
     percentile_labels: list[float],
     prevalence_ratios: np.ndarray,
-    panel_label: str,
+    panel_label: str | None,
 ) -> None:
     colors = [SELECTED_COLOR if value >= 1.0 else NONSELECTED_COLOR for value in prevalence_ratios]
     tick_labels = [f"{int(round(p))}%" for p in percentile_labels]
     ax.bar(tick_labels, prevalence_ratios, color=colors, edgecolor="white", linewidth=1.0)
-    ax.axhline(1.0, linestyle="--", color="0.5", linewidth=1.6)
-    ax.set_ylabel("Relative Prevalence\n(Selected / Non-selected)")
+    ax.axhline(1.0, linestyle="--", color=REFERENCE_COLOR, linewidth=1.6)
+    ax.set_ylabel("Below-threshold fraction ratio\n(Selected / Non-selected)")
     ax.set_xlabel("Variability Percentile Threshold")
-    ax.text(-0.02, 1.03, panel_label, transform=ax.transAxes, fontsize=18, fontweight="bold")
+    if panel_label:
+        ax.text(-0.02, 1.03, panel_label, transform=ax.transAxes, fontsize=18, fontweight="bold")
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
@@ -846,19 +848,32 @@ def _plot_resample_panel(
     selected_mean: float,
     resampled_means: np.ndarray,
     metric_name: str,
-    panel_label: str,
+    panel_label: str | None,
 ) -> None:
     ax.hist(resampled_means, bins=40, density=True, color=NULL_COLOR, edgecolor="white", alpha=0.95)
     resample_mean = float(np.mean(resampled_means))
     ci_low, ci_high = np.percentile(resampled_means, [2.5, 97.5])
     ax.axvline(selected_mean, linestyle="--", linewidth=2.0, color=SELECTED_COLOR, label=f"Selected mean = {selected_mean:.4g}")
-    ax.axvline(resample_mean, linestyle="--", linewidth=1.6, color="0.45", label=f"Resample mean = {resample_mean:.4g}")
-    ax.axvline(ci_low, linestyle="--", linewidth=1.4, color="0.55")
-    ax.axvline(ci_high, linestyle="--", linewidth=1.4, color="0.55", label=f"95% CI = [{ci_low:.4g}, {ci_high:.4g}]")
+    ax.axvline(resample_mean, linestyle="--", linewidth=1.6, color=REFERENCE_COLOR, label=f"Resample mean = {resample_mean:.4g}")
+    ax.axvline(ci_low, linestyle="--", linewidth=1.4, color=REFERENCE_COLOR)
+    ax.axvline(ci_high, linestyle="--", linewidth=1.4, color=REFERENCE_COLOR, label=f"95% CI = [{ci_low:.4g}, {ci_high:.4g}]")
+    x_min = float(min(np.min(resampled_means), selected_mean, ci_low))
+    x_max = float(max(np.max(resampled_means), selected_mean, ci_high))
+    x_span = x_max - x_min
+    if not np.isfinite(x_span) or np.isclose(x_span, 0.0):
+        x_span = max(abs(x_max), 1.0)
+    left_pad = 0.12 * x_span
+    right_pad = 0.06 * x_span
+    x_left = x_min - left_pad
+    x_right = x_max + right_pad
+    ax.set_xlim(x_left, x_right)
     ax.set_xlabel(metric_name)
     ax.set_ylabel("Density")
-    ax.text(-0.02, 1.03, panel_label, transform=ax.transAxes, fontsize=18, fontweight="bold")
-    ax.legend(frameon=True, fontsize=9, loc="upper right")
+    if panel_label:
+        ax.text(-0.02, 1.03, panel_label, transform=ax.transAxes, fontsize=18, fontweight="bold")
+    ci_high_frac = float((ci_high - x_left) / max(x_right - x_left, 1e-12))
+    legend_anchor_x = float(np.clip(ci_high_frac - 0.02, 0.58, 0.86))
+    ax.legend(frameon=True, fontsize=9, loc="upper right", bbox_to_anchor=(legend_anchor_x, 0.98))
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
 
@@ -949,17 +964,15 @@ def _plot_tail_summary_figure(
         ax_c,
         percentile_labels=percentile_labels,
         prevalence_ratios=prevalence_ratios,
-        panel_label="c",
+        panel_label=None,
     )
     _plot_resample_panel(
         ax_d,
         selected_mean=selected_mean,
         resampled_means=resampled_means,
         metric_name=metric_name,
-        panel_label="d",
+        panel_label=None,
     )
-
-    fig.suptitle("selected vs motor area non-selected voxels", fontsize=14, y=1.02)
     fig.savefig(figure_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
