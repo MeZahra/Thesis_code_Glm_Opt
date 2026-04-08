@@ -120,6 +120,14 @@ def _fmt_float(value: float | None, digits: int = 3) -> str:
     return f"{float(value):.{digits}f}"
 
 
+def _sem(values: pd.Series) -> float:
+    arr = values.to_numpy(dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size <= 1:
+        return 0.0
+    return float(arr.std(ddof=1) / math.sqrt(arr.size))
+
+
 def _fit_mixedlm(long_df: pd.DataFrame) -> dict[str, object]:
     data = long_df.copy()
     data["state"] = pd.Categorical(data["state"], categories=["off", "on"], ordered=True)
@@ -253,9 +261,10 @@ def _plot_subject_means(
     figure_path: Path,
     paired_summary: dict[str, object],
 ) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4.5), sharey=True, constrained_layout=True)
-    colors = {"control": "#4c84a6", "selected": "#e74c5b"}
-    state_order = {"off": 0, "on": 1}
+    fig, axes = plt.subplots(1, 2, figsize=(7.4, 4.2), sharey=True)
+    colors = {"control": "#3d6f8e", "selected": "#d65a6f"}
+    state_order = ["off", "on"]
+    x_positions = np.array([0.0, 1.0], dtype=np.float64)
     panel_stats = {
         "control": {
             "delta": float(paired_summary["D_ctl_mean_on_minus_off"]),
@@ -270,32 +279,73 @@ def _plot_subject_means(
             "p": _safe_float(paired_summary["selected_state_p_two_sided"]),
         },
     }
+    value_arr = long_df["value"].to_numpy(dtype=np.float64)
+    value_arr = value_arr[np.isfinite(value_arr)]
+    y_limits: tuple[float, float] | None = None
+    if value_arr.size > 0:
+        y_min = float(value_arr.min())
+        y_max = float(value_arr.max())
+        pad = max(0.2, 0.06 * (y_max - y_min if y_max > y_min else 1.0))
+        y_limits = (y_min - pad, y_max + pad)
+
     for ax, selection in zip(axes, ("control", "selected")):
         subset = long_df.loc[long_df["selection"] == selection].copy()
         for subject, subject_df in subset.groupby("subject", sort=True):
-            subject_df = subject_df.sort_values("state")
-            xs = [state_order[state] for state in subject_df["state"]]
+            subject_df = subject_df.set_index("state").reindex(state_order)
             ys = subject_df["value"].to_numpy(dtype=np.float64)
-            ax.plot(xs, ys, color=colors[selection], alpha=0.28, linewidth=1.0)
-            ax.scatter(xs, ys, color=colors[selection], alpha=0.55, s=18)
+            finite_mask = np.isfinite(ys)
+            if not np.any(finite_mask):
+                continue
+            ax.plot(
+                x_positions[finite_mask],
+                ys[finite_mask],
+                color="0.78",
+                alpha=0.9,
+                linewidth=1.0,
+                zorder=1,
+            )
+            ax.scatter(
+                x_positions[finite_mask],
+                ys[finite_mask],
+                s=24,
+                facecolor="white",
+                edgecolor=colors[selection],
+                linewidth=0.9,
+                alpha=0.95,
+                zorder=2,
+            )
 
-        state_means = subset.groupby("state", sort=False)["value"].mean()
-        ax.plot(
-            [0, 1],
-            [float(state_means.loc["off"]), float(state_means.loc["on"])],
-            color="#111111",
-            linewidth=2.2,
+        state_means = subset.groupby("state")["value"].mean().reindex(state_order)
+        state_sems = subset.groupby("state")["value"].apply(_sem).reindex(state_order).fillna(0.0)
+        ax.errorbar(
+            x_positions,
+            state_means.to_numpy(dtype=np.float64),
+            yerr=state_sems.to_numpy(dtype=np.float64),
+            color=colors[selection],
+            linewidth=2.6,
             marker="o",
-            markersize=5,
+            markersize=6.5,
+            markerfacecolor=colors[selection],
+            markeredgecolor="white",
+            markeredgewidth=0.9,
+            capsize=3.5,
+            elinewidth=1.5,
+            zorder=4,
         )
-        ax.set_xticks([0, 1])
+        ax.set_xticks(x_positions)
         ax.set_xticklabels(["OFF", "ON"])
-        ax.set_title(selection.capitalize())
+        ax.set_title(selection.capitalize(), fontsize=12, pad=8)
         ax.set_xlabel("Medication state")
+        ax.grid(axis="y", color="0.9", linewidth=0.8)
+        ax.set_axisbelow(True)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_linewidth(0.9)
+        ax.spines["bottom"].set_linewidth(0.9)
+        if y_limits is not None:
+            ax.set_ylim(*y_limits)
         stats_text = (
-            f"{panel_stats[selection]['delta_label']} = ON - OFF = "
+            f"{panel_stats[selection]['delta_label']} = "
             f"{_fmt_signed(panel_stats[selection]['delta'])}\n"
             f"paired t = {_fmt_float(panel_stats[selection]['t'])}, "
             f"p = {_fmt_float(panel_stats[selection]['p'])}"
@@ -307,27 +357,27 @@ def _plot_subject_means(
             transform=ax.transAxes,
             ha="left",
             va="top",
-            fontsize=9,
-            bbox=dict(boxstyle="round", facecolor="white", edgecolor="0.7", alpha=0.95),
+            fontsize=8.5,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="0.8", alpha=0.95),
         )
 
     axes[0].set_ylabel(metric_label)
-    fig.suptitle(f"Subject-level state means: {metric_label}")
+    fig.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
     interaction_text = (
-        f"D_sel - D_ctl = "
-        f"{_fmt_signed(paired_summary['interaction_mean_D_sel_minus_D_ctl'])}, "
+        f"Interaction: D_sel - D_ctl = "
+        f"{_fmt_signed(paired_summary['interaction_mean_D_sel_minus_D_ctl'])}; "
         f"p = {_fmt_float(_safe_float(paired_summary['interaction_p_two_sided']))}"
     )
     fig.text(
         0.5,
-        0.02,
+        0.015,
         interaction_text,
         ha="center",
         va="bottom",
-        fontsize=9,
-        bbox=dict(boxstyle="round", facecolor="white", edgecolor="0.7", alpha=0.95),
+        fontsize=8.5,
+        color="0.25",
     )
-    fig.savefig(figure_path, dpi=300, bbox_inches="tight")
+    fig.savefig(figure_path, dpi=400, bbox_inches="tight")
     plt.close(fig)
 
 

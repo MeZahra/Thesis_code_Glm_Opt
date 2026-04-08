@@ -1162,6 +1162,12 @@ def _add_significance_bar(
     ax.text((x1 + x2) / 2.0, y + h, text, ha="center", va="bottom", fontsize=9)
 
 
+def _distribution_ylabel(comparison_metric: str) -> str:
+    if comparison_metric == "laplacian_spectral_distance_signed":
+        return "Spectral distance (lower = more similar)"
+    return "Pairwise metric value"
+
+
 def _save_distribution_plot(
     pairwise_df: pd.DataFrame,
     connectivity_metric: str,
@@ -1229,6 +1235,11 @@ def _save_distribution_plot(
     )
     selected_color = "#4c78a8"
     nonselected_color = "#7b7b7b"
+    class_color_map = {
+        "OFF-OFF": "#4c78a8",
+        "ON-ON": "#e9a3a3",
+        "OFF-ON": "#54a24b",
+    }
     side_offset = 0.24
 
     plot_data: list[np.ndarray] = []
@@ -1240,10 +1251,11 @@ def _save_distribution_plot(
             if has_secondary:
                 plot_data.append(values)
                 plot_positions.append(center - side_offset / 2.0)
+                plot_colors.append(selected_color)
             else:
                 plot_data.append(values)
                 plot_positions.append(center)
-            plot_colors.append(selected_color)
+                plot_colors.append(class_color_map.get(name, selected_color))
         secondary_values = secondary_group_data.get(name, np.asarray([], dtype=np.float64))
         if has_secondary and secondary_values.size > 0:
             plot_data.append(secondary_values)
@@ -1287,8 +1299,7 @@ def _save_distribution_plot(
         jitter_x = rng.normal(loc=plot_positions[idx], scale=0.04, size=values.size)
         ax.scatter(jitter_x, values, s=14, alpha=0.55, color="black", linewidths=0.0)
 
-    ax.set_title(f"{connectivity_metric} | {comparison_metric} | {cohort_name}")
-    ax.set_ylabel("Raw pairwise score")
+    ax.set_ylabel(_distribution_ylabel(comparison_metric))
 
     finite_plot_data = [
         np.asarray(values, dtype=np.float64)[np.isfinite(values)] for values in plot_data if np.isfinite(values).any()
@@ -1369,6 +1380,7 @@ def _save_distribution_plot(
     ax.set_ylim(y_min - 0.05 * y_span, current_y + 0.08 * y_span)
     fig.tight_layout()
     fig.savefig(out_png, dpi=190, bbox_inches="tight")
+    fig.savefig(out_png.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(fig)
     return pd.DataFrame(stats_rows)
 

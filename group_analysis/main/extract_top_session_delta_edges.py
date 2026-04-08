@@ -18,7 +18,24 @@ import pandas as pd
 from matplotlib import colors, ticker
 from scipy import stats
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
 LABEL_RE = re.compile(r"^(sub-[^_]+)_ses-(\d+)$")
+GENERIC_NODE_LABEL_RE = re.compile(r"^([LR]) ROI_(\d+)$")
+NODE_LABEL_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    (" (relative)", ""),
+    (" (Control & monitoring)", ""),
+    ("Dorsolateral Prefrontal Cortex", "DLPFC"),
+    ("vmPFC / dmPFC", "vmPFC/dmPFC"),
+    ("Inferior Frontal Gyrus", "IFG"),
+    ("Insular / Opercular Cortex", "Insular/Opercular"),
+    ("Other Cerebral Cortex", "Other ctx"),
+    ("Parietal Cortex", "Parietal"),
+    ("Temporal Cortex", "Temporal"),
+    ("Occipital Cortex", "Occipital"),
+    ("Cingulate Cortex", "Cingulate"),
+    ("Basal Ganglia", "Basal ganglia"),
+    ("Unassigned Active Voxels", "Unassigned"),
+)
 
 
 @dataclass(frozen=True)
@@ -91,6 +108,56 @@ def _edge_rows_cols(n_nodes: int) -> tuple[np.ndarray, np.ndarray]:
     return rows.astype(np.int64), cols.astype(np.int64)
 
 
+def _resolve_node_labels(advanced_root: Path, labels: list[str]) -> list[str]:
+    candidate_paths: list[Path] = []
+    for candidate in (
+        advanced_root / "roi_nodes.csv",
+        advanced_root.parent / "roi_nodes.csv",
+        REPO_ROOT / "results" / "connectivity" / "roi_edge_network" / "roi_nodes.csv",
+        REPO_ROOT / "results" / "connectivity_new" / "roi_edge_network" / "roi_nodes.csv",
+    ):
+        if candidate not in candidate_paths:
+            candidate_paths.append(candidate)
+
+    for roi_nodes_path in candidate_paths:
+        if not roi_nodes_path.exists():
+            continue
+
+        try:
+            roi_df = pd.read_csv(roi_nodes_path)
+        except Exception:
+            continue
+
+        required = {"base_roi_id", "hemisphere", "node_name"}
+        if not required.issubset(set(roi_df.columns)):
+            continue
+
+        lookup: dict[tuple[str, int], str] = {}
+        for row in roi_df.itertuples(index=False):
+            try:
+                key = (str(row.hemisphere).strip().upper(), int(row.base_roi_id))
+            except (TypeError, ValueError):
+                continue
+            lookup[key] = str(row.node_name).strip()
+
+        resolved: list[str] = []
+        changed = False
+        for label in labels:
+            match = GENERIC_NODE_LABEL_RE.match(str(label).strip())
+            if match is None:
+                resolved.append(label)
+                continue
+            key = (match.group(1).upper(), int(match.group(2)))
+            mapped = lookup.get(key, label)
+            resolved.append(mapped)
+            changed = changed or mapped != label
+
+        if changed:
+            return resolved
+
+    return labels
+
+
 def _load_metric_data(advanced_root: Path, metric: str) -> tuple[list[SessionMetric], list[str]]:
     session_metrics: list[SessionMetric] = []
     node_labels: list[str] | None = None
@@ -111,7 +178,10 @@ def _load_metric_data(advanced_root: Path, metric: str) -> tuple[list[SessionMet
         if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
             raise ValueError(f"Expected square matrix in {matrix_path}, got {matrix.shape}")
 
-        labels = labels_path.read_text(encoding="utf-8").strip().splitlines()
+        labels = _resolve_node_labels(
+            advanced_root,
+            labels_path.read_text(encoding="utf-8").strip().splitlines(),
+        )
         if len(labels) != matrix.shape[0]:
             raise ValueError(
                 f"Label count mismatch in {labels_path}: {len(labels)} labels for matrix {matrix.shape}"
@@ -148,7 +218,15 @@ def _edge_name(node_labels: list[str], i: int, j: int) -> str:
 
 
 def _display_edge_label(edge_label: str) -> str:
-    return edge_label.replace(" (relative)", "")
+    parts = edge_label.split(" -- ")
+    compact_parts: list[str] = []
+    for part in parts:
+        compact = part
+        for old, new in NODE_LABEL_REPLACEMENTS:
+            compact = compact.replace(old, new)
+        compact = re.sub(r"\s+", " ", compact).strip()
+        compact_parts.append(compact)
+    return "\n".join(compact_parts)
 
 
 def _rank_scores(delta_edges: np.ndarray, rank_by: str) -> np.ndarray:
@@ -247,12 +325,16 @@ def _plot_top_edge_heatmap(
     )
 
     fig_width = max(14.0, 0.72 * len(edge_labels) + 3.0)
-    fig_height = max(6.0, 0.45 * len(subject_labels) + 2.0)
+    fig_height = max(6.4, 0.45 * len(subject_labels) + 2.4)
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-    im = ax.imshow(values, cmap="coolwarm", norm=norm, aspect="auto")
+    cmap = matplotlib.colormaps["RdBu_r"].copy()
+    cmap.set_bad("#f2f2f2")
+    im = ax.imshow(values, cmap=cmap, norm=norm, aspect="auto")
     ax.set_xticks(np.arange(len(edge_labels), dtype=int))
     ax.set_yticks(np.arange(len(subject_labels), dtype=int))
-    if len(edge_labels) <= 30:
+    if len(edge_labels) <= 18:
+        x_fontsize = 9
+    elif len(edge_labels) <= 30:
         x_fontsize = 8
     elif len(edge_labels) <= 60:
         x_fontsize = 7
@@ -261,22 +343,30 @@ def _plot_top_edge_heatmap(
     else:
         x_fontsize = 5
     display_edge_labels = [_display_edge_label(label) for label in edge_labels]
-    ax.set_xticklabels(display_edge_labels, rotation=80, ha="right", fontsize=x_fontsize)
-    ax.set_yticklabels(subject_labels, fontsize=10)
-    ax.set_title(
-        f"{metric} | {selection_label} edge deltas (Session2 - Session1)",
-        fontsize=18,
+    ax.set_xticklabels(
+        display_edge_labels,
+        rotation=52,
+        ha="right",
+        rotation_mode="anchor",
+        fontsize=x_fontsize,
     )
+    ax.set_yticklabels(subject_labels, fontsize=10)
+    ax.tick_params(axis="x", pad=6)
+    ax.tick_params(axis="y", pad=3)
+    ax.set_ylabel("Subject", fontsize=12)
+    ax.set_xticks(np.arange(-0.5, len(edge_labels), 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(subject_labels), 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=0.5, alpha=0.55)
+    ax.tick_params(which="minor", bottom=False, left=False)
     cbar = fig.colorbar(im, ax=ax, shrink=0.86, pad=0.02)
     cbar.ax.yaxis.set_major_formatter(
         ticker.FuncFormatter(lambda x, pos: _plain_tick_label(x))
     )
-    cbar.set_label(
-        "Delta edge value x 1e7 (signed symlog, clipped at 99th pct)",
-        fontsize=13,
-    )
+    cbar.ax.tick_params(labelsize=10)
+    cbar.set_label("Edge delta", fontsize=12)
     fig.tight_layout()
     fig.savefig(out_png, dpi=180, bbox_inches="tight")
+    fig.savefig(out_png.with_suffix(".pdf"), bbox_inches="tight")
     plt.close(fig)
 
 
