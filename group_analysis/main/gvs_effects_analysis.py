@@ -1434,9 +1434,14 @@ def summarize_ratio_score_stats(
         if log_values.size >= 2:
             t_res = stats.ttest_1samp(log_values, popmean=0.0, nan_policy="omit")
             t_stat = float(t_res.statistic)
-            p_t = float(t_res.pvalue)
+            if np.isnan(t_stat) or np.isnan(t_res.pvalue):
+                p_t = float("nan")
+            elif t_stat > 0.0:
+                p_t = float(t_res.pvalue / 2.0)
+            else:
+                p_t = float(1.0 - (t_res.pvalue / 2.0))
             try:
-                wilcoxon_res = stats.wilcoxon(log_values, alternative="two-sided", zero_method="wilcox")
+                wilcoxon_res = stats.wilcoxon(log_values, alternative="greater", zero_method="wilcox")
                 wilcoxon_stat = float(wilcoxon_res.statistic)
                 p_wilcoxon = float(wilcoxon_res.pvalue)
             except ValueError:
@@ -1640,11 +1645,14 @@ def plot_ratio_scores_by_condition(
             label=str(group_value),
         )
 
+    ax.axhline(1.0, color="#6e6e6e", linestyle="--", linewidth=1.0, alpha=0.8)
+
     if not stats_df.empty:
         sig_df = stats_df.loc[
             (stats_df["distance_metric"] == distance_metric)
             & stats_df["condition_factor"].isin(condition_order)
             & stats_df["significant_fdr"].fillna(False)
+            & (stats_df["mean_log_ratio_score"] > 0.0)
         ].copy()
         if not sig_df.empty:
             data_extent: list[float] = []
@@ -1698,6 +1706,89 @@ def plot_ratio_scores_by_condition(
         ax.legend(frameon=False)
     ax.grid(axis="y", alpha=0.25, linewidth=0.7)
     fig.tight_layout()
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_ratio_score_heatmaps_by_condition(
+    score_df: pd.DataFrame,
+    distance_metric: str,
+    ylabel: str,
+    out_path: Path,
+    group_column: str,
+    group_order: list[str],
+    condition_order: list[str],
+) -> None:
+    metric_df = score_df.loc[score_df["distance_metric"] == distance_metric].copy()
+    if metric_df.empty:
+        return
+
+    def _subject_sort_key(value: object) -> tuple[float, str]:
+        text = str(value)
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if digits:
+            return (float(int(digits)), text)
+        return (float("inf"), text)
+
+    subject_order = sorted(metric_df["subject"].dropna().unique().tolist(), key=_subject_sort_key)
+    grouped_matrices: dict[str, np.ndarray] = {}
+    finite_values: list[np.ndarray] = []
+    for group_value in group_order:
+        group_df = metric_df.loc[metric_df[group_column] == group_value, ["subject", "condition_factor", "ratio_score"]].copy()
+        pivot = group_df.pivot_table(
+            index="subject",
+            columns="condition_factor",
+            values="ratio_score",
+            aggfunc="mean",
+        )
+        pivot = pivot.reindex(index=subject_order, columns=condition_order)
+        matrix = pivot.to_numpy(dtype=np.float64)
+        grouped_matrices[str(group_value)] = matrix
+        finite = matrix[np.isfinite(matrix)]
+        if finite.size:
+            finite_values.append(finite)
+
+    if finite_values:
+        finite_concat = np.concatenate(finite_values)
+        spread = float(np.max(np.abs(finite_concat - 1.0)))
+        spread = max(spread, 0.05)
+        norm = matplotlib.colors.TwoSlopeNorm(vmin=1.0 - spread, vcenter=1.0, vmax=1.0 + spread)
+    else:
+        norm = matplotlib.colors.TwoSlopeNorm(vmin=0.95, vcenter=1.0, vmax=1.05)
+
+    fig_width = max(10.0, 7.0 * max(1, len(group_order)))
+    fig_height = max(7.0, 0.46 * max(1, len(subject_order)) + 2.6)
+    fig, axes = plt.subplots(
+        1,
+        len(group_order),
+        figsize=(fig_width, fig_height),
+        squeeze=False,
+    )
+    cmap = plt.get_cmap("coolwarm").copy()
+    cmap.set_bad(color="#d9d9d9")
+    image = None
+    for ax, group_value in zip(axes.ravel(), group_order):
+        matrix = grouped_matrices.get(str(group_value))
+        if matrix is None:
+            matrix = np.full((len(subject_order), len(condition_order)), np.nan, dtype=np.float64)
+        image = ax.imshow(matrix, aspect="auto", cmap=cmap, norm=norm)
+        ax.set_xticks(np.arange(len(condition_order)))
+        ax.set_xticklabels(condition_order, rotation=45, ha="right")
+        ax.set_yticks(np.arange(len(subject_order)))
+        ax.set_yticklabels(subject_order, fontsize=8)
+        ax.set_xlabel("GVS condition")
+        ax.set_title(str(group_value).replace("_", " "))
+        ax.set_xticks(np.arange(-0.5, len(condition_order), 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, len(subject_order), 1), minor=True)
+        ax.grid(which="minor", color="white", linewidth=0.6)
+        ax.tick_params(which="minor", bottom=False, left=False)
+
+    axes[0, 0].set_ylabel("Subject")
+    if image is not None:
+        fig.subplots_adjust(right=0.88, wspace=0.28)
+        cax = fig.add_axes([0.90, 0.16, 0.022, 0.68])
+        cbar = fig.colorbar(image, cax=cax)
+        cbar.set_label(ylabel)
     fig.savefig(out_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
 
@@ -1765,7 +1856,7 @@ def write_report(
         report_lines.append("- No run-paired FC ratio tests were available.")
     else:
         report_lines.append(
-            "- `ratio_score` was defined as mean target-vs-sham distance divided by mean absolute within-condition distance. Significance was tested with a two-sided Wilcoxon signed-rank test on `log(ratio_score)` against 0, which is equivalent to testing `ratio_score` against 1."
+            "- `ratio_score` was defined as mean target-vs-sham distance divided by mean absolute within-condition distance. Significance was tested with a one-sided Wilcoxon signed-rank test on `log(ratio_score)` against 0 using the alternative `greater`, which is equivalent to testing whether `ratio_score` is reliably greater than 1."
         )
         for row in (
             approach1_stats.sort_values(["q_value_fdr", "p_value_wilcoxon"], ascending=[True, True])
@@ -1783,7 +1874,7 @@ def write_report(
         report_lines.append("- No OFF-vs-ON sham ratio tests were available.")
     else:
         report_lines.append(
-            "- `ratio_score` was defined as mean target-vs-sham distance divided by mean absolute within-condition distance. Significance was tested with a two-sided Wilcoxon signed-rank test on `log(ratio_score)` against 0, which is equivalent to testing `ratio_score` against 1."
+            "- `ratio_score` was defined as mean target-vs-sham distance divided by mean absolute within-condition distance. Significance was tested with a one-sided Wilcoxon signed-rank test on `log(ratio_score)` against 0 using the alternative `greater`, which is equivalent to testing whether `ratio_score` is reliably greater than 1."
         )
         for row in (
             approach2_stats.sort_values(["q_value_fdr", "p_value_wilcoxon"], ascending=[True, True])
@@ -1967,12 +2058,30 @@ def main() -> None:
         group_order=MEDICATION_ORDER,
         condition_order=ACTIVE_CONDITION_FACTORS,
     )
+    plot_ratio_score_heatmaps_by_condition(
+        score_df=approach1_df,
+        distance_metric="correlation_distance",
+        ylabel="Run-paired correlation-distance ratio",
+        out_path=fc_dir / "approach1_correlation_ratio_heatmap_by_condition.png",
+        group_column="medication",
+        group_order=MEDICATION_ORDER,
+        condition_order=ACTIVE_CONDITION_FACTORS,
+    )
     plot_ratio_scores_by_condition(
         score_df=approach1_df,
         stats_df=approach1_stats,
         distance_metric="frobenius_norm",
         ylabel="Run-paired Frobenius ratio",
         out_path=fc_dir / "approach1_frobenius_ratio_by_condition.png",
+        group_column="medication",
+        group_order=MEDICATION_ORDER,
+        condition_order=ACTIVE_CONDITION_FACTORS,
+    )
+    plot_ratio_score_heatmaps_by_condition(
+        score_df=approach1_df,
+        distance_metric="frobenius_norm",
+        ylabel="Run-paired Frobenius ratio",
+        out_path=fc_dir / "approach1_frobenius_ratio_heatmap_by_condition.png",
         group_column="medication",
         group_order=MEDICATION_ORDER,
         condition_order=ACTIVE_CONDITION_FACTORS,
@@ -1987,12 +2096,30 @@ def main() -> None:
         group_order=MEDICATION_ORDER,
         condition_order=ACTIVE_CONDITION_FACTORS,
     )
+    plot_ratio_score_heatmaps_by_condition(
+        score_df=approach1_df,
+        distance_metric="laplacian_spectral_distance",
+        ylabel="Run-paired Laplacian-distance ratio",
+        out_path=fc_dir / "approach1_laplacian_ratio_heatmap_by_condition.png",
+        group_column="medication",
+        group_order=MEDICATION_ORDER,
+        condition_order=ACTIVE_CONDITION_FACTORS,
+    )
     plot_ratio_scores_by_condition(
         score_df=approach2_df,
         stats_df=approach2_stats,
         distance_metric="correlation_distance",
         ylabel="OFF GVS vs ON sham correlation-distance ratio",
         out_path=fc_dir / "approach2_correlation_ratio_by_condition.png",
+        group_column="comparison_group",
+        group_order=["OFF_vs_ON_sham"],
+        condition_order=APPROACH2_CONDITION_FACTORS,
+    )
+    plot_ratio_score_heatmaps_by_condition(
+        score_df=approach2_df,
+        distance_metric="correlation_distance",
+        ylabel="OFF GVS vs ON sham correlation-distance ratio",
+        out_path=fc_dir / "approach2_correlation_ratio_heatmap_by_condition.png",
         group_column="comparison_group",
         group_order=["OFF_vs_ON_sham"],
         condition_order=APPROACH2_CONDITION_FACTORS,
@@ -2007,12 +2134,30 @@ def main() -> None:
         group_order=["OFF_vs_ON_sham"],
         condition_order=APPROACH2_CONDITION_FACTORS,
     )
+    plot_ratio_score_heatmaps_by_condition(
+        score_df=approach2_df,
+        distance_metric="frobenius_norm",
+        ylabel="OFF GVS vs ON sham Frobenius ratio",
+        out_path=fc_dir / "approach2_frobenius_ratio_heatmap_by_condition.png",
+        group_column="comparison_group",
+        group_order=["OFF_vs_ON_sham"],
+        condition_order=APPROACH2_CONDITION_FACTORS,
+    )
     plot_ratio_scores_by_condition(
         score_df=approach2_df,
         stats_df=approach2_stats,
         distance_metric="laplacian_spectral_distance",
         ylabel="OFF GVS vs ON sham Laplacian-distance ratio",
         out_path=fc_dir / "approach2_laplacian_ratio_by_condition.png",
+        group_column="comparison_group",
+        group_order=["OFF_vs_ON_sham"],
+        condition_order=APPROACH2_CONDITION_FACTORS,
+    )
+    plot_ratio_score_heatmaps_by_condition(
+        score_df=approach2_df,
+        distance_metric="laplacian_spectral_distance",
+        ylabel="OFF GVS vs ON sham Laplacian-distance ratio",
+        out_path=fc_dir / "approach2_laplacian_ratio_heatmap_by_condition.png",
         group_column="comparison_group",
         group_order=["OFF_vs_ON_sham"],
         condition_order=APPROACH2_CONDITION_FACTORS,
