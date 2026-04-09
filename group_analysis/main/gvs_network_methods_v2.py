@@ -50,6 +50,7 @@ from typing import Any
 import matplotlib
 
 matplotlib.use("Agg")
+from matplotlib import colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -133,6 +134,7 @@ METHOD_LABELS = {
     "method4": "Method 4",
 }
 EXACT_SIGN_FLIP_MAX_SUBJECTS = 15
+HEATMAP_EXCLUDED_SUBJECTS = frozenset({"sub-pd017"})
 
 
 @dataclass(frozen=True)
@@ -1897,6 +1899,143 @@ def plot_method1_by_condition(
     plt.close(fig)
 
 
+def _build_subject_condition_matrix(
+    observed_df: pd.DataFrame,
+    value_column: str,
+    subject_order: list[str],
+) -> pd.DataFrame:
+    matrix_df = (
+        observed_df.pivot_table(
+            index="condition_factor",
+            columns="subject",
+            values=value_column,
+            aggfunc="mean",
+        )
+        .reindex(index=ACTIVE_CONDITION_FACTORS)
+        .reindex(columns=subject_order)
+    )
+    return matrix_df
+
+
+def _resolve_heatmap_style(
+    matrix_frames: list[pd.DataFrame],
+) -> tuple[mcolors.Normalize, str]:
+    finite_values = np.concatenate(
+        [
+            frame.to_numpy(dtype=np.float64)[np.isfinite(frame.to_numpy(dtype=np.float64))]
+            for frame in matrix_frames
+            if not frame.empty
+        ]
+    )
+    vmin = float(np.min(finite_values))
+    vmax = float(np.max(finite_values))
+    if math.isclose(vmin, vmax):
+        pad = max(abs(vmin) * 0.05, 1e-6)
+        vmin -= pad
+        vmax += pad
+    if vmin < 0.0 and vmax > 0.0:
+        return mcolors.TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax), "jet"
+    return mcolors.Normalize(vmin=vmin, vmax=vmax), "jet"
+
+
+def plot_subject_condition_heatmap(
+    observed_df: pd.DataFrame,
+    value_column: str,
+    value_label: str,
+    title: str,
+    out_path: Path,
+    panel_column: str | None = None,
+    panel_order: list[str] | tuple[str, ...] | None = None,
+) -> None:
+    if observed_df.empty:
+        return
+
+    observed_df = observed_df.loc[
+        ~observed_df["subject"].astype(str).isin(HEATMAP_EXCLUDED_SUBJECTS)
+    ].copy()
+    if observed_df.empty:
+        return
+
+    subject_order = sorted({str(subject) for subject in observed_df["subject"].dropna().astype(str)})
+    if not subject_order:
+        return
+
+    if panel_column is None:
+        panel_keys = [None]
+    else:
+        candidate_keys = list(panel_order) if panel_order is not None else observed_df[panel_column].dropna().astype(str).unique().tolist()
+        panel_keys = [
+            key
+            for key in candidate_keys
+            if not observed_df.loc[observed_df[panel_column].astype(str) == str(key)].empty
+        ]
+        if not panel_keys:
+            return
+
+    matrix_frames: list[pd.DataFrame] = []
+    panel_titles: list[str] = []
+    for panel_key in panel_keys:
+        if panel_column is None:
+            panel_df = observed_df.copy()
+            panel_titles.append("")
+        else:
+            panel_df = observed_df.loc[observed_df[panel_column].astype(str) == str(panel_key)].copy()
+            panel_titles.append(str(panel_key))
+        matrix_df = _build_subject_condition_matrix(
+            observed_df=panel_df,
+            value_column=value_column,
+            subject_order=subject_order,
+        )
+        matrix_frames.append(matrix_df)
+
+    finite_arrays = [
+        frame.to_numpy(dtype=np.float64)[np.isfinite(frame.to_numpy(dtype=np.float64))]
+        for frame in matrix_frames
+        if not frame.empty
+    ]
+    if not finite_arrays or not any(values.size for values in finite_arrays):
+        return
+
+    norm, cmap_name = _resolve_heatmap_style(matrix_frames)
+    cmap = plt.get_cmap(cmap_name).copy()
+    cmap.set_bad(color="#e8e8e8")
+
+    n_panels = len(matrix_frames)
+    fig_width = max(8.0, 4.0 * n_panels + 0.28 * len(subject_order) * n_panels)
+    fig_height = max(4.8, 2.7 + 0.36 * len(ACTIVE_CONDITION_FACTORS))
+    fig, axes = plt.subplots(
+        1,
+        n_panels,
+        figsize=(fig_width, fig_height),
+        sharey=True,
+        constrained_layout=True,
+    )
+    axes_array = np.atleast_1d(axes)
+
+    image = None
+    for axis, matrix_df, panel_title in zip(axes_array, matrix_frames, panel_titles):
+        matrix = np.ma.masked_invalid(matrix_df.to_numpy(dtype=np.float64))
+        image = axis.imshow(matrix, aspect="auto", interpolation="nearest", cmap=cmap, norm=norm)
+        axis.set_xticks(np.arange(len(subject_order), dtype=np.int64))
+        axis.set_xticklabels(subject_order, rotation=60, ha="right", fontsize=8)
+        axis.set_yticks(np.arange(len(ACTIVE_CONDITION_FACTORS), dtype=np.int64))
+        axis.set_yticklabels(ACTIVE_CONDITION_FACTORS)
+        axis.set_xlabel("Subject")
+        if panel_title:
+            axis.set_title(panel_title)
+        axis.set_xticks(np.arange(-0.5, len(subject_order), 1.0), minor=True)
+        axis.set_yticks(np.arange(-0.5, len(ACTIVE_CONDITION_FACTORS), 1.0), minor=True)
+        axis.grid(which="minor", color="white", linestyle="-", linewidth=0.6, alpha=0.35)
+        axis.tick_params(which="minor", bottom=False, left=False)
+
+    axes_array[0].set_ylabel("GVS condition")
+    fig.suptitle(title, y=1.02)
+    if image is not None:
+        fig.colorbar(image, ax=axes_array.tolist(), shrink=0.92, pad=0.02, label=value_label)
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_method2_by_condition(
     observed_df: pd.DataFrame,
     stats_df: pd.DataFrame,
@@ -2478,6 +2617,18 @@ def main() -> None:
                 distance_metric=metric_name,
                 out_path=plots_dir / f"method1_{safe_slug(metric_name)}_by_condition.png",
             )
+            plot_subject_condition_heatmap(
+                observed_df=observed_df.loc[observed_df["distance_metric"] == metric_name].copy(),
+                value_column="distance_value",
+                value_label=DISTANCE_METRIC_LABELS.get(metric_name, metric_name),
+                title=(
+                    "Method 1 subject-level distance to sham\n"
+                    f"{DISTANCE_METRIC_LABELS.get(metric_name, metric_name)}"
+                ),
+                out_path=plots_dir / f"method1_{safe_slug(metric_name)}_subject_heatmap.png",
+                panel_column="medication",
+                panel_order=MEDICATION_ORDER,
+            )
 
         manifest_payload = build_manifest_payload(
             args=args,
@@ -2533,6 +2684,22 @@ def main() -> None:
                 baseline_mode=baseline_mode,
                 out_path=method2_plots_dir / f"method2_{safe_slug(metric_name)}_by_condition.png",
             )
+            plot_subject_condition_heatmap(
+                observed_df=method2_observed_df.loc[
+                    (method2_observed_df["distance_metric"] == metric_name)
+                    & (method2_observed_df["baseline_mode"] == baseline_mode)
+                ].copy(),
+                value_column="excess_distance_value",
+                value_label=f"Excess distance\n{DISTANCE_METRIC_LABELS.get(metric_name, metric_name)}",
+                title=(
+                    "Method 2 subject-level excess distance\n"
+                    f"{DISTANCE_METRIC_LABELS.get(metric_name, metric_name)} | "
+                    f"{METHOD2_BASELINE_LABELS.get(baseline_mode, baseline_mode)}"
+                ),
+                out_path=method2_plots_dir / f"method2_{safe_slug(metric_name)}_subject_heatmap.png",
+                panel_column="medication",
+                panel_order=MEDICATION_ORDER,
+            )
 
         method2_manifest_payload = build_method2_manifest_payload(
             args=args,
@@ -2584,6 +2751,16 @@ def main() -> None:
                 distance_metric=metric_name,
                 out_path=method3_plots_dir / f"method3_{safe_slug(metric_name)}_by_condition.png",
             )
+            plot_subject_condition_heatmap(
+                observed_df=method3_observed_df.loc[method3_observed_df["distance_metric"] == metric_name].copy(),
+                value_column="normalization_score",
+                value_label=f"Normalization score\n{DISTANCE_METRIC_LABELS.get(metric_name, metric_name)}",
+                title=(
+                    "Method 3 subject-level normalization score\n"
+                    f"{DISTANCE_METRIC_LABELS.get(metric_name, metric_name)}"
+                ),
+                out_path=method3_plots_dir / f"method3_{safe_slug(metric_name)}_subject_heatmap.png",
+            )
 
         method3_manifest_payload = build_method3_manifest_payload(
             args=args,
@@ -2627,6 +2804,15 @@ def main() -> None:
             observed_df=method4_observed_df,
             stats_df=method4_stats_df,
             out_path=method4_plots_dir / "method4_crossvalidated_contrast_by_condition.png",
+        )
+        plot_subject_condition_heatmap(
+            observed_df=method4_observed_df,
+            value_column="crossvalidated_contrast_value",
+            value_label="Crossvalidated contrast",
+            title="Method 4 subject-level crossvalidated contrast",
+            out_path=method4_plots_dir / "method4_crossvalidated_contrast_subject_heatmap.png",
+            panel_column="medication",
+            panel_order=MEDICATION_ORDER,
         )
 
         method4_manifest_payload = build_method4_manifest_payload(

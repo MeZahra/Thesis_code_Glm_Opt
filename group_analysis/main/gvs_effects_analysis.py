@@ -1329,7 +1329,7 @@ def summarize_off_to_on_sham_scores(
                 distance_gvs_off = compute_distance_metric(metric_name, gvs_off_run1, gvs_off_run2)
                 score = compute_ratio_score(
                     numerator_terms=[distance_gvs1_sham_on1, distance_gvs2_sham_on2],
-                    denominator_terms=[distance_sham_off, distance_sham_on, distance_gvs_off],
+                    denominator_terms=[distance_sham_on, distance_gvs_off],
                 )
                 rows.append(
                     {
