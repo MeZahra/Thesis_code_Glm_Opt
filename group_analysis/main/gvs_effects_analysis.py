@@ -1225,8 +1225,17 @@ def compute_distance_metric(metric_name: str, a: dict[str, np.ndarray], b: dict[
     raise KeyError(f"Unsupported distance metric: {metric_name}")
 
 
-def compute_ratio_score(numerator: float, denominator_terms: list[float]) -> float:
-    denominator = float(np.nansum(np.square(np.asarray(denominator_terms, dtype=np.float64))))
+def compute_ratio_score(numerator_terms: list[float], denominator_terms: list[float]) -> float:
+    numerator_array = np.asarray(numerator_terms, dtype=np.float64)
+    denominator_array = np.asarray(denominator_terms, dtype=np.float64)
+    numerator_array = numerator_array[np.isfinite(numerator_array)]
+    denominator_array = np.abs(denominator_array[np.isfinite(denominator_array)])
+    if numerator_array.size == 0 or denominator_array.size == 0:
+        return float("nan")
+    # Compare mean between-condition distance against mean within-condition distance
+    # so that a null case with matched distances is centered at ratio_score == 1.
+    numerator = float(np.mean(numerator_array))
+    denominator = float(np.mean(denominator_array))
     if not np.isfinite(numerator) or not np.isfinite(denominator) or np.isclose(denominator, 0.0):
         return float("nan")
     return float(numerator / denominator)
@@ -1258,9 +1267,8 @@ def summarize_runmatched_fc_scores(
                 distance_gvs2_sham2 = compute_distance_metric(metric_name, gvs_run2, sham_run2)
                 distance_sham1_sham2 = compute_distance_metric(metric_name, sham_run1, sham_run2)
                 distance_gvs1_gvs2 = compute_distance_metric(metric_name, gvs_run1, gvs_run2)
-                numerator = distance_gvs1_sham1 + distance_gvs2_sham2
                 score = compute_ratio_score(
-                    numerator=numerator,
+                    numerator_terms=[distance_gvs1_sham1, distance_gvs2_sham2],
                     denominator_terms=[distance_sham1_sham2, distance_gvs1_gvs2],
                 )
                 rows.append(
@@ -1319,9 +1327,8 @@ def summarize_off_to_on_sham_scores(
                 distance_sham_off = compute_distance_metric(metric_name, sham_off_run1, sham_off_run2)
                 distance_sham_on = compute_distance_metric(metric_name, sham_on_run1, sham_on_run2)
                 distance_gvs_off = compute_distance_metric(metric_name, gvs_off_run1, gvs_off_run2)
-                numerator = distance_gvs1_sham_on1 + distance_gvs2_sham_on2
                 score = compute_ratio_score(
-                    numerator=numerator,
+                    numerator_terms=[distance_gvs1_sham_on1, distance_gvs2_sham_on2],
                     denominator_terms=[distance_sham_off, distance_sham_on, distance_gvs_off],
                 )
                 rows.append(
@@ -1359,9 +1366,8 @@ def summarize_off_to_on_sham_scores(
             distance_sham_off2_vs_on2 = compute_distance_metric(metric_name, sham_off_run2, sham_on_run2)
             distance_sham_off = compute_distance_metric(metric_name, sham_off_run1, sham_off_run2)
             distance_sham_on = compute_distance_metric(metric_name, sham_on_run1, sham_on_run2)
-            numerator = distance_sham_off1_vs_on1 + distance_sham_off2_vs_on2
             score = compute_ratio_score(
-                numerator=numerator,
+                numerator_terms=[distance_sham_off1_vs_on1, distance_sham_off2_vs_on2],
                 denominator_terms=[distance_sham_off, distance_sham_on],
             )
             rows.append(
@@ -1759,7 +1765,7 @@ def write_report(
         report_lines.append("- No run-paired FC ratio tests were available.")
     else:
         report_lines.append(
-            "- Significance was tested with a two-sided Wilcoxon signed-rank test on `log(ratio_score)` against 0, which is equivalent to testing `ratio_score` against 1."
+            "- `ratio_score` was defined as mean target-vs-sham distance divided by mean absolute within-condition distance. Significance was tested with a two-sided Wilcoxon signed-rank test on `log(ratio_score)` against 0, which is equivalent to testing `ratio_score` against 1."
         )
         for row in (
             approach1_stats.sort_values(["q_value_fdr", "p_value_wilcoxon"], ascending=[True, True])
@@ -1777,7 +1783,7 @@ def write_report(
         report_lines.append("- No OFF-vs-ON sham ratio tests were available.")
     else:
         report_lines.append(
-            "- Significance was tested with a two-sided Wilcoxon signed-rank test on `log(ratio_score)` against 0, which is equivalent to testing `ratio_score` against 1."
+            "- `ratio_score` was defined as mean target-vs-sham distance divided by mean absolute within-condition distance. Significance was tested with a two-sided Wilcoxon signed-rank test on `log(ratio_score)` against 0, which is equivalent to testing `ratio_score` against 1."
         )
         for row in (
             approach2_stats.sort_values(["q_value_fdr", "p_value_wilcoxon"], ascending=[True, True])
