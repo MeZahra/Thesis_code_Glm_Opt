@@ -23,8 +23,8 @@ Null hypotheses used here:
         sham-referenced run-level distance relative to within-condition
         baseline variability.
     Method 3:
-        Shuffling OFF-session block labels within run does not make OFF+GVS look
-        systematically closer to ON-sham than OFF-sham does.
+        The mean OFF-to-ON-sham cross-run distance for a GVS condition does not
+        differ from the corresponding OFF-sham distance within subject.
     Method 4:
         The crossvalidated sham-vs-GVS edge contrast has subject-level mean 0,
         so random sign flips across subjects should reproduce the observed group
@@ -54,6 +54,7 @@ from matplotlib import colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy import stats
 from statsmodels.stats.multitest import fdrcorrection
 
 _HERE = Path(__file__).resolve().parent
@@ -72,6 +73,7 @@ from group_analysis.main.analyze_pairwise_metric_separation import (  # noqa: E4
     _signed_normalized_laplacian_spectrum,
 )
 from group_analysis.main.gvs_effects_analysis import (  # noqa: E402
+    APPROACH2_CONDITION_FACTORS,
     ACTIVE_CONDITION_CODES,
     ACTIVE_CONDITION_FACTORS,
     DEFAULT_GVS_ORDER_PATH,
@@ -123,6 +125,7 @@ DISTANCE_METRIC_LABELS = {
     "frobenius_norm": "Frobenius norm",
     "correlation_distance": "Correlation distance",
 }
+METHOD3_CONDITION_FACTORS = list(APPROACH2_CONDITION_FACTORS)
 METHOD2_BASELINE_LABELS = {
     "mean_within": "Mean within-condition baseline",
     "sham_only": "Sham-only baseline",
@@ -161,7 +164,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run GVS network methods v2 with restricted within-run block-label "
-            "randomization for Methods 1-3 and subject-level sign flips for Method 4."
+            "randomization for Methods 1-2, paired OFF-vs-ON sham comparisons "
+            "for Method 3, and subject-level sign flips for Method 4."
         )
     )
     parser.add_argument("--gvs-order-path", type=Path, default=DEFAULT_GVS_ORDER_PATH)
@@ -596,18 +600,64 @@ def compute_method2_excess_distance(
     }
 
 
-def compute_method3_normalization_score(
-    off_condition_payloads: dict[str, dict[str, np.ndarray]],
-    on_sham_payload: dict[str, np.ndarray],
+def compute_method3_cross_run_distance(
+    off_run_payloads: dict[tuple[int, str], dict[str, np.ndarray]],
+    on_run_payloads: dict[tuple[int, str], dict[str, np.ndarray]],
     condition_code: str,
     metric_name: str,
 ) -> dict[str, float] | None:
     """Method 3 score.
 
-    Null hypothesis:
-        After shuffling only OFF-session block labels within run, OFF+GVS is not
-        systematically closer to ON-sham than OFF-sham is.
+    For a given OFF-session condition, compute the mean of the four cross-run
+    distances to ON-session sham:
+        mean(
+            d(off_run1, on_sham_run1),
+            d(off_run1, on_sham_run2),
+            d(off_run2, on_sham_run1),
+            d(off_run2, on_sham_run2),
+        )
     """
+
+    required_keys = [
+        (1, condition_code),
+        (2, condition_code),
+        (1, SHAM_CONDITION_CODE),
+        (2, SHAM_CONDITION_CODE),
+    ]
+    if any(key not in off_run_payloads for key in required_keys[:2]):
+        return None
+    if any(key not in on_run_payloads for key in required_keys[2:]):
+        return None
+
+    off_run1 = off_run_payloads[(1, condition_code)]
+    off_run2 = off_run_payloads[(2, condition_code)]
+    on_sham_run1 = on_run_payloads[(1, SHAM_CONDITION_CODE)]
+    on_sham_run2 = on_run_payloads[(2, SHAM_CONDITION_CODE)]
+
+    distances = {
+        "distance_off_run1_vs_on_sham_run1": compute_distance_metric(metric_name, off_run1, on_sham_run1),
+        "distance_off_run1_vs_on_sham_run2": compute_distance_metric(metric_name, off_run1, on_sham_run2),
+        "distance_off_run2_vs_on_sham_run1": compute_distance_metric(metric_name, off_run2, on_sham_run1),
+        "distance_off_run2_vs_on_sham_run2": compute_distance_metric(metric_name, off_run2, on_sham_run2),
+    }
+    values = np.asarray(list(distances.values()), dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return None
+
+    return {
+        **{key: float(value) for key, value in distances.items()},
+        "mean_cross_run_distance_to_on_sham": float(np.mean(values)),
+    }
+
+
+def compute_method3_normalization_score_legacy(
+    off_condition_payloads: dict[str, dict[str, np.ndarray]],
+    on_sham_payload: dict[str, np.ndarray],
+    condition_code: str,
+    metric_name: str,
+) -> dict[str, float] | None:
+    """Legacy Method 3 score kept alongside the new paired-distance analysis."""
 
     off_sham_payload = off_condition_payloads.get(SHAM_CONDITION_CODE)
     off_target_payload = off_condition_payloads.get(condition_code)
@@ -862,16 +912,11 @@ def collect_observed_method2_outputs(
     return observed_df, inventory_df, skip_df
 
 
-def collect_observed_method3_outputs(
+def collect_observed_method3_legacy_outputs(
     blocks_by_session: dict[tuple[str, int], tuple[SessionBlock, ...]],
     distance_metrics: list[str],
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Build observed Method 3 subject-level normalization scores and skip logs.
-
-    Null hypothesis:
-        After randomizing OFF-session block labels, OFF+GVS does not move closer
-        to ON-sham than OFF-sham does.
-    """
+    """Build legacy Method 3 normalization scores and skip logs."""
 
     subject_rows: list[dict[str, Any]] = []
     inventory_rows: list[dict[str, Any]] = []
@@ -897,7 +942,7 @@ def collect_observed_method3_outputs(
                 for metric_name in distance_metrics:
                     skip_rows.append(
                         {
-                            "method": "method3",
+                            "method": "method3_legacy",
                             "subject": subject,
                             "condition_code": condition_code,
                             "distance_metric": metric_name,
@@ -925,7 +970,7 @@ def collect_observed_method3_outputs(
                 for metric_name in distance_metrics:
                     skip_rows.append(
                         {
-                            "method": "method3",
+                            "method": "method3_legacy",
                             "subject": subject,
                             "condition_code": condition_code,
                             "distance_metric": metric_name,
@@ -936,7 +981,7 @@ def collect_observed_method3_outputs(
 
         for condition_code in ACTIVE_CONDITION_CODES:
             for metric_name in distance_metrics:
-                score = compute_method3_normalization_score(
+                score = compute_method3_normalization_score_legacy(
                     off_condition_payloads=off_payloads,
                     on_sham_payload=on_sham_payload,
                     condition_code=condition_code,
@@ -945,7 +990,7 @@ def collect_observed_method3_outputs(
                 if score is None:
                     skip_rows.append(
                         {
-                            "method": "method3",
+                            "method": "method3_legacy",
                             "subject": subject,
                             "condition_code": condition_code,
                             "distance_metric": metric_name,
@@ -976,6 +1021,134 @@ def collect_observed_method3_outputs(
         observed_df["condition_factor"] = pd.Categorical(
             observed_df["condition_factor"],
             categories=ACTIVE_CONDITION_FACTORS,
+            ordered=True,
+        )
+
+    inventory_df = _frame_from_rows(inventory_rows, ["subject"])
+    skip_df = _ensure_columns(
+        _frame_from_rows(skip_rows, ["subject", "condition_code", "distance_metric"]),
+        ["method", "subject", "condition_code", "distance_metric", "skip_reason"],
+    )
+    return observed_df, inventory_df, skip_df
+
+
+def collect_observed_method3_outputs(
+    blocks_by_session: dict[tuple[str, int], tuple[SessionBlock, ...]],
+    distance_metrics: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Build observed Method 3 subject-level cross-run distances and skip logs."""
+
+    subject_rows: list[dict[str, Any]] = []
+    inventory_rows: list[dict[str, Any]] = []
+    skip_rows: list[dict[str, Any]] = []
+
+    subject_ids = sorted({subject for subject, _ in blocks_by_session})
+    for subject in subject_ids:
+        off_blocks = blocks_by_session.get((subject, 1))
+        on_blocks = blocks_by_session.get((subject, 2))
+        if off_blocks is None or on_blocks is None:
+            inventory_rows.append(
+                {
+                    "subject": subject,
+                    "has_off_session": bool(off_blocks is not None),
+                    "has_on_session": bool(on_blocks is not None),
+                    "has_on_sham_run1": False,
+                    "has_on_sham_run2": False,
+                    "n_off_blocks": int(len(off_blocks)) if off_blocks is not None else 0,
+                    "n_on_blocks": int(len(on_blocks)) if on_blocks is not None else 0,
+                    "n_trials_on_sham_run1_fc": float("nan"),
+                    "n_trials_on_sham_run2_fc": float("nan"),
+                }
+            )
+            for condition_code in [SHAM_CONDITION_CODE, *ACTIVE_CONDITION_CODES]:
+                for metric_name in distance_metrics:
+                    skip_rows.append(
+                        {
+                            "method": "method3",
+                            "subject": subject,
+                            "condition_code": condition_code,
+                            "distance_metric": metric_name,
+                            "skip_reason": "missing_off_or_on_session",
+                        }
+                    )
+            continue
+
+        _, off_run_payloads = rebuild_run_condition_networks(off_blocks)
+        _, on_run_payloads = rebuild_run_condition_networks(on_blocks)
+        on_sham_run1 = on_run_payloads.get((1, SHAM_CONDITION_CODE))
+        on_sham_run2 = on_run_payloads.get((2, SHAM_CONDITION_CODE))
+        inventory_rows.append(
+            {
+                "subject": subject,
+                "has_off_session": True,
+                "has_on_session": True,
+                "has_on_sham_run1": bool(on_sham_run1 is not None),
+                "has_on_sham_run2": bool(on_sham_run2 is not None),
+                "n_off_blocks": int(len(off_blocks)),
+                "n_on_blocks": int(len(on_blocks)),
+                "n_trials_on_sham_run1_fc": int(on_sham_run1["n_trials_fc"]) if on_sham_run1 is not None else float("nan"),
+                "n_trials_on_sham_run2_fc": int(on_sham_run2["n_trials_fc"]) if on_sham_run2 is not None else float("nan"),
+            }
+        )
+        if on_sham_run1 is None or on_sham_run2 is None:
+            for condition_code in [SHAM_CONDITION_CODE, *ACTIVE_CONDITION_CODES]:
+                for metric_name in distance_metrics:
+                    skip_rows.append(
+                        {
+                            "method": "method3",
+                            "subject": subject,
+                            "condition_code": condition_code,
+                            "distance_metric": metric_name,
+                            "skip_reason": "missing_required_on_sham_run_payload",
+                        }
+                    )
+            continue
+
+        for condition_code in [SHAM_CONDITION_CODE, *ACTIVE_CONDITION_CODES]:
+            for metric_name in distance_metrics:
+                score = compute_method3_cross_run_distance(
+                    off_run_payloads=off_run_payloads,
+                    on_run_payloads=on_run_payloads,
+                    condition_code=condition_code,
+                    metric_name=metric_name,
+                )
+                if score is None:
+                    skip_rows.append(
+                        {
+                            "method": "method3",
+                            "subject": subject,
+                            "condition_code": condition_code,
+                            "distance_metric": metric_name,
+                            "skip_reason": "missing_required_run_level_payload_or_non_finite_score",
+                        }
+                    )
+                    continue
+                off_run1 = off_run_payloads[(1, condition_code)]
+                off_run2 = off_run_payloads[(2, condition_code)]
+                subject_rows.append(
+                    {
+                        "subject": subject,
+                        "source_session_off": 1,
+                        "reference_session_on": 2,
+                        "condition_code": condition_code,
+                        "condition_name": (
+                            "sham" if condition_code == SHAM_CONDITION_CODE else condition_name_from_code(condition_code)
+                        ),
+                        "condition_factor": condition_factor_from_code(condition_code),
+                        "distance_metric": metric_name,
+                        "n_trials_off_run1_fc": int(off_run1["n_trials_fc"]),
+                        "n_trials_off_run2_fc": int(off_run2["n_trials_fc"]),
+                        "n_trials_on_sham_run1_fc": int(on_sham_run1["n_trials_fc"]),
+                        "n_trials_on_sham_run2_fc": int(on_sham_run2["n_trials_fc"]),
+                        **score,
+                    }
+                )
+
+    observed_df = _frame_from_rows(subject_rows, ["distance_metric", "condition_code", "subject"])
+    if not observed_df.empty:
+        observed_df["condition_factor"] = pd.Categorical(
+            observed_df["condition_factor"],
+            categories=METHOD3_CONDITION_FACTORS,
             ordered=True,
         )
 
@@ -1222,7 +1395,7 @@ def run_method2_group_permutations(
     return permutation_df
 
 
-def run_method3_group_permutations(
+def run_method3_group_permutations_legacy(
     blocks_by_session: dict[tuple[str, int], tuple[SessionBlock, ...]],
     distance_metrics: list[str],
     n_permutations: int,
@@ -1254,7 +1427,7 @@ def run_method3_group_permutations(
             _, off_payloads = rebuild_session_condition_networks(off_blocks, relabeled_condition_codes=relabeled_codes)
             for condition_code in ACTIVE_CONDITION_CODES:
                 for metric_name in distance_metrics:
-                    score = compute_method3_normalization_score(
+                    score = compute_method3_normalization_score_legacy(
                         off_condition_payloads=off_payloads,
                         on_sham_payload=on_sham_payload,
                         condition_code=condition_code,
@@ -1596,6 +1769,144 @@ def summarize_method2_group_statistics(
 
 def summarize_method3_group_statistics(
     observed_df: pd.DataFrame,
+    permutation_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    if observed_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "condition_code",
+                "condition_name",
+                "condition_factor",
+                "distance_metric",
+                "n_subjects_paired",
+                "mean_condition_distance",
+                "mean_sham_distance",
+                "mean_paired_difference_vs_sham",
+                "std_paired_difference_vs_sham",
+                "sem_paired_difference_vs_sham",
+                "t_stat_paired_ttest",
+                "p_value_paired_ttest_two_sided",
+                "q_value_fdr",
+                "significant_fdr",
+            ]
+        )
+
+    rows: list[dict[str, Any]] = []
+    metric_names = observed_df["distance_metric"].dropna().astype(str).unique().tolist()
+    for metric_name in metric_names:
+        metric_df = observed_df.loc[observed_df["distance_metric"] == metric_name].copy()
+        sham_df = metric_df.loc[
+            metric_df["condition_code"] == SHAM_CONDITION_CODE,
+            ["subject", "mean_cross_run_distance_to_on_sham"],
+        ].rename(columns={"mean_cross_run_distance_to_on_sham": "sham_distance"})
+        if sham_df.empty:
+            continue
+
+        for condition_code in ACTIVE_CONDITION_CODES:
+            condition_df = metric_df.loc[
+                metric_df["condition_code"] == condition_code,
+                [
+                    "subject",
+                    "condition_name",
+                    "condition_factor",
+                    "mean_cross_run_distance_to_on_sham",
+                ],
+            ].rename(columns={"mean_cross_run_distance_to_on_sham": "condition_distance"})
+            if condition_df.empty:
+                continue
+
+            paired_df = condition_df.merge(sham_df, on="subject", how="inner")
+            if paired_df.empty:
+                continue
+
+            condition_values = paired_df["condition_distance"].to_numpy(dtype=np.float64)
+            sham_values = paired_df["sham_distance"].to_numpy(dtype=np.float64)
+            finite_mask = np.isfinite(condition_values) & np.isfinite(sham_values)
+            if not np.any(finite_mask):
+                continue
+
+            condition_values = condition_values[finite_mask]
+            sham_values = sham_values[finite_mask]
+            paired_difference = condition_values - sham_values
+
+            t_stat = float("nan")
+            p_value = float("nan")
+            if paired_difference.size >= 2:
+                t_result = stats.ttest_rel(condition_values, sham_values, nan_policy="omit")
+                t_stat = float(t_result.statistic) if np.isfinite(t_result.statistic) else float("nan")
+                p_value = float(t_result.pvalue) if np.isfinite(t_result.pvalue) else float("nan")
+
+            std_difference = (
+                float(np.std(paired_difference, ddof=1)) if paired_difference.size >= 2 else float("nan")
+            )
+            sem_difference = (
+                float(std_difference / math.sqrt(paired_difference.size))
+                if paired_difference.size >= 2 and np.isfinite(std_difference)
+                else float("nan")
+            )
+            first_row = paired_df.iloc[0]
+            rows.append(
+                {
+                    "condition_code": condition_code,
+                    "condition_name": str(first_row["condition_name"]),
+                    "condition_factor": str(first_row["condition_factor"]),
+                    "distance_metric": metric_name,
+                    "n_subjects_paired": int(paired_difference.size),
+                    "mean_condition_distance": float(np.mean(condition_values)),
+                    "mean_sham_distance": float(np.mean(sham_values)),
+                    "mean_paired_difference_vs_sham": float(np.mean(paired_difference)),
+                    "std_paired_difference_vs_sham": std_difference,
+                    "sem_paired_difference_vs_sham": sem_difference,
+                    "t_stat_paired_ttest": t_stat,
+                    "p_value_paired_ttest_two_sided": p_value,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "condition_code",
+                "condition_name",
+                "condition_factor",
+                "distance_metric",
+                "n_subjects_paired",
+                "mean_condition_distance",
+                "mean_sham_distance",
+                "mean_paired_difference_vs_sham",
+                "std_paired_difference_vs_sham",
+                "sem_paired_difference_vs_sham",
+                "t_stat_paired_ttest",
+                "p_value_paired_ttest_two_sided",
+                "q_value_fdr",
+                "significant_fdr",
+            ]
+        )
+
+    stats_df = pd.DataFrame(rows).sort_values(["distance_metric", "condition_code"]).reset_index(drop=True)
+    q_values = np.full(stats_df.shape[0], np.nan, dtype=np.float64)
+    significant = np.zeros(stats_df.shape[0], dtype=bool)
+    for _, idx in stats_df.groupby(["distance_metric"], observed=True).groups.items():
+        idx_array = np.asarray(list(idx), dtype=np.int64)
+        p_values = stats_df.loc[idx_array, "p_value_paired_ttest_two_sided"].to_numpy(dtype=np.float64)
+        finite_mask = np.isfinite(p_values)
+        if not np.any(finite_mask):
+            continue
+        sig_valid, q_valid = fdrcorrection(p_values[finite_mask], alpha=0.05)
+        q_values[idx_array[finite_mask]] = q_valid
+        significant[idx_array[finite_mask]] = sig_valid
+
+    stats_df["q_value_fdr"] = q_values
+    stats_df["significant_fdr"] = significant
+    stats_df["condition_factor"] = pd.Categorical(
+        stats_df["condition_factor"],
+        categories=ACTIVE_CONDITION_FACTORS,
+        ordered=True,
+    )
+    return stats_df
+
+
+def summarize_method3_group_statistics_legacy(
+    observed_df: pd.DataFrame,
     permutation_df: pd.DataFrame,
 ) -> pd.DataFrame:
     if observed_df.empty:
@@ -1910,6 +2221,7 @@ def _build_subject_condition_matrix(
             columns="subject",
             values=value_column,
             aggfunc="mean",
+            observed=False,
         )
         .reindex(index=ACTIVE_CONDITION_FACTORS)
         .reindex(columns=subject_order)
@@ -2147,7 +2459,7 @@ def plot_method2_by_condition(
     plt.close(fig)
 
 
-def plot_method3_by_condition(
+def plot_method3_legacy_by_condition(
     observed_df: pd.DataFrame,
     stats_df: pd.DataFrame,
     distance_metric: str,
@@ -2224,8 +2536,127 @@ def plot_method3_by_condition(
     ax.set_xlabel("Active GVS condition")
     ax.set_ylabel(f"Normalization score\n{DISTANCE_METRIC_LABELS.get(distance_metric, distance_metric)}")
     ax.set_title(
-        "Method 3 OFF-to-ON normalization\n"
+        "Method 3 legacy OFF-to-ON normalization\n"
         f"{DISTANCE_METRIC_LABELS.get(distance_metric, distance_metric)} | lower is more normalization"
+    )
+    ax.grid(axis="y", alpha=0.25, linewidth=0.7)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_method3_by_condition(
+    observed_df: pd.DataFrame,
+    stats_df: pd.DataFrame,
+    distance_metric: str,
+    out_path: Path,
+) -> None:
+    metric_df = observed_df.loc[observed_df["distance_metric"] == distance_metric].copy()
+    if metric_df.empty:
+        return
+
+    condition_order = METHOD3_CONDITION_FACTORS
+    x_positions = np.arange(len(condition_order), dtype=np.float64)
+    plot_data: list[np.ndarray] = []
+    for condition_factor in condition_order:
+        values = metric_df.loc[
+            metric_df["condition_factor"] == condition_factor,
+            "mean_cross_run_distance_to_on_sham",
+        ].to_numpy(dtype=np.float64)
+        plot_data.append(values[np.isfinite(values)])
+    available = [
+        (condition_factor, values)
+        for condition_factor, values in zip(condition_order, plot_data, strict=False)
+        if values.size
+    ]
+    if not available:
+        return
+    condition_order = [condition_factor for condition_factor, _ in available]
+    plot_data = [values for _, values in available]
+    x_positions = np.arange(len(condition_order), dtype=np.float64)
+
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    box = ax.boxplot(
+        plot_data,
+        positions=x_positions,
+        widths=0.6,
+        patch_artist=True,
+        showfliers=False,
+    )
+    box_colors = ["#9e9e9e"] + ["#54a24b"] * (len(condition_order) - 1)
+    for patch, color in zip(box["boxes"], box_colors, strict=False):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.72)
+        patch.set_edgecolor("#3a3a3a")
+        patch.set_linewidth(1.0)
+    for median in box["medians"]:
+        median.set_color("#1f1f1f")
+        median.set_linewidth(1.3)
+    for whisker in box["whiskers"]:
+        whisker.set_color("#4f4f4f")
+        whisker.set_linewidth(1.0)
+    for cap in box["caps"]:
+        cap.set_color("#4f4f4f")
+        cap.set_linewidth(1.0)
+
+    rng = np.random.default_rng(0)
+    for position, values in zip(x_positions, plot_data, strict=False):
+        if values.size == 0:
+            continue
+        jitter = rng.uniform(-0.12, 0.12, size=values.size)
+        ax.scatter(
+            np.full(values.size, position, dtype=np.float64) + jitter,
+            values,
+            s=22,
+            alpha=0.65,
+            color="#1f1f1f",
+            linewidths=0.0,
+            zorder=3,
+        )
+
+    sig_df = stats_df.loc[
+        (stats_df["distance_metric"] == distance_metric)
+        & stats_df["significant_fdr"].fillna(False)
+        & stats_df["condition_factor"].isin(ACTIVE_CONDITION_FACTORS)
+    ].copy()
+    if not sig_df.empty:
+        data_extent = [float(value) for values in plot_data for value in values]
+        y_span = max(data_extent) - min(data_extent) if len(data_extent) >= 2 else 1.0
+        y_pad = max(0.05, 0.07 * y_span)
+        star_offset = 0.55 * y_pad
+        top_margin = 1.8 * y_pad
+        star_tops: list[float] = []
+        for row in sig_df.itertuples(index=False):
+            condition_factor = str(row.condition_factor)
+            if condition_factor not in condition_order:
+                continue
+            condition_idx = condition_order.index(condition_factor)
+            values = plot_data[condition_idx]
+            if values.size == 0:
+                continue
+            star_y = float(np.max(values) + star_offset)
+            ax.text(
+                x_positions[condition_idx],
+                star_y,
+                "*",
+                ha="center",
+                va="bottom",
+                color="#54a24b",
+                fontsize=16,
+                fontweight="bold",
+            )
+            star_tops.append(star_y)
+        if star_tops:
+            ymin, ymax = ax.get_ylim()
+            ax.set_ylim(ymin, max(ymax, max(star_tops) + top_margin))
+
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(condition_order, rotation=45, ha="right")
+    ax.set_xlabel("OFF-session condition")
+    ax.set_ylabel(f"Mean cross-run distance to ON sham\n{DISTANCE_METRIC_LABELS.get(distance_metric, distance_metric)}")
+    ax.set_title(
+        "Method 3 OFF-to-ON sham distance\n"
+        f"{DISTANCE_METRIC_LABELS.get(distance_metric, distance_metric)} | paired t-tests compare each GVS with sham"
     )
     ax.grid(axis="y", alpha=0.25, linewidth=0.7)
     fig.tight_layout()
@@ -2413,13 +2844,20 @@ def build_method3_manifest_payload(
     roi_labels: list[str],
     subject_inventory_df: pd.DataFrame,
     observed_df: pd.DataFrame,
-    permutation_df: pd.DataFrame,
     stats_df: pd.DataFrame,
     distance_metrics: list[str],
+    legacy_subject_inventory_df: pd.DataFrame | None = None,
+    legacy_observed_df: pd.DataFrame | None = None,
+    legacy_permutation_df: pd.DataFrame | None = None,
+    legacy_stats_df: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     return {
         "script": str(Path(__file__).resolve()),
         "implemented_methods": ["method3_off_to_on_normalization"],
+        "method3_analysis_variants": [
+            "cross_run_distance_paired_ttest",
+            "legacy_normalization_permutation",
+        ],
         "gvs_order_path": str(args.gvs_order_path.expanduser().resolve()),
         "manifest_path": str(args.manifest_path.expanduser().resolve()),
         "session_beta_dir": str(args.session_beta_dir.expanduser().resolve()),
@@ -2432,15 +2870,18 @@ def build_method3_manifest_payload(
         "distance_metrics": distance_metrics,
         "primary_distance_metric": PRIMARY_DISTANCE_METRIC,
         "secondary_distance_metrics": list(SECONDARY_DISTANCE_METRICS),
-        "n_permutations_requested": int(args.n_permutations),
         "seed": int(args.seed),
         "sham_condition_code": SHAM_CONDITION_CODE,
         "active_condition_codes": ACTIVE_CONDITION_CODES,
+        "method3_condition_factors": METHOD3_CONDITION_FACTORS,
         "n_rois": int(len(roi_labels)),
         "n_subject_inventory_rows": int(subject_inventory_df.shape[0]),
         "n_subject_level_method3_rows": int(observed_df.shape[0]),
-        "n_group_permutation_rows": int(permutation_df.shape[0]),
         "n_group_stat_rows": int(stats_df.shape[0]),
+        "n_subject_inventory_rows_legacy": int(legacy_subject_inventory_df.shape[0]) if legacy_subject_inventory_df is not None else 0,
+        "n_subject_level_method3_rows_legacy": int(legacy_observed_df.shape[0]) if legacy_observed_df is not None else 0,
+        "n_group_permutation_rows_legacy": int(legacy_permutation_df.shape[0]) if legacy_permutation_df is not None else 0,
+        "n_group_stat_rows_legacy": int(legacy_stats_df.shape[0]) if legacy_stats_df is not None else 0,
     }
 
 
@@ -2497,7 +2938,7 @@ def write_report(
         "## Interpretation",
         "- Method 1: positive values mean the active condition moved the session-level network farther from sham than expected under within-run block-label randomization.",
         "- Method 2: positive values mean the active condition exceeded the within-condition baseline variability more than expected under within-run block-label randomization.",
-        "- Method 3: negative values mean OFF+GVS moved closer to ON-sham than OFF-sham did. Lower one-sided p-values support normalization.",
+        "- Method 3: smaller distances mean the OFF-session condition looks more similar to ON-sham. Each GVS is compared against OFF-sham with a paired two-sided t-test. Legacy normalization/permutation outputs are also saved with `_legacy` filenames.",
         "- Method 4: positive values mean the sham-vs-GVS edge contrast replicated across runs. Sign-flip nulls are centered at zero by construction.",
         "",
     ]
@@ -2525,12 +2966,13 @@ def write_report(
                     f"mean excess={row.t_obs_mean_excess_distance:.4g}, p={row.empirical_p_value:.4g}, q={row.q_value_fdr:.4g}"
                 )
         elif method_name == "method3":
-            top_df = stats_df.sort_values(["q_value_fdr", "empirical_p_value_normalization_one_sided"]).head(6)
+            top_df = stats_df.sort_values(["q_value_fdr", "p_value_paired_ttest_two_sided"]).head(6)
             for row in top_df.itertuples(index=False):
                 lines.append(
                     f"- {row.distance_metric} | {row.condition_factor}: "
-                    f"mean normalization={row.t_obs_mean_normalization_score:.4g}, "
-                    f"p={row.empirical_p_value_normalization_one_sided:.4g}, q={row.q_value_fdr:.4g}"
+                    f"mean distance={row.mean_condition_distance:.4g}, "
+                    f"mean sham={row.mean_sham_distance:.4g}, "
+                    f"p={row.p_value_paired_ttest_two_sided:.4g}, q={row.q_value_fdr:.4g}"
                 )
         elif method_name == "method4":
             top_df = stats_df.sort_values(["q_value_fdr", "empirical_p_value"]).head(6)
@@ -2721,25 +3163,73 @@ def main() -> None:
         method3_tables_dir = ensure_dir(method3_dir / "tables")
         method3_plots_dir = ensure_dir(method3_dir / "plots")
 
+        method3_legacy_observed_df, method3_legacy_subject_inventory_df, method3_legacy_skip_df = collect_observed_method3_legacy_outputs(
+            blocks_by_session=blocks_by_session,
+            distance_metrics=distance_metrics,
+        )
+        method3_legacy_subject_inventory_df.to_csv(
+            method3_tables_dir / "method3_subject_inventory_legacy.csv",
+            index=False,
+        )
+        method3_legacy_skip_df.to_csv(
+            method3_tables_dir / "method3_skipped_cells_legacy.csv",
+            index=False,
+        )
+        method3_legacy_observed_df.to_csv(
+            method3_tables_dir / "method3_subject_normalization_scores_legacy.csv",
+            index=False,
+        )
+
+        method3_legacy_permutation_df = run_method3_group_permutations_legacy(
+            blocks_by_session=blocks_by_session,
+            distance_metrics=distance_metrics,
+            n_permutations=int(args.n_permutations),
+            random_seed=int(args.seed),
+        )
+        method3_legacy_permutation_df.to_csv(
+            method3_tables_dir / "method3_group_permutation_null_legacy.csv",
+            index=False,
+        )
+
+        method3_legacy_stats_df = summarize_method3_group_statistics_legacy(
+            observed_df=method3_legacy_observed_df,
+            permutation_df=method3_legacy_permutation_df,
+        )
+        method3_legacy_stats_df.to_csv(
+            method3_tables_dir / "method3_group_statistics_legacy.csv",
+            index=False,
+        )
+
+        for metric_name in distance_metrics:
+            plot_method3_legacy_by_condition(
+                observed_df=method3_legacy_observed_df,
+                stats_df=method3_legacy_stats_df,
+                distance_metric=metric_name,
+                out_path=method3_plots_dir / f"method3_{safe_slug(metric_name)}_legacy_normalization_by_condition.png",
+            )
+            plot_subject_condition_heatmap(
+                observed_df=method3_legacy_observed_df.loc[
+                    method3_legacy_observed_df["distance_metric"] == metric_name
+                ].copy(),
+                value_column="normalization_score",
+                value_label=f"Legacy normalization score\n{DISTANCE_METRIC_LABELS.get(metric_name, metric_name)}",
+                title=(
+                    "Method 3 legacy subject-level normalization score\n"
+                    f"{DISTANCE_METRIC_LABELS.get(metric_name, metric_name)}"
+                ),
+                out_path=method3_plots_dir / f"method3_{safe_slug(metric_name)}_legacy_normalization_subject_heatmap.png",
+            )
+
         method3_observed_df, method3_subject_inventory_df, method3_skip_df = collect_observed_method3_outputs(
             blocks_by_session=blocks_by_session,
             distance_metrics=distance_metrics,
         )
         method3_subject_inventory_df.to_csv(method3_tables_dir / "method3_subject_inventory.csv", index=False)
         method3_skip_df.to_csv(method3_tables_dir / "method3_skipped_cells.csv", index=False)
-        method3_observed_df.to_csv(method3_tables_dir / "method3_subject_normalization_scores.csv", index=False)
-
-        method3_permutation_df = run_method3_group_permutations(
-            blocks_by_session=blocks_by_session,
-            distance_metrics=distance_metrics,
-            n_permutations=int(args.n_permutations),
-            random_seed=int(args.seed),
-        )
-        method3_permutation_df.to_csv(method3_tables_dir / "method3_group_permutation_null.csv", index=False)
+        method3_observed_df.to_csv(method3_tables_dir / "method3_subject_cross_run_distances.csv", index=False)
 
         method3_stats_df = summarize_method3_group_statistics(
             observed_df=method3_observed_df,
-            permutation_df=method3_permutation_df,
         )
         method3_stats_df.to_csv(method3_tables_dir / "method3_group_statistics.csv", index=False)
         method_stats["method3"] = method3_stats_df
@@ -2751,25 +3241,18 @@ def main() -> None:
                 distance_metric=metric_name,
                 out_path=method3_plots_dir / f"method3_{safe_slug(metric_name)}_by_condition.png",
             )
-            plot_subject_condition_heatmap(
-                observed_df=method3_observed_df.loc[method3_observed_df["distance_metric"] == metric_name].copy(),
-                value_column="normalization_score",
-                value_label=f"Normalization score\n{DISTANCE_METRIC_LABELS.get(metric_name, metric_name)}",
-                title=(
-                    "Method 3 subject-level normalization score\n"
-                    f"{DISTANCE_METRIC_LABELS.get(metric_name, metric_name)}"
-                ),
-                out_path=method3_plots_dir / f"method3_{safe_slug(metric_name)}_subject_heatmap.png",
-            )
 
         method3_manifest_payload = build_method3_manifest_payload(
             args=args,
             roi_labels=roi_labels,
             subject_inventory_df=method3_subject_inventory_df,
             observed_df=method3_observed_df,
-            permutation_df=method3_permutation_df,
             stats_df=method3_stats_df,
             distance_metrics=distance_metrics,
+            legacy_subject_inventory_df=method3_legacy_subject_inventory_df,
+            legacy_observed_df=method3_legacy_observed_df,
+            legacy_permutation_df=method3_legacy_permutation_df,
+            legacy_stats_df=method3_legacy_stats_df,
         )
         (method3_dir / "analysis_manifest.json").write_text(
             json.dumps(method3_manifest_payload, indent=2, sort_keys=True),

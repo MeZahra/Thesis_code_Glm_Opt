@@ -29,12 +29,13 @@ METRIC_TITLES = {
     "frobenius_norm": "Frobenius norm",
     "correlation_distance": "Correlation distance",
 }
+METHOD3_CONDITION_ORDER = ["sham", *[f"GVS{index}" for index in range(2, 10)]]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Read Method 3 OFF-to-ON normalization outputs and create compact "
+            "Read Method 3 OFF-to-ON sham distance outputs and create compact "
             "summary tables showing which GVS conditions differ statistically from sham."
         )
     )
@@ -61,12 +62,12 @@ def load_method3_tables(method3_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, 
     tables_dir = method3_dir / "tables"
     plots_dir = method3_dir / "plots"
     stats_path = tables_dir / "method3_group_statistics.csv"
-    observed_path = tables_dir / "method3_subject_normalization_scores.csv"
+    observed_path = tables_dir / "method3_subject_cross_run_distances.csv"
 
     if not stats_path.exists():
         raise FileNotFoundError(f"Missing statistics table: {stats_path}")
     if not observed_path.exists():
-        raise FileNotFoundError(f"Missing observed normalization table: {observed_path}")
+        raise FileNotFoundError(f"Missing observed cross-run distance table: {observed_path}")
 
     stats_df = pd.read_csv(stats_path)
     observed_df = pd.read_csv(observed_path)
@@ -79,31 +80,32 @@ def build_summary_table(stats_df: pd.DataFrame, observed_df: pd.DataFrame) -> pd
             ["condition_code", "condition_name", "condition_factor", "distance_metric"],
             dropna=False,
             observed=False,
-        )["normalization_score"]
+        )["mean_cross_run_distance_to_on_sham"]
         .agg(
-            observed_mean_normalization_score="mean",
+            n_subjects_observed="count",
+            observed_mean_cross_run_distance="mean",
             observed_sd=lambda values: float(np.std(values, ddof=1)) if len(values) >= 2 else float("nan"),
             observed_sem=lambda values: float(np.std(values, ddof=1) / np.sqrt(len(values))) if len(values) >= 2 else float("nan"),
         )
         .reset_index()
     )
 
-    summary_df = stats_df.merge(
-        observed_summary,
+    summary_df = observed_summary.merge(
+        stats_df,
         on=["condition_code", "condition_name", "condition_factor", "distance_metric"],
         how="left",
     )
-    summary_df["delta_vs_null_mean"] = summary_df["t_obs_mean_normalization_score"] - summary_df["null_mean"]
     summary_df["different_from_sham_uncorrected"] = (
-        summary_df["empirical_p_value_normalization_one_sided"] < 0.05
+        summary_df["p_value_paired_ttest_two_sided"] < 0.05
     )
-    summary_df["different_from_sham_fdr"] = summary_df["significant_fdr"].fillna(False).astype(bool)
-    summary_df["null_95pct_interval"] = [
-        _format_interval(lower, upper)
-        for lower, upper in zip(summary_df["null_q025"], summary_df["null_q975"], strict=False)
-    ]
+    summary_df["different_from_sham_fdr"] = summary_df["significant_fdr"].eq(True)
     summary_df["distance_metric_title"] = summary_df["distance_metric"].map(METRIC_TITLES).fillna(
         summary_df["distance_metric"]
+    )
+    summary_df["condition_factor"] = pd.Categorical(
+        summary_df["condition_factor"],
+        categories=METHOD3_CONDITION_ORDER,
+        ordered=True,
     )
 
     summary_df = summary_df.sort_values(
@@ -120,13 +122,13 @@ def write_csv_tables(summary_df: pd.DataFrame, tables_dir: Path) -> None:
         "condition_name",
         "condition_factor",
         "n_subjects_observed",
-        "t_obs_mean_normalization_score",
+        "observed_mean_cross_run_distance",
         "observed_sd",
         "observed_sem",
-        "null_mean",
-        "delta_vs_null_mean",
-        "null_95pct_interval",
-        "empirical_p_value_normalization_one_sided",
+        "n_subjects_paired",
+        "mean_sham_distance",
+        "mean_paired_difference_vs_sham",
+        "p_value_paired_ttest_two_sided",
         "q_value_fdr",
         "different_from_sham_uncorrected",
         "different_from_sham_fdr",
@@ -139,7 +141,8 @@ def write_csv_tables(summary_df: pd.DataFrame, tables_dir: Path) -> None:
     significance_rows: list[dict[str, str]] = []
     for metric_name, group_df in summary_df.groupby("distance_metric", sort=False):
         significant_conditions = group_df.loc[
-            group_df["different_from_sham_fdr"], "condition_factor"
+            group_df["different_from_sham_fdr"] & (group_df["condition_factor"].astype(str) != "sham"),
+            "condition_factor",
         ].astype(str).tolist()
         significance_rows.append(
             {
@@ -159,13 +162,13 @@ def write_csv_tables(summary_df: pd.DataFrame, tables_dir: Path) -> None:
         metric_columns = [
             "condition_factor",
             "n_subjects_observed",
-            "t_obs_mean_normalization_score",
+            "observed_mean_cross_run_distance",
             "observed_sd",
             "observed_sem",
-            "null_mean",
-            "delta_vs_null_mean",
-            "null_95pct_interval",
-            "empirical_p_value_normalization_one_sided",
+            "n_subjects_paired",
+            "mean_sham_distance",
+            "mean_paired_difference_vs_sham",
+            "p_value_paired_ttest_two_sided",
             "q_value_fdr",
             "different_from_sham_fdr",
         ]
@@ -181,10 +184,10 @@ def render_metric_table(metric_df: pd.DataFrame, metric_name: str, out_path: Pat
         [
             "condition_factor",
             "n_subjects_observed",
-            "t_obs_mean_normalization_score",
+            "observed_mean_cross_run_distance",
             "observed_sem",
-            "null_mean",
-            "empirical_p_value_normalization_one_sided",
+            "mean_paired_difference_vs_sham",
+            "p_value_paired_ttest_two_sided",
             "q_value_fdr",
             "different_from_sham_fdr",
         ],
@@ -192,21 +195,29 @@ def render_metric_table(metric_df: pd.DataFrame, metric_name: str, out_path: Pat
     display_df.columns = [
         "GVS",
         "N",
-        "MeanScore",
+        "MeanDist",
         "SEM",
-        "NullMean",
-        "p(1-sided)",
+        "MeanDiffVsSham",
+        "p(ttest)",
         "q(FDR)",
-        "Diff vs sham",
+        "Paired vs sham",
     ]
-    display_df["MeanScore"] = display_df["MeanScore"].map(lambda value: f"{value:.3f}" if np.isfinite(value) else "NA")
+    display_df["MeanDist"] = display_df["MeanDist"].map(lambda value: f"{value:.3f}" if np.isfinite(value) else "NA")
     display_df["SEM"] = display_df["SEM"].map(lambda value: f"{value:.3f}" if np.isfinite(value) else "NA")
-    display_df["NullMean"] = display_df["NullMean"].map(lambda value: f"{value:.3f}" if np.isfinite(value) else "NA")
-    display_df["p(1-sided)"] = display_df["p(1-sided)"].map(
+    display_df["MeanDiffVsSham"] = display_df["MeanDiffVsSham"].map(
+        lambda value: f"{value:.3f}" if np.isfinite(value) else "NA"
+    )
+    display_df["p(ttest)"] = display_df["p(ttest)"].map(
         lambda value: f"{value:.3f}" if np.isfinite(value) else "NA"
     )
     display_df["q(FDR)"] = display_df["q(FDR)"].map(lambda value: f"{value:.3f}" if np.isfinite(value) else "NA")
-    display_df["Diff vs sham"] = display_df["Diff vs sham"].map(lambda value: "Yes" if bool(value) else "No")
+    paired_labels: list[str] = []
+    for row in metric_df.itertuples(index=False):
+        if str(row.condition_factor) == "sham":
+            paired_labels.append("Reference")
+        else:
+            paired_labels.append("Yes" if bool(row.different_from_sham_fdr) else "No")
+    display_df["Paired vs sham"] = paired_labels
 
     n_rows = int(display_df.shape[0])
     fig_height = max(4.6, 0.42 * (n_rows + 3))
@@ -229,12 +240,15 @@ def render_metric_table(metric_df: pd.DataFrame, metric_name: str, out_path: Pat
         if row == 0:
             cell.set_facecolor("#e9eef5")
             cell.set_text_props(weight="bold")
-        elif display_df.iloc[row - 1]["Diff vs sham"] == "Yes":
+        elif display_df.iloc[row - 1]["Paired vs sham"] == "Yes":
             cell.set_facecolor("#fde2e1")
         else:
             cell.set_facecolor("#ffffff" if row % 2 else "#f7f9fb")
 
-    sig_conditions = metric_df.loc[metric_df["different_from_sham_fdr"], "condition_factor"].astype(str).tolist()
+    sig_conditions = metric_df.loc[
+        metric_df["different_from_sham_fdr"] & (metric_df["condition_factor"].astype(str) != "sham"),
+        "condition_factor",
+    ].astype(str).tolist()
     subtitle = (
         f"FDR-significant vs sham: {', '.join(sig_conditions)}"
         if sig_conditions
@@ -242,8 +256,8 @@ def render_metric_table(metric_df: pd.DataFrame, metric_name: str, out_path: Pat
     )
 
     ax.set_title(
-        "Method 3 OFF-to-ON normalization statistics\n"
-        f"{METRIC_TITLES.get(metric_name, metric_name)} | lower score = more normalization\n"
+        "Method 3 OFF-to-ON sham distance statistics\n"
+        f"{METRIC_TITLES.get(metric_name, metric_name)} | paired t-tests versus sham\n"
         f"{subtitle}",
         fontsize=12,
         pad=18,
