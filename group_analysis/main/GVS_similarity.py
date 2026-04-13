@@ -2289,7 +2289,7 @@ def _write_significant_roi_condition_panel_png(
     subset = subset.sort_values(["subject", "target_condition_label", "roi_label"]).reset_index(drop=True)
 
     n_subjects = len(subjects)
-    n_cols = min(3, max(1, n_subjects))
+    n_cols = min(4, max(1, n_subjects))
     n_rows = int(np.ceil(n_subjects / n_cols))
     fig_w = max(15.0, 5.2 * n_cols + 1.2)
     fig_h = max(8.0, 3.4 * n_rows + 1.6)
@@ -2362,7 +2362,6 @@ def _write_significant_roi_condition_panel_png(
         axes[row_idx, col_idx].axis("off")
 
     fig.text(0.5, 0.02, "ROI", ha="center", va="center")
-    fig.text(0.02, 0.5, "GVS Condition", ha="center", va="center", rotation=90)
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
 
