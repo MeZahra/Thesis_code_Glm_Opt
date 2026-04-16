@@ -7,6 +7,7 @@ import argparse
 from collections import defaultdict
 import json
 import math
+import re
 import sys
 import warnings
 from dataclasses import dataclass
@@ -377,6 +378,8 @@ def summarize_condition_metrics(trial_df: pd.DataFrame) -> pd.DataFrame:
         group = group.sort_values(["run", "block_order", "trial_in_block"]).reset_index(drop=True)
         y = np.asarray(group["y"], dtype=np.float64)
         y_finite = y[np.isfinite(y)]
+        rt = np.asarray(group["rt"], dtype=np.float64)
+        rt_finite = rt[np.isfinite(rt)]
         rt_pair_mask = np.isfinite(group["y"].to_numpy(dtype=np.float64)) & np.isfinite(
             group["rt"].to_numpy(dtype=np.float64)
         )
@@ -442,10 +445,18 @@ def summarize_condition_metrics(trial_df: pd.DataFrame) -> pd.DataFrame:
                 "is_sham": bool(is_sham),
                 "n_trials_total": int(group.shape[0]),
                 "n_trials_y": int(y_finite.size),
+                "n_trials_rt": int(rt_finite.size),
                 "n_trials_y_rt": int(y_pair.size),
                 "mean_y": float(np.mean(y_finite)) if y_finite.size else float("nan"),
                 "std_y": float(np.std(y_finite)) if y_finite.size else float("nan"),
-                "mean_rt": float(np.mean(rt_pair)) if rt_pair.size else float("nan"),
+                "mean_rt": float(np.mean(rt_finite)) if rt_finite.size else float("nan"),
+                "std_rt": float(np.std(rt_finite, ddof=1)) if rt_finite.size >= 2 else float("nan"),
+                "sem_rt": (
+                    float(np.std(rt_finite, ddof=1) / math.sqrt(rt_finite.size))
+                    if rt_finite.size >= 2
+                    else float("nan")
+                ),
+                "median_rt": float(np.median(rt_finite)) if rt_finite.size else float("nan"),
                 "y_rt_r": y_rt_r,
                 "y_rt_p": y_rt_p,
                 "y_rt_fisher_z": fisher_z_value(y_rt_r),
@@ -695,6 +706,110 @@ def build_condition_on_vs_off_contrasts(
     return contrast_df
 
 
+def build_condition_vs_sham_contrasts(
+    fit: Any | None,
+    *,
+    medication: str,
+    out_path: Path | None = None,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for condition_factor in PLOT_CONDITION_ORDER:
+        if condition_factor == "sham":
+            continue
+        contrast = _linear_model_contrast(
+            fit,
+            {
+                f'C(condition_factor, Treatment(reference="sham"))[T.{condition_factor}]': 1.0,
+            },
+        )
+        rows.append(
+            {
+                "medication": str(medication),
+                "condition_factor": condition_factor,
+                "estimate_vs_sham": float(contrast["estimate"]),
+                "se": float(contrast["se"]),
+                "z_value": float(contrast["z_value"]),
+                "p_value": float(contrast["p_value_two_sided"]),
+            }
+        )
+
+    contrast_df = pd.DataFrame(rows)
+    if not contrast_df.empty:
+        valid_mask = np.isfinite(contrast_df["p_value"].to_numpy(dtype=np.float64))
+        q_values = np.full(contrast_df.shape[0], np.nan, dtype=np.float64)
+        significant = np.zeros(contrast_df.shape[0], dtype=bool)
+        if np.any(valid_mask):
+            significant_valid, q_values_valid = fdrcorrection(
+                contrast_df.loc[valid_mask, "p_value"].to_numpy(dtype=np.float64)
+            )
+            q_values[valid_mask] = q_values_valid
+            significant[valid_mask] = significant_valid
+        contrast_df["q_value_fdr"] = q_values
+        contrast_df["significant_fdr"] = significant
+    if out_path is not None:
+        contrast_df.to_csv(out_path, index=False)
+    return contrast_df
+
+
+def _fit_fixed_effect_model(
+    data: pd.DataFrame,
+    response_col: str,
+    formula_rhs: str,
+    model_name: str,
+    *,
+    cluster_col: str = "subject",
+) -> ModelResult:
+    model_df = data.copy()
+    model_df = model_df.dropna(subset=[response_col, "subject", cluster_col]).reset_index(drop=True)
+    formula = f"{response_col} ~ {formula_rhs}"
+    if model_df.empty:
+        empty_table = pd.DataFrame(columns=["term", "coef", "std_err", "z_or_t", "p_value", "ci_low", "ci_high"])
+        return ModelResult(
+            name=model_name,
+            engine="none",
+            formula=formula,
+            n_obs=0,
+            n_groups=0,
+            converged=None,
+            aic=None,
+            bic=None,
+            table=empty_table,
+            summary_text="No usable rows for model fitting.\n",
+            fit_object=None,
+        )
+
+    fit = smf.ols(formula, data=model_df).fit(
+        cov_type="cluster",
+        cov_kwds={"groups": model_df[cluster_col]},
+    )
+    conf = fit.conf_int()
+    table = pd.DataFrame(
+        {
+            "term": fit.params.index,
+            "coef": fit.params.to_numpy(dtype=np.float64),
+            "std_err": fit.bse.to_numpy(dtype=np.float64),
+            "z_or_t": fit.tvalues.to_numpy(dtype=np.float64),
+            "p_value": fit.pvalues.to_numpy(dtype=np.float64),
+            "ci_low": conf.iloc[:, 0].to_numpy(dtype=np.float64),
+            "ci_high": conf.iloc[:, 1].to_numpy(dtype=np.float64),
+        }
+    )
+    n_groups = int(model_df[cluster_col].nunique())
+    return ModelResult(
+        name=model_name,
+        engine=f"ols_cluster_{cluster_col}",
+        formula=formula,
+        n_obs=int(model_df.shape[0]),
+        n_groups=n_groups,
+        converged=None,
+        aic=float(fit.aic) if np.isfinite(fit.aic) else None,
+        bic=float(fit.bic) if np.isfinite(fit.bic) else None,
+        table=table,
+        summary_text=str(fit.summary()),
+        fit_object=fit,
+    )
+
+
 def fit_primary_models(
     trial_df: pd.DataFrame,
     summary_df: pd.DataFrame,
@@ -772,6 +887,890 @@ def fit_primary_models(
     model_df = pd.DataFrame(model_rows)
     model_df.to_csv(out_dir / "primary_model_coefficients.csv", index=False)
     return model_df, consecutive_rmse_contrasts
+
+
+def _condition_summary_display_name(condition_factor: str) -> str:
+    label = str(condition_factor)
+    if label == "sham":
+        return "sham"
+    match = re.fullmatch(r"GVS(\d+)", label)
+    if match is None:
+        return label
+    condition_number = int(match.group(1))
+    if condition_number >= 2:
+        return f"GVS{condition_number - 1}"
+    return label
+
+
+def compute_per_subject_rt_vs_sham_stats(trial_df: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    if trial_df.empty:
+        return pd.DataFrame()
+
+    for (subject, medication), group_df in trial_df.groupby(
+        ["subject", "medication"], sort=True, observed=True
+    ):
+        sham_values = group_df.loc[group_df["condition_factor"] == "sham", "rt"].to_numpy(dtype=np.float64)
+        sham_values = sham_values[np.isfinite(sham_values)]
+        for condition_factor in PLOT_CONDITION_ORDER:
+            if condition_factor == "sham":
+                continue
+            condition_values = group_df.loc[
+                group_df["condition_factor"] == condition_factor,
+                "rt",
+            ].to_numpy(dtype=np.float64)
+            condition_values = condition_values[np.isfinite(condition_values)]
+
+            p_value = float("nan")
+            statistic = float("nan")
+            if sham_values.size >= 1 and condition_values.size >= 1:
+                try:
+                    test_result = stats.mannwhitneyu(
+                        condition_values,
+                        sham_values,
+                        alternative="two-sided",
+                        method="auto",
+                    )
+                    statistic = float(test_result.statistic)
+                    p_value = float(test_result.pvalue)
+                except ValueError:
+                    statistic = float("nan")
+                    p_value = float("nan")
+
+            mean_condition = float(np.mean(condition_values)) if condition_values.size else float("nan")
+            mean_sham = float(np.mean(sham_values)) if sham_values.size else float("nan")
+            mean_delta = (
+                float(mean_condition - mean_sham)
+                if np.isfinite(mean_condition) and np.isfinite(mean_sham)
+                else float("nan")
+            )
+            rows.append(
+                {
+                    "subject": str(subject),
+                    "medication": str(medication),
+                    "condition_factor": str(condition_factor),
+                    "condition_plot_label": _condition_summary_display_name(str(condition_factor)),
+                    "n_trials_condition": int(condition_values.size),
+                    "n_trials_sham": int(sham_values.size),
+                    "mean_condition_rt": mean_condition,
+                    "mean_sham_rt": mean_sham,
+                    "mean_delta_rt_vs_sham": mean_delta,
+                    "median_condition_rt": (
+                        float(np.median(condition_values)) if condition_values.size else float("nan")
+                    ),
+                    "median_sham_rt": float(np.median(sham_values)) if sham_values.size else float("nan"),
+                    "mannwhitney_u_statistic": statistic,
+                    "p_value": p_value,
+                    "direction_vs_sham": (
+                        "higher_rt_than_sham"
+                        if np.isfinite(mean_delta) and mean_delta > 0.0
+                        else (
+                            "lower_rt_than_sham"
+                            if np.isfinite(mean_delta) and mean_delta < 0.0
+                            else "no_mean_difference"
+                        )
+                    ),
+                }
+            )
+
+    stats_df = pd.DataFrame(rows).sort_values(
+        ["medication", "subject", "condition_factor"]
+    ).reset_index(drop=True)
+    q_values = np.full(stats_df.shape[0], np.nan, dtype=np.float64)
+    significant = np.zeros(stats_df.shape[0], dtype=bool)
+    for _, idx in stats_df.groupby(["subject", "medication"], sort=True, observed=True).groups.items():
+        idx_array = np.asarray(list(idx), dtype=np.int64)
+        p_values = stats_df.loc[idx_array, "p_value"].to_numpy(dtype=np.float64)
+        finite_mask = np.isfinite(p_values)
+        if not np.any(finite_mask):
+            continue
+        significant_valid, q_values_valid = fdrcorrection(p_values[finite_mask], alpha=0.05)
+        q_values[idx_array[finite_mask]] = q_values_valid
+        significant[idx_array[finite_mask]] = significant_valid
+    stats_df["q_value_fdr"] = q_values
+    stats_df["significant_fdr"] = significant
+    return stats_df
+
+
+def compute_per_subject_off_to_on_sham_rt_stats(trial_df: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    if trial_df.empty:
+        return pd.DataFrame()
+
+    for subject, subject_df in trial_df.groupby("subject", sort=True, observed=True):
+        sham_on_values = subject_df.loc[
+            (subject_df["medication"].astype(str) == "ON")
+            & (subject_df["condition_factor"].astype(str) == "sham"),
+            "rt",
+        ].to_numpy(dtype=np.float64)
+        sham_on_values = sham_on_values[np.isfinite(sham_on_values)]
+        if sham_on_values.size == 0:
+            continue
+
+        off_df = subject_df.loc[subject_df["medication"].astype(str) == "OFF"].copy()
+        for condition_factor in PLOT_CONDITION_ORDER:
+            condition_values = off_df.loc[
+                off_df["condition_factor"].astype(str) == str(condition_factor),
+                "rt",
+            ].to_numpy(dtype=np.float64)
+            condition_values = condition_values[np.isfinite(condition_values)]
+
+            p_value = float("nan")
+            statistic = float("nan")
+            if condition_values.size >= 1:
+                try:
+                    test_result = stats.mannwhitneyu(
+                        condition_values,
+                        sham_on_values,
+                        alternative="two-sided",
+                        method="auto",
+                    )
+                    statistic = float(test_result.statistic)
+                    p_value = float(test_result.pvalue)
+                except ValueError:
+                    statistic = float("nan")
+                    p_value = float("nan")
+
+            mean_condition = float(np.mean(condition_values)) if condition_values.size else float("nan")
+            mean_reference = float(np.mean(sham_on_values)) if sham_on_values.size else float("nan")
+            mean_delta = (
+                float(mean_condition - mean_reference)
+                if np.isfinite(mean_condition) and np.isfinite(mean_reference)
+                else float("nan")
+            )
+            rows.append(
+                {
+                    "subject": str(subject),
+                    "target_medication": "OFF",
+                    "reference_medication": "ON",
+                    "reference_condition_factor": "sham",
+                    "condition_factor": str(condition_factor),
+                    "condition_plot_label": _condition_summary_display_name(str(condition_factor)),
+                    "n_trials_condition": int(condition_values.size),
+                    "n_trials_reference": int(sham_on_values.size),
+                    "mean_condition_rt": mean_condition,
+                    "mean_reference_rt": mean_reference,
+                    "mean_delta_rt_vs_on_sham": mean_delta,
+                    "median_condition_rt": (
+                        float(np.median(condition_values)) if condition_values.size else float("nan")
+                    ),
+                    "median_reference_rt": float(np.median(sham_on_values)) if sham_on_values.size else float("nan"),
+                    "mannwhitney_u_statistic": statistic,
+                    "p_value": p_value,
+                    "direction_vs_on_sham": (
+                        "higher_rt_than_on_sham"
+                        if np.isfinite(mean_delta) and mean_delta > 0.0
+                        else (
+                            "lower_rt_than_on_sham"
+                            if np.isfinite(mean_delta) and mean_delta < 0.0
+                            else "no_mean_difference"
+                        )
+                    ),
+                }
+            )
+
+    stats_df = pd.DataFrame(rows).sort_values(
+        ["subject", "condition_factor"]
+    ).reset_index(drop=True)
+    q_values = np.full(stats_df.shape[0], np.nan, dtype=np.float64)
+    significant = np.zeros(stats_df.shape[0], dtype=bool)
+    if not stats_df.empty:
+        for _, idx in stats_df.groupby(["subject"], sort=True, observed=True).groups.items():
+            idx_array = np.asarray(list(idx), dtype=np.int64)
+            p_values = stats_df.loc[idx_array, "p_value"].to_numpy(dtype=np.float64)
+            finite_mask = np.isfinite(p_values)
+            if not np.any(finite_mask):
+                continue
+            significant_valid, q_values_valid = fdrcorrection(p_values[finite_mask], alpha=0.05)
+            q_values[idx_array[finite_mask]] = q_values_valid
+            significant[idx_array[finite_mask]] = significant_valid
+    stats_df["q_value_fdr"] = q_values
+    stats_df["significant_fdr"] = significant
+    return stats_df
+
+
+def summarize_per_subject_significant_rt_conditions(stats_df: pd.DataFrame) -> pd.DataFrame:
+    if stats_df.empty:
+        return pd.DataFrame(
+            columns=["subject", "medication", "n_significant_conditions_fdr", "significant_conditions_fdr"]
+        )
+
+    rows: list[dict[str, Any]] = []
+    for (subject, medication), group_df in stats_df.groupby(
+        ["subject", "medication"], sort=True, observed=True
+    ):
+        significant_conditions = (
+            group_df.loc[group_df["significant_fdr"], "condition_plot_label"].astype(str).tolist()
+        )
+        rows.append(
+            {
+                "subject": str(subject),
+                "medication": str(medication),
+                "n_significant_conditions_fdr": int(len(significant_conditions)),
+                "significant_conditions_fdr": ", ".join(significant_conditions) if significant_conditions else "None",
+            }
+    )
+    return pd.DataFrame(rows).sort_values(["medication", "subject"]).reset_index(drop=True)
+
+
+def _build_subject_condition_summary_table_df(
+    summary_df: pd.DataFrame,
+    *,
+    medication: str,
+    value_col: str,
+    spread_col: str,
+    value_decimals: int = 3,
+    significance_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    med_df = summary_df.loc[summary_df["medication"] == medication].copy()
+    ordered_conditions = [
+        condition for condition in PLOT_CONDITION_ORDER if condition in med_df["condition_factor"].astype(str).tolist()
+    ]
+    if med_df.empty or not ordered_conditions:
+        return pd.DataFrame(columns=["Subject", *PLOT_CONDITION_ORDER])
+
+    label_map = {condition: _condition_summary_display_name(condition) for condition in ordered_conditions}
+    mean_pivot = med_df.pivot(index="subject", columns="condition_factor", values=value_col)
+    mean_pivot = mean_pivot.reindex(columns=ordered_conditions).sort_index()
+    spread_pivot = med_df.pivot(index="subject", columns="condition_factor", values=spread_col)
+    spread_pivot = spread_pivot.reindex(index=mean_pivot.index, columns=ordered_conditions)
+
+    significance_level_by_pair: dict[tuple[str, str], int] = {}
+    if significance_df is not None and not significance_df.empty:
+        sig_subset = significance_df.loc[
+            significance_df["medication"].astype(str) == str(medication)
+        ].copy()
+        for row in sig_subset.itertuples(index=False):
+            pair = (str(row.subject), str(row.condition_factor))
+            p_value = float(getattr(row, "p_value", np.nan))
+            if bool(getattr(row, "significant_fdr", False)):
+                significance_level_by_pair[pair] = 2
+            elif np.isfinite(p_value) and p_value < 0.05:
+                significance_level_by_pair[pair] = max(significance_level_by_pair.get(pair, 0), 1)
+
+    table_df = pd.DataFrame(index=mean_pivot.index)
+    for condition in ordered_conditions:
+        labels: list[str] = []
+        mean_values = mean_pivot[condition].to_numpy(dtype=np.float64)
+        spread_values = spread_pivot[condition].to_numpy(dtype=np.float64)
+        for subject_name, mean_value, spread_value in zip(
+            mean_pivot.index.tolist(),
+            mean_values,
+            spread_values,
+            strict=True,
+        ):
+            if not np.isfinite(mean_value):
+                labels.append("NA")
+                continue
+            if np.isfinite(spread_value):
+                cell_label = f"{mean_value:.{value_decimals}f}+-{spread_value:.{value_decimals}f}"
+            else:
+                cell_label = f"{mean_value:.{value_decimals}f}"
+            sig_level = significance_level_by_pair.get((str(subject_name), str(condition)), 0)
+            if sig_level == 2:
+                cell_label = f"{cell_label}**"
+            elif sig_level == 1:
+                cell_label = f"{cell_label}*"
+            labels.append(cell_label)
+        table_df[label_map[condition]] = labels
+    return table_df.reset_index().rename(columns={"subject": "Subject"})
+
+
+def _render_subject_condition_summary_table(
+    table_df: pd.DataFrame,
+    *,
+    out_png: Path,
+    title: str,
+    footnote: str = "* p < 0.05, ** FDR < 0.05",
+) -> None:
+    if table_df.empty:
+        fig, ax = plt.subplots(figsize=(8, 2.8))
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No rows available.", ha="center", va="center", fontsize=12)
+        ax.set_title(title)
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=220, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    fig_w = max(11.0, 1.55 * table_df.shape[1] + 1.8)
+    fig_h = max(4.6, 0.42 * table_df.shape[0] + 2.2)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.axis("off")
+    table = ax.table(
+        cellText=table_df.to_numpy(dtype=object),
+        colLabels=table_df.columns.tolist(),
+        cellLoc="center",
+        loc="center",
+        bbox=[0.0, 0.04, 1.0, 0.88],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.0, 1.2)
+    for (row_idx, col_idx), cell in table.get_celld().items():
+        cell.set_edgecolor("black")
+        cell.set_linewidth(0.6)
+        if row_idx == 0:
+            cell.set_facecolor("#e6e6e6")
+            cell.set_text_props(weight="bold")
+        elif col_idx == 0:
+            cell.set_facecolor("#f2f2f2")
+            cell.set_text_props(weight="bold")
+        else:
+            cell.set_facecolor("white")
+    ax.set_title(title, pad=12)
+    ax.text(0.0, 0.0, footnote, ha="left", va="bottom", fontsize=9, transform=ax.transAxes)
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.97])
+    fig.savefig(out_png, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def write_subject_condition_summary_table(
+    summary_df: pd.DataFrame,
+    *,
+    medication: str,
+    value_col: str,
+    spread_col: str,
+    out_csv: Path,
+    out_png: Path,
+    title: str,
+    value_decimals: int = 3,
+    significance_df: pd.DataFrame | None = None,
+) -> None:
+    table_df = _build_subject_condition_summary_table_df(
+        summary_df,
+        medication=medication,
+        value_col=value_col,
+        spread_col=spread_col,
+        value_decimals=value_decimals,
+        significance_df=significance_df,
+    )
+    table_df.to_csv(out_csv, index=False)
+    _render_subject_condition_summary_table(table_df, out_png=out_png, title=title)
+
+
+def write_combined_subject_condition_summary_panel(
+    summary_df: pd.DataFrame,
+    *,
+    value_col: str,
+    spread_col: str,
+    out_png: Path,
+    title: str,
+    value_decimals: int = 3,
+    significance_df: pd.DataFrame | None = None,
+) -> None:
+    off_table_df = _build_subject_condition_summary_table_df(
+        summary_df,
+        medication="OFF",
+        value_col=value_col,
+        spread_col=spread_col,
+        value_decimals=value_decimals,
+        significance_df=significance_df,
+    )
+    on_table_df = _build_subject_condition_summary_table_df(
+        summary_df,
+        medication="ON",
+        value_col=value_col,
+        spread_col=spread_col,
+        value_decimals=value_decimals,
+        significance_df=significance_df,
+    )
+
+    fig_w = max(
+        12.0,
+        1.55
+        * max(
+            off_table_df.shape[1] if not off_table_df.empty else 0,
+            on_table_df.shape[1] if not on_table_df.empty else 0,
+        )
+        + 1.8,
+    )
+    fig_h = max(
+        8.0,
+        0.42 * (off_table_df.shape[0] if not off_table_df.empty else 2)
+        + 0.42 * (on_table_df.shape[0] if not on_table_df.empty else 2)
+        + 3.5,
+    )
+    fig, axes = plt.subplots(2, 1, figsize=(fig_w, fig_h))
+    panels = [("OFF", off_table_df), ("ON", on_table_df)]
+    for ax, (medication, table_df) in zip(np.atleast_1d(axes), panels, strict=True):
+        ax.axis("off")
+        if table_df.empty:
+            ax.text(0.5, 0.5, f"No {medication} rows available.", ha="center", va="center", fontsize=12)
+            ax.set_title(medication)
+            continue
+        table = ax.table(
+            cellText=table_df.to_numpy(dtype=object),
+            colLabels=table_df.columns.tolist(),
+            cellLoc="center",
+            loc="center",
+            bbox=[0.0, 0.05, 1.0, 0.85],
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1.0, 1.2)
+        for (row_idx, col_idx), cell in table.get_celld().items():
+            cell.set_edgecolor("black")
+            cell.set_linewidth(0.6)
+            if row_idx == 0:
+                cell.set_facecolor("#e6e6e6")
+                cell.set_text_props(weight="bold")
+            elif col_idx == 0:
+                cell.set_facecolor("#f2f2f2")
+                cell.set_text_props(weight="bold")
+            else:
+                cell.set_facecolor("white")
+        ax.set_title(medication, pad=10)
+    fig.suptitle(title, fontsize=13)
+    fig.text(0.01, 0.01, "* p < 0.05, ** FDR < 0.05", ha="left", va="bottom", fontsize=9)
+    fig.tight_layout(rect=[0.0, 0.02, 1.0, 0.97])
+    fig.savefig(out_png, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_subject_rt_boxplots_by_medication(
+    trial_df: pd.DataFrame,
+    stats_df: pd.DataFrame,
+    *,
+    medication: str,
+    out_path: Path,
+    title: str,
+    exclude_subjects: list[str] | None = None,
+) -> None:
+    med_trial_df = trial_df.loc[trial_df["medication"].astype(str) == str(medication)].copy()
+    if exclude_subjects:
+        med_trial_df = med_trial_df.loc[
+            ~med_trial_df["subject"].astype(str).isin([str(subject) for subject in exclude_subjects])
+        ].copy()
+    subjects = sorted(med_trial_df["subject"].astype(str).unique().tolist())
+    if not subjects:
+        fig, ax = plt.subplots(figsize=(8, 2.8))
+        ax.axis("off")
+        ax.text(0.5, 0.5, f"No {medication} rows available.", ha="center", va="center", fontsize=12)
+        ax.set_title(title)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=220, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    n_subjects = len(subjects)
+    n_cols = min(4, max(1, n_subjects))
+    n_rows = int(np.ceil(n_subjects / n_cols))
+    fig_w = max(14.0, 4.3 * n_cols)
+    fig_h = max(8.0, 3.2 * n_rows + 1.0)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_w, fig_h), squeeze=False)
+    axes_flat = axes.ravel()
+
+    ordered_conditions = [
+        condition for condition in PLOT_CONDITION_ORDER if condition in med_trial_df["condition_factor"].astype(str).tolist()
+    ]
+    display_labels = [_condition_summary_display_name(condition) for condition in ordered_conditions]
+    colors = plt.get_cmap("jet")(np.linspace(0.1, 0.9, len(ordered_conditions)))
+
+    for ax_idx, subject in enumerate(subjects):
+        ax = axes_flat[ax_idx]
+        subject_df = med_trial_df.loc[med_trial_df["subject"].astype(str) == subject].copy()
+        values_list: list[np.ndarray] = []
+        for condition in ordered_conditions:
+            values = subject_df.loc[
+                subject_df["condition_factor"].astype(str) == str(condition),
+                "rt",
+            ].to_numpy(dtype=np.float64)
+            values_list.append(values[np.isfinite(values)])
+
+        box = ax.boxplot(
+            values_list,
+            patch_artist=True,
+            tick_labels=display_labels,
+            widths=0.65,
+            showfliers=False,
+        )
+        for patch, color in zip(box["boxes"], colors, strict=True):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.75)
+        for median in box["medians"]:
+            median.set_color("black")
+            median.set_linewidth(1.4)
+
+        ax.set_title(subject, fontsize=10)
+        ax.tick_params(axis="x", rotation=45)
+        ax.grid(axis="y", alpha=0.25)
+        if ax_idx % n_cols == 0:
+            ax.set_ylabel("RT (s)")
+
+        flat_values = np.concatenate([values for values in values_list if values.size], axis=0) if any(
+            values.size for values in values_list
+        ) else np.array([], dtype=np.float64)
+        if flat_values.size:
+            y_min = float(np.nanmin(flat_values))
+            y_max = float(np.nanmax(flat_values))
+            y_range = max(0.05, y_max - y_min)
+            y_text = y_max + 0.06 * y_range
+            ax.set_ylim(bottom=y_min - 0.04 * y_range, top=y_max + 0.18 * y_range)
+        else:
+            y_text = 1.0
+
+        subject_stats_df = stats_df.loc[
+            (stats_df["subject"].astype(str) == subject)
+            & (stats_df["medication"].astype(str) == str(medication))
+        ].copy()
+        for pos, condition in enumerate(ordered_conditions, start=1):
+            if str(condition) == "sham":
+                continue
+            stat_row = subject_stats_df.loc[
+                subject_stats_df["condition_factor"].astype(str) == str(condition)
+            ]
+            if stat_row.empty:
+                continue
+            if bool(stat_row["significant_fdr"].iloc[0]):
+                text = "**"
+            else:
+                p_value = float(stat_row["p_value"].iloc[0])
+                text = "*" if np.isfinite(p_value) and p_value < 0.05 else ""
+            if text:
+                ax.text(pos, y_text, text, ha="center", va="bottom", fontsize=10, fontweight="bold")
+
+    for ax in axes_flat[n_subjects:]:
+        ax.axis("off")
+
+    fig.suptitle(title, fontsize=13)
+    fig.text(
+        0.99,
+        0.01,
+        "* means p < 0.05; ** means FDR < 0.05",
+        ha="right",
+        va="bottom",
+        fontsize=11,
+    )
+    fig.tight_layout(rect=[0.0, 0.03, 1.0, 0.97])
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_subject_off_to_on_sham_rt_boxplots(
+    trial_df: pd.DataFrame,
+    stats_df: pd.DataFrame,
+    *,
+    out_path: Path,
+    title: str,
+    exclude_subjects: list[str] | None = None,
+) -> None:
+    plot_trial_df = trial_df.copy()
+    if exclude_subjects:
+        plot_trial_df = plot_trial_df.loc[
+            ~plot_trial_df["subject"].astype(str).isin([str(subject) for subject in exclude_subjects])
+        ].copy()
+    subjects = sorted(plot_trial_df["subject"].astype(str).unique().tolist())
+    if not subjects:
+        fig, ax = plt.subplots(figsize=(8, 2.8))
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No rows available.", ha="center", va="center", fontsize=12)
+        ax.set_title(title)
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=220, bbox_inches="tight")
+        plt.close(fig)
+        return
+
+    n_subjects = len(subjects)
+    n_cols = min(4, max(1, n_subjects))
+    n_rows = int(np.ceil(n_subjects / n_cols))
+    fig_w = max(14.0, 4.3 * n_cols)
+    fig_h = max(8.0, 3.2 * n_rows + 1.0)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_w, fig_h), squeeze=False)
+    axes_flat = axes.ravel()
+
+    off_trial_df = plot_trial_df.loc[plot_trial_df["medication"].astype(str) == "OFF"].copy()
+    condition_order = [
+        condition for condition in PLOT_CONDITION_ORDER if condition in off_trial_df["condition_factor"].astype(str).tolist()
+    ]
+    display_labels = [_condition_summary_display_name(condition) for condition in condition_order]
+    colors: list[Any] = ["#4d4d4d"]
+    if len(condition_order) > 1:
+        colors.extend(plt.get_cmap("jet")(np.linspace(0.1, 0.9, len(condition_order) - 1)).tolist())
+
+    for ax_idx, subject in enumerate(subjects):
+        ax = axes_flat[ax_idx]
+        subject_df = plot_trial_df.loc[plot_trial_df["subject"].astype(str) == subject].copy()
+
+        values_list: list[np.ndarray] = []
+        for condition in condition_order:
+            values = subject_df.loc[
+                (subject_df["medication"].astype(str) == "OFF")
+                & (subject_df["condition_factor"].astype(str) == str(condition)),
+                "rt",
+            ].to_numpy(dtype=np.float64)
+            values_list.append(values[np.isfinite(values)])
+
+        box = ax.boxplot(
+            values_list,
+            patch_artist=True,
+            tick_labels=display_labels,
+            widths=0.65,
+            showfliers=False,
+        )
+        for patch, color in zip(box["boxes"], colors, strict=True):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.75)
+        for median in box["medians"]:
+            median.set_color("black")
+            median.set_linewidth(1.4)
+
+        ax.set_title(subject, fontsize=10)
+        ax.tick_params(axis="x", rotation=45)
+        ax.grid(axis="y", alpha=0.25)
+        if ax_idx % n_cols == 0:
+            ax.set_ylabel("RT (s)")
+
+        flat_values = np.concatenate([values for values in values_list if values.size], axis=0) if any(
+            values.size for values in values_list
+        ) else np.array([], dtype=np.float64)
+        if flat_values.size:
+            y_min = float(np.nanmin(flat_values))
+            y_max = float(np.nanmax(flat_values))
+            y_range = max(0.05, y_max - y_min)
+            y_text = y_max + 0.06 * y_range
+            ax.set_ylim(bottom=y_min - 0.04 * y_range, top=y_max + 0.18 * y_range)
+        else:
+            y_text = 1.0
+
+        subject_stats_df = stats_df.loc[stats_df["subject"].astype(str) == subject].copy()
+        for pos, condition in enumerate(condition_order, start=1):
+            stat_row = subject_stats_df.loc[
+                subject_stats_df["condition_factor"].astype(str) == str(condition)
+            ]
+            if stat_row.empty:
+                continue
+            if bool(stat_row["significant_fdr"].iloc[0]):
+                text = "**"
+            else:
+                p_value = float(stat_row["p_value"].iloc[0])
+                text = "*" if np.isfinite(p_value) and p_value < 0.05 else ""
+            if text:
+                ax.text(pos, y_text, text, ha="center", va="bottom", fontsize=10, fontweight="bold")
+
+    for ax in axes_flat[n_subjects:]:
+        ax.axis("off")
+
+    fig.suptitle(title, fontsize=13)
+    fig.text(
+        0.99,
+        0.01,
+        "* means p < 0.05; ** means FDR < 0.05",
+        ha="right",
+        va="bottom",
+        fontsize=11,
+    )
+    fig.tight_layout(rect=[0.0, 0.03, 1.0, 0.97])
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+
+
+def run_behavior_rt_support_analysis(
+    trial_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    out_dir: Path,
+) -> dict[str, pd.DataFrame]:
+    rt_dir = ensure_dir(out_dir / "behavior_rt_support")
+    tables_dir = ensure_dir(rt_dir / "tables")
+    plots_dir = ensure_dir(rt_dir / "plots")
+    models_dir = ensure_dir(rt_dir / "models")
+
+    rt_trial_df = trial_df.loc[
+        :,
+        [
+            "subject",
+            "subject_session",
+            "session",
+            "medication",
+            "run",
+            "condition_code",
+            "condition_name",
+            "condition_factor",
+            "is_sham",
+            "block_order",
+            "trial_in_block",
+            "inv_rt",
+            "rt",
+        ],
+    ].copy()
+    rt_trial_df["condition_plot_label"] = rt_trial_df["condition_factor"].map(_condition_summary_display_name)
+    rt_trial_df.to_csv(tables_dir / "trial_level_rt_by_condition.csv", index=False)
+    per_subject_rt_stats_df = compute_per_subject_rt_vs_sham_stats(rt_trial_df)
+    per_subject_rt_stats_df.to_csv(tables_dir / "per_subject_rt_vs_sham_stats.csv", index=False)
+    per_subject_sig_summary_df = summarize_per_subject_significant_rt_conditions(per_subject_rt_stats_df)
+    per_subject_sig_summary_df.to_csv(tables_dir / "per_subject_significant_rt_conditions.csv", index=False)
+    per_subject_off_to_on_sham_rt_stats_df = compute_per_subject_off_to_on_sham_rt_stats(rt_trial_df)
+    per_subject_off_to_on_sham_rt_stats_df.to_csv(
+        tables_dir / "per_subject_off_to_on_sham_rt_stats.csv",
+        index=False,
+    )
+
+    rt_summary_df = summary_df.loc[
+        :,
+        [
+            "subject",
+            "subject_session",
+            "session",
+            "medication",
+            "condition_code",
+            "condition_name",
+            "condition_factor",
+            "is_sham",
+            "n_trials_rt",
+            "mean_rt",
+            "std_rt",
+            "sem_rt",
+            "median_rt",
+            "mean_run",
+            "mean_block_order",
+        ],
+    ].copy()
+    rt_summary_df["condition_plot_label"] = rt_summary_df["condition_factor"].map(_condition_summary_display_name)
+    rt_summary_df.to_csv(tables_dir / "session_condition_rt_summary.csv", index=False)
+
+    rt_delta_df = build_primary_delta_table(rt_summary_df, ["mean_rt"])
+    rt_delta_df["condition_plot_label"] = rt_delta_df["condition_factor"].map(_condition_summary_display_name)
+    rt_delta_df.to_csv(tables_dir / "session_condition_mean_rt_delta_vs_sham.csv", index=False)
+    rt_delta_tests = run_sham_delta_tests(
+        data=rt_delta_df,
+        metric_columns=["delta_vs_sham_mean_rt"],
+        condition_column="condition_factor",
+    )
+    rt_delta_tests["condition_plot_label"] = rt_delta_tests["condition_factor"].map(_condition_summary_display_name)
+    rt_delta_tests.to_csv(tables_dir / "mean_rt_sham_delta_tests.csv", index=False)
+
+    plot_metric_by_condition(
+        rt_summary_df,
+        metric="mean_rt",
+        ylabel="Mean RT (s)",
+        out_path=plots_dir / "mean_rt_by_condition.png",
+        condition_label_map={condition: _condition_summary_display_name(condition) for condition in PLOT_CONDITION_ORDER},
+    )
+
+    write_subject_condition_summary_table(
+        rt_summary_df,
+        medication="OFF",
+        value_col="mean_rt",
+        spread_col="std_rt",
+        out_csv=tables_dir / "off_mean_rt_subject_by_gvs.csv",
+        out_png=plots_dir / "off_mean_rt_subject_by_gvs.png",
+        title="OFF mean RT by subject and GVS condition",
+        significance_df=per_subject_rt_stats_df,
+    )
+    write_subject_condition_summary_table(
+        rt_summary_df,
+        medication="ON",
+        value_col="mean_rt",
+        spread_col="std_rt",
+        out_csv=tables_dir / "on_mean_rt_subject_by_gvs.csv",
+        out_png=plots_dir / "on_mean_rt_subject_by_gvs.png",
+        title="ON mean RT by subject and GVS condition",
+        significance_df=per_subject_rt_stats_df,
+    )
+    write_combined_subject_condition_summary_panel(
+        rt_summary_df,
+        value_col="mean_rt",
+        spread_col="std_rt",
+        out_png=plots_dir / "rt_subject_by_gvs_significance_panel.png",
+        title="Subject RT by GVS condition and sham",
+        significance_df=per_subject_rt_stats_df,
+    )
+    plot_subject_rt_boxplots_by_medication(
+        rt_trial_df,
+        per_subject_rt_stats_df,
+        medication="OFF",
+        out_path=plots_dir / "off_rt_subject_boxplots.png",
+        title="OFF RT by subject: sham vs GVS conditions",
+    )
+    plot_subject_rt_boxplots_by_medication(
+        rt_trial_df,
+        per_subject_rt_stats_df,
+        medication="ON",
+        out_path=plots_dir / "on_rt_subject_boxplots.png",
+        title="ON RT by subject: sham vs GVS conditions",
+        exclude_subjects=["sub-pd017"],
+    )
+    plot_subject_off_to_on_sham_rt_boxplots(
+        rt_trial_df,
+        per_subject_off_to_on_sham_rt_stats_df,
+        out_path=plots_dir / "off_gvs_vs_on_sham_rt_subject_boxplots.png",
+        title="OFF sham and GVS RT by subject: compared with sham ON",
+        exclude_subjects=["sub-pd017"],
+    )
+
+    formula_within = 'C(subject) + C(condition_factor, Treatment(reference="sham")) + mean_run + mean_block_order'
+    formula_combined = (
+        'C(subject) + C(medication, Treatment(reference="OFF")) '
+        '* C(condition_factor, Treatment(reference="sham")) + mean_run + mean_block_order'
+    )
+
+    model_results: list[ModelResult] = []
+    for medication in MEDICATION_ORDER:
+        med_result = _fit_fixed_effect_model(
+            data=rt_summary_df.loc[rt_summary_df["medication"] == medication].reset_index(drop=True),
+            response_col="mean_rt",
+            formula_rhs=formula_within,
+            model_name=f"condition_level_mean_rt_subject_fe_{str(medication).lower()}",
+        )
+        (models_dir / f"{med_result.name}_summary.txt").write_text(med_result.summary_text, encoding="utf-8")
+        med_result.table.to_csv(models_dir / f"{med_result.name}_coefficients.csv", index=False)
+        med_contrasts = build_condition_vs_sham_contrasts(
+            med_result.fit_object,
+            medication=str(medication),
+            out_path=None,
+        )
+        med_contrasts["condition_plot_label"] = med_contrasts["condition_factor"].map(_condition_summary_display_name)
+        med_contrasts.to_csv(models_dir / f"{med_result.name}_condition_vs_sham_contrasts.csv", index=False)
+        model_results.append(med_result)
+
+    combined_result = _fit_fixed_effect_model(
+        data=rt_summary_df,
+        response_col="mean_rt",
+        formula_rhs=formula_combined,
+        model_name="condition_level_mean_rt_subject_fe_combined",
+    )
+    (models_dir / f"{combined_result.name}_summary.txt").write_text(
+        combined_result.summary_text,
+        encoding="utf-8",
+    )
+    combined_result.table.to_csv(models_dir / f"{combined_result.name}_coefficients.csv", index=False)
+    combined_contrasts = build_condition_on_vs_off_contrasts(
+        combined_result.fit_object,
+        out_path=None,
+    )
+    combined_contrasts["condition_plot_label"] = combined_contrasts["condition_factor"].map(_condition_summary_display_name)
+    combined_contrasts.to_csv(models_dir / f"{combined_result.name}_on_vs_off_contrasts.csv", index=False)
+    model_results.append(combined_result)
+
+    model_rows: list[dict[str, Any]] = []
+    for result in model_results:
+        for row in result.table.to_dict(orient="records"):
+            model_rows.append(
+                {
+                    "model_name": result.name,
+                    "engine": result.engine,
+                    "formula": result.formula,
+                    "n_obs": result.n_obs,
+                    "n_groups": result.n_groups,
+                    "converged": result.converged,
+                    "aic": result.aic,
+                    "bic": result.bic,
+                    **row,
+                }
+            )
+    model_df = pd.DataFrame(model_rows)
+    model_df.to_csv(models_dir / "fixed_effect_model_coefficients.csv", index=False)
+
+    return {
+        "rt_trial_df": rt_trial_df,
+        "per_subject_rt_stats_df": per_subject_rt_stats_df,
+        "per_subject_sig_summary_df": per_subject_sig_summary_df,
+        "per_subject_off_to_on_sham_rt_stats_df": per_subject_off_to_on_sham_rt_stats_df,
+        "rt_summary_df": rt_summary_df,
+        "rt_delta_df": rt_delta_df,
+        "rt_delta_tests": rt_delta_tests,
+        "rt_model_df": model_df,
+    }
 
 
 def run_sham_delta_tests(
@@ -1504,6 +2503,7 @@ def plot_metric_by_condition(
     ylabel: str,
     out_path: Path,
     significance_df: pd.DataFrame | None = None,
+    condition_label_map: dict[str, str] | None = None,
 ) -> None:
     fig, ax = plt.subplots(figsize=(10, 5))
     x_positions = np.arange(len(PLOT_CONDITION_ORDER), dtype=np.float64)
@@ -1582,7 +2582,11 @@ def plot_metric_by_condition(
                 ax.set_ylim(ymin, max(ymax, max(star_tops) + top_margin))
 
     ax.set_xticks(x_positions)
-    ax.set_xticklabels(PLOT_CONDITION_ORDER, rotation=45, ha="right")
+    xtick_labels = [
+        condition_label_map.get(condition, condition) if condition_label_map is not None else condition
+        for condition in PLOT_CONDITION_ORDER
+    ]
+    ax.set_xticklabels(xtick_labels, rotation=45, ha="right")
     ax.set_ylabel(ylabel)
     ax.set_xlabel("GVS condition")
     ax.legend(frameon=False)
@@ -1951,6 +2955,11 @@ def main() -> None:
         summary_df=summary_df,
         out_dir=primary_dir,
     )
+    rt_support_outputs = run_behavior_rt_support_analysis(
+        trial_df=trial_df,
+        summary_df=summary_df,
+        out_dir=out_dir,
+    )
 
     plot_metric_by_condition(
         summary_df,
@@ -2180,6 +3189,7 @@ def main() -> None:
         "active_condition_codes": ACTIVE_CONDITION_CODES,
         "n_trial_rows": int(trial_df.shape[0]),
         "n_condition_rows": int(summary_df.shape[0]),
+        "n_behavior_rt_rows": int(rt_support_outputs["rt_summary_df"].shape[0]),
         "n_fc_rows": int(fc_df.shape[0]),
         "n_run_level_fc_rows": int(run_level_fc_df.shape[0]),
         "n_approach1_rows": int(approach1_df.shape[0]),
