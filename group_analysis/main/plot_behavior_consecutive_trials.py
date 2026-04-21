@@ -3,9 +3,9 @@
 
 The script uses the same behavior-file and trial_keep convention as
 motor_brain_com.py, but instead of plotting (trial i, trial i+1) pairs, it
-plots each kept trial value against trial number and connects trials within
-each run using lines. Output figures use a 2x2 panel layout with one subplot
-per session-run. Session colors are shared across runs from the same session.
+plots each kept trial value against trial number. It saves both line and
+scatter versions in a 2x2 panel layout with one subplot per session-run.
+Session colors are shared across runs from the same session.
 """
 
 from __future__ import annotations
@@ -169,6 +169,7 @@ def _plot_subject_trials(
     behavior_column: int,
     demean_within_run: bool,
     dpi: int,
+    plot_kind: str,
 ) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(10.5, 7.6), sharex=True, sharey=True)
     axes_flat = axes.ravel()
@@ -203,14 +204,31 @@ def _plot_subject_trials(
             ax.set_visible(False)
             continue
 
-        ax.plot(
-            run_df["trial_index_run"].to_numpy(dtype=np.float64),
-            run_df["behavior_value"].to_numpy(dtype=np.float64),
-            linestyle="-",
-            linewidth=1.45,
-            alpha=0.86,
-            color=session_color_map[int(ses)],
-        )
+        x_values = run_df["trial_index_run"].to_numpy(dtype=np.float64)
+        y_values = run_df["behavior_value"].to_numpy(dtype=np.float64)
+        color = session_color_map[int(ses)]
+
+        if plot_kind == "line":
+            ax.plot(
+                x_values,
+                y_values,
+                linestyle="-",
+                linewidth=1.45,
+                alpha=0.86,
+                color=color,
+            )
+        elif plot_kind == "scatter":
+            ax.scatter(
+                x_values,
+                y_values,
+                s=28,
+                alpha=0.86,
+                color=color,
+                edgecolors="none",
+            )
+        else:
+            raise ValueError(f"Unsupported plot kind: {plot_kind}")
+
         ax.set_xlim(1, x_max)
         ax.set_ylim(y_min, y_max)
         ax.grid(True, alpha=0.18, linewidth=0.7)
@@ -230,7 +248,11 @@ def _plot_subject_trials(
         if ax.get_visible():
             ax.set_ylabel(value_label)
 
-    fig.suptitle(f"{sub_tag}: behavior across kept trials by session-run", fontsize=15)
+    figure_label = "line plot" if plot_kind == "line" else "scatter plot"
+    fig.suptitle(
+        f"{sub_tag}: behavior across kept trials by session-run ({figure_label})",
+        fontsize=15,
+    )
 
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
     fig.savefig(out_path, dpi=int(dpi), bbox_inches="tight")
@@ -261,17 +283,27 @@ def main() -> None:
     n_figures = 0
     for sub_tag, subject_df in trial_df.groupby("sub_tag", sort=False):
         subject_df = subject_df.sort_values(["ses", "run", "trial_index_run"]).copy()
-        out_path = out_dir / f"{sub_tag}_behavior_trial_lineplot_panel.png"
+        line_out_path = out_dir / f"{sub_tag}_behavior_trial_lineplot_panel.png"
+        scatter_out_path = out_dir / f"{sub_tag}_behavior_trial_scatter_panel.png"
         _plot_subject_trials(
             subject_df=subject_df,
-            out_path=out_path,
+            out_path=line_out_path,
             behavior_column=int(args.behavior_column),
             demean_within_run=bool(args.demean_within_run),
             dpi=int(args.dpi),
+            plot_kind="line",
+        )
+        _plot_subject_trials(
+            subject_df=subject_df,
+            out_path=scatter_out_path,
+            behavior_column=int(args.behavior_column),
+            demean_within_run=bool(args.demean_within_run),
+            dpi=int(args.dpi),
+            plot_kind="scatter",
         )
         n_figures += 1
 
-    print(f"Saved {n_figures} subject figures to: {out_dir}")
+    print(f"Saved {n_figures} line figures and {n_figures} scatter figures to: {out_dir}")
 
 
 if __name__ == "__main__":
