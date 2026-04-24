@@ -52,6 +52,7 @@ from group_analysis.main.split_data_by_gvs_condition import (  # noqa: E402
 TRIALS_PER_BLOCK = 10
 RT_COLUMN_INDEX = 1
 MIN_CORR_TRIALS = 3
+MIN_LAG1_AUTOCORR_PAIRS = 2
 MIN_CONSECUTIVE_PAIRS = 1
 MIN_ROI_VOXELS = 5
 SHAM_CONDITION_CODE = "gvs-01"
@@ -1565,10 +1566,320 @@ def plot_subject_off_to_on_sham_rt_boxplots(
     plt.close(fig)
 
 
+def _trial_number_within_run(
+    run_df: pd.DataFrame,
+    *,
+    trials_per_block: int,
+) -> np.ndarray:
+    """Reconstruct original within-run trial numbers from block and trial indices."""
+    block_order = run_df["block_order"].to_numpy(dtype=np.int64)
+    trial_in_block = run_df["trial_in_block"].to_numpy(dtype=np.int64)
+    return ((block_order - 1) * int(trials_per_block)) + trial_in_block
+
+
+def _extract_adjacent_trial_pairs(
+    values: np.ndarray,
+    trial_numbers: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return only true lag-1 pairs; gaps from excluded trials are not bridged."""
+    values = np.asarray(values, dtype=np.float64)
+    trial_numbers = np.asarray(trial_numbers, dtype=np.int64)
+    if values.size < 2 or trial_numbers.size < 2:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    consecutive_mask = trial_numbers[1:] == (trial_numbers[:-1] + 1)
+    if not np.any(consecutive_mask):
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    a_values = values[:-1][consecutive_mask]
+    b_values = values[1:][consecutive_mask]
+    finite_mask = np.isfinite(a_values) & np.isfinite(b_values)
+    return a_values[finite_mask], b_values[finite_mask]
+
+
+def _compute_linear_detrended_residuals(
+    values: np.ndarray,
+    trial_numbers: np.ndarray,
+) -> np.ndarray:
+    """Remove the within-run linear effect of trial number using least squares."""
+    values = np.asarray(values, dtype=np.float64)
+    trial_numbers = np.asarray(trial_numbers, dtype=np.float64)
+    residuals = np.full(values.shape, np.nan, dtype=np.float64)
+    finite_mask = np.isfinite(values) & np.isfinite(trial_numbers)
+    if int(np.count_nonzero(finite_mask)) < 2:
+        return residuals
+
+    design = np.column_stack(
+        [
+            np.ones(int(np.count_nonzero(finite_mask)), dtype=np.float64),
+            trial_numbers[finite_mask],
+        ]
+    )
+    beta_hat, _, _, _ = np.linalg.lstsq(design, values[finite_mask], rcond=None)
+    fitted = design @ beta_hat
+    residuals[finite_mask] = values[finite_mask] - fitted
+    return residuals
+
+
+def _compute_lag1_pearson_stats(
+    a_values: np.ndarray,
+    b_values: np.ndarray,
+) -> tuple[float, float, int]:
+    """Compute lag-1 Pearson r/p after filtering invalid adjacent pairs."""
+    a_values = np.asarray(a_values, dtype=np.float64)
+    b_values = np.asarray(b_values, dtype=np.float64)
+    finite_mask = np.isfinite(a_values) & np.isfinite(b_values)
+    a_values = a_values[finite_mask]
+    b_values = b_values[finite_mask]
+    n_pairs = int(a_values.size)
+    if n_pairs < MIN_LAG1_AUTOCORR_PAIRS:
+        return float("nan"), float("nan"), n_pairs
+    if np.isclose(np.std(a_values), 0.0) or np.isclose(np.std(b_values), 0.0):
+        return float("nan"), float("nan"), n_pairs
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        corr = stats.pearsonr(a_values, b_values)
+    return float(corr.statistic), float(corr.pvalue), n_pairs
+
+
+def compute_rt_lag1_autocorrelation_tables(
+    trial_df: pd.DataFrame,
+    *,
+    trials_per_block: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute run-level and subject/session RT lag-1 autocorrelation summaries."""
+    required_columns = {
+        "subject",
+        "subject_session",
+        "session",
+        "medication",
+        "run",
+        "block_order",
+        "trial_in_block",
+        "rt",
+    }
+    missing_columns = required_columns.difference(trial_df.columns)
+    if missing_columns:
+        missing_text = ", ".join(sorted(missing_columns))
+        raise ValueError(f"Missing required RT lag-1 columns: {missing_text}")
+
+    variable_specs = [{"column": "rt", "variable_name": "rt"}]
+    run_rows: list[dict[str, Any]] = []
+    session_pair_store: dict[tuple[str, int, str, str], dict[str, Any]] = defaultdict(
+        lambda: {
+            "raw_a_parts": [],
+            "raw_b_parts": [],
+            "detrended_a_parts": [],
+            "detrended_b_parts": [],
+            "runs_with_pairs": set(),
+            "n_runs_total": 0,
+        }
+    )
+
+    run_group_cols = ["subject", "subject_session", "session", "medication", "run"]
+    for (subject, subject_session, session, medication, run), run_df in trial_df.groupby(
+        run_group_cols,
+        sort=True,
+    ):
+        run_df = run_df.sort_values(["block_order", "trial_in_block"]).reset_index(drop=True)
+        trial_numbers = _trial_number_within_run(run_df, trials_per_block=int(trials_per_block))
+
+        for spec in variable_specs:
+            values = run_df[spec["column"]].to_numpy(dtype=np.float64)
+
+            # Raw lag-1 autocorrelation uses only truly adjacent original trials.
+            raw_a, raw_b = _extract_adjacent_trial_pairs(values, trial_numbers)
+            raw_r, raw_p, raw_n_pairs = _compute_lag1_pearson_stats(raw_a, raw_b)
+
+            # Detrend within run before re-forming the same adjacent-trial pairs.
+            detrended_values = _compute_linear_detrended_residuals(values, trial_numbers)
+            detrended_a, detrended_b = _extract_adjacent_trial_pairs(detrended_values, trial_numbers)
+            detrended_r, detrended_p, detrended_n_pairs = _compute_lag1_pearson_stats(
+                detrended_a,
+                detrended_b,
+            )
+
+            n_valid_adjacent_pairs = max(raw_n_pairs, detrended_n_pairs)
+            run_rows.append(
+                {
+                    "subject": str(subject),
+                    "subject_session": str(subject_session),
+                    "session": int(session),
+                    "medication": str(medication),
+                    "run": int(run),
+                    "variable_name": str(spec["variable_name"]),
+                    "raw_lag1_autocorrelation_r": raw_r,
+                    "raw_lag1_p_value": raw_p,
+                    "detrended_lag1_autocorrelation_r": detrended_r,
+                    "detrended_lag1_p_value": detrended_p,
+                    "n_valid_adjacent_pairs": int(n_valid_adjacent_pairs),
+                }
+            )
+
+            session_key = (
+                str(subject),
+                int(session),
+                str(medication),
+                str(spec["variable_name"]),
+            )
+            session_store = session_pair_store[session_key]
+            session_store["n_runs_total"] = int(session_store["n_runs_total"]) + 1
+            if raw_a.size > 0:
+                session_store["raw_a_parts"].append(raw_a)
+                session_store["raw_b_parts"].append(raw_b)
+                session_store["runs_with_pairs"].add(int(run))
+            if detrended_a.size > 0:
+                session_store["detrended_a_parts"].append(detrended_a)
+                session_store["detrended_b_parts"].append(detrended_b)
+                session_store["runs_with_pairs"].add(int(run))
+
+    run_df = pd.DataFrame(run_rows).sort_values(
+        ["subject", "session", "run", "variable_name"]
+    ).reset_index(drop=True)
+
+    session_rows: list[dict[str, Any]] = []
+    for (subject, session, medication, variable_name), session_store in sorted(session_pair_store.items()):
+        raw_a = (
+            np.concatenate(session_store["raw_a_parts"]).astype(np.float64, copy=False)
+            if session_store["raw_a_parts"]
+            else np.array([], dtype=np.float64)
+        )
+        raw_b = (
+            np.concatenate(session_store["raw_b_parts"]).astype(np.float64, copy=False)
+            if session_store["raw_b_parts"]
+            else np.array([], dtype=np.float64)
+        )
+        detrended_a = (
+            np.concatenate(session_store["detrended_a_parts"]).astype(np.float64, copy=False)
+            if session_store["detrended_a_parts"]
+            else np.array([], dtype=np.float64)
+        )
+        detrended_b = (
+            np.concatenate(session_store["detrended_b_parts"]).astype(np.float64, copy=False)
+            if session_store["detrended_b_parts"]
+            else np.array([], dtype=np.float64)
+        )
+
+        raw_r, raw_p, raw_n_pairs = _compute_lag1_pearson_stats(raw_a, raw_b)
+        detrended_r, detrended_p, detrended_n_pairs = _compute_lag1_pearson_stats(
+            detrended_a,
+            detrended_b,
+        )
+        n_valid_adjacent_pairs = max(raw_n_pairs, detrended_n_pairs)
+
+        session_rows.append(
+            {
+                "subject": str(subject),
+                "subject_session": f"{subject}_ses-{int(session)}",
+                "session": int(session),
+                "medication": str(medication),
+                "variable_name": str(variable_name),
+                "raw_lag1_autocorrelation_r": raw_r,
+                "raw_lag1_p_value": raw_p,
+                "detrended_lag1_autocorrelation_r": detrended_r,
+                "detrended_lag1_p_value": detrended_p,
+                "n_valid_adjacent_pairs": int(n_valid_adjacent_pairs),
+                "n_runs_total": int(session_store["n_runs_total"]),
+                "n_runs_with_valid_pairs": int(len(session_store["runs_with_pairs"])),
+            }
+        )
+
+    session_df = pd.DataFrame(session_rows).sort_values(
+        ["subject", "session", "variable_name"]
+    ).reset_index(drop=True)
+    return run_df, session_df
+
+
+def render_rt_lag1_autocorrelation_summary_table(
+    summary_df: pd.DataFrame,
+    *,
+    out_png: Path,
+    out_pmg: Path | None = None,
+) -> None:
+    """Render the subject/session lag-1 autocorrelation summary as an image table."""
+    if summary_df.empty:
+        fig, ax = plt.subplots(figsize=(8, 2.8))
+        ax.axis("off")
+        ax.text(0.5, 0.5, "No RT lag-1 rows available.", ha="center", va="center", fontsize=12)
+        ax.set_title("RT lag-1 autocorrelation summary")
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=220, bbox_inches="tight")
+        if out_pmg is not None:
+            fig.savefig(out_pmg, dpi=220, bbox_inches="tight", format="png")
+        plt.close(fig)
+        return
+
+    def _fmt(value: float, digits: int = 4) -> str:
+        if not np.isfinite(value):
+            return "NA"
+        return f"{float(value):.{digits}g}"
+
+    display_df = pd.DataFrame(
+        {
+            "Subject": summary_df["subject"].astype(str),
+            "Session": summary_df["session"].astype(int).astype(str),
+            "Medication": summary_df["medication"].astype(str),
+            "Variable": summary_df["variable_name"].astype(str),
+            "Raw r": [_fmt(value) for value in summary_df["raw_lag1_autocorrelation_r"]],
+            "Raw p": [_fmt(value) for value in summary_df["raw_lag1_p_value"]],
+            "Detrended r": [
+                _fmt(value) for value in summary_df["detrended_lag1_autocorrelation_r"]
+            ],
+            "Detrended p": [
+                _fmt(value) for value in summary_df["detrended_lag1_p_value"]
+            ],
+            "N pairs": summary_df["n_valid_adjacent_pairs"].astype(int).astype(str),
+        }
+    )
+
+    fig_w = max(13.0, 1.45 * display_df.shape[1] + 2.0)
+    fig_h = max(6.0, 0.38 * display_df.shape[0] + 2.4)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.axis("off")
+    table = ax.table(
+        cellText=display_df.to_numpy(dtype=object),
+        colLabels=display_df.columns.tolist(),
+        cellLoc="center",
+        loc="center",
+        bbox=[0.0, 0.05, 1.0, 0.87],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(8.8)
+    table.scale(1.0, 1.16)
+    for (row_idx, col_idx), cell in table.get_celld().items():
+        cell.set_edgecolor("black")
+        cell.set_linewidth(0.6)
+        if row_idx == 0:
+            cell.set_facecolor("#e6e6e6")
+            cell.set_text_props(weight="bold")
+        elif col_idx in {0, 1, 2, 3}:
+            cell.set_facecolor("#f5f5f5")
+        else:
+            cell.set_facecolor("white")
+    ax.set_title("Subject/session RT lag-1 autocorrelation summary", pad=12)
+    ax.text(
+        0.0,
+        0.0,
+        "Detrended values are residuals from a within-run linear model on trial number.",
+        ha="left",
+        va="bottom",
+        fontsize=9,
+        transform=ax.transAxes,
+    )
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.97])
+    fig.savefig(out_png, dpi=220, bbox_inches="tight")
+    if out_pmg is not None:
+        fig.savefig(out_pmg, dpi=220, bbox_inches="tight", format="png")
+    plt.close(fig)
+
+
 def run_behavior_rt_support_analysis(
     trial_df: pd.DataFrame,
     summary_df: pd.DataFrame,
     out_dir: Path,
+    *,
+    trials_per_block: int = TRIALS_PER_BLOCK,
 ) -> dict[str, pd.DataFrame]:
     rt_dir = ensure_dir(out_dir / "behavior_rt_support")
     tables_dir = ensure_dir(rt_dir / "tables")
@@ -1595,6 +1906,21 @@ def run_behavior_rt_support_analysis(
     ].copy()
     rt_trial_df["condition_plot_label"] = rt_trial_df["condition_factor"].map(_condition_summary_display_name)
     rt_trial_df.to_csv(tables_dir / "trial_level_rt_by_condition.csv", index=False)
+    rt_lag1_run_df, rt_lag1_session_df = compute_rt_lag1_autocorrelation_tables(
+        rt_trial_df,
+        trials_per_block=int(trials_per_block),
+    )
+    rt_lag1_run_df.to_csv(tables_dir / "run_level_rt_lag1_autocorrelation.csv", index=False)
+    rt_lag1_session_df.to_csv(
+        tables_dir / "subject_session_rt_lag1_autocorrelation_summary.csv",
+        index=False,
+    )
+    render_rt_lag1_autocorrelation_summary_table(
+        rt_lag1_session_df,
+        out_png=plots_dir / "subject_session_rt_lag1_autocorrelation_summary_table.png",
+        out_pmg=plots_dir / "subject_session_rt_lag1_autocorrelation_summary_table.pmg",
+    )
+
     per_subject_rt_stats_df = compute_per_subject_rt_vs_sham_stats(rt_trial_df)
     per_subject_rt_stats_df.to_csv(tables_dir / "per_subject_rt_vs_sham_stats.csv", index=False)
     per_subject_sig_summary_df = summarize_per_subject_significant_rt_conditions(per_subject_rt_stats_df)
@@ -1763,6 +2089,8 @@ def run_behavior_rt_support_analysis(
 
     return {
         "rt_trial_df": rt_trial_df,
+        "rt_lag1_run_df": rt_lag1_run_df,
+        "rt_lag1_session_df": rt_lag1_session_df,
         "per_subject_rt_stats_df": per_subject_rt_stats_df,
         "per_subject_sig_summary_df": per_subject_sig_summary_df,
         "per_subject_off_to_on_sham_rt_stats_df": per_subject_off_to_on_sham_rt_stats_df,
@@ -2959,6 +3287,7 @@ def main() -> None:
         trial_df=trial_df,
         summary_df=summary_df,
         out_dir=out_dir,
+        trials_per_block=int(args.trials_per_block),
     )
 
     plot_metric_by_condition(
