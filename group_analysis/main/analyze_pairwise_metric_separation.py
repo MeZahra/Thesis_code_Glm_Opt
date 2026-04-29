@@ -1159,12 +1159,12 @@ def _add_significance_bar(
     text: str,
 ) -> None:
     ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y], color="black", linewidth=1.0)
-    ax.text((x1 + x2) / 2.0, y + h, text, ha="center", va="bottom", fontsize=9)
+    ax.text((x1 + x2) / 2.0, y + h, text, ha="center", va="bottom", fontsize=12)
 
 
 def _distribution_ylabel(comparison_metric: str) -> str:
     if comparison_metric == "laplacian_spectral_distance_signed":
-        return "Spectral distance (lower = more similar)"
+        return "Distance"
     return "Pairwise metric value"
 
 
@@ -1203,7 +1203,8 @@ def _save_distribution_plot(
         for display_name, pair_key in class_order
     ]
     group_lookup = {name: values for name, values in groups}
-    class_positions = {name: float(2 * idx + 1) for idx, (name, _pair_key) in enumerate(class_order)}
+    class_gap = 1.15
+    class_positions = {name: float(idx * class_gap) for idx, (name, _pair_key) in enumerate(class_order)}
     secondary_group_data: dict[str, np.ndarray] = {}
 
     if secondary_pairwise_df is not None:
@@ -1267,7 +1268,7 @@ def _save_distribution_plot(
 
     class_positions_x = [class_positions[name] for name, _ in class_order]
     class_labels = [name for name, _ in class_order]
-    fig, ax = plt.subplots(figsize=(9.2, 5.2))
+    fig, ax = plt.subplots(figsize=(5.2, 4.1))
     box_kwargs = {
         "patch_artist": True,
         "flierprops": {
@@ -1280,7 +1281,7 @@ def _save_distribution_plot(
         box = ax.boxplot(plot_data, positions=plot_positions, widths=0.30, **box_kwargs)
         ax.set_xticks(class_positions_x)
         ax.set_xticklabels(class_labels)
-        ax.set_xlim(min(class_positions_x) - 0.8, max(class_positions_x) + 0.8)
+        ax.set_xlim(min(class_positions_x) - 0.48, max(class_positions_x) + 0.48)
         ax.plot([], [], linewidth=8, color=selected_color, alpha=0.55, label="selected")
         ax.plot([], [], linewidth=8, color=nonselected_color, alpha=0.55, label="non-selected")
         ax.legend(frameon=False, loc="upper right")
@@ -1288,7 +1289,7 @@ def _save_distribution_plot(
         box = ax.boxplot(plot_data, positions=plot_positions, widths=0.56, **box_kwargs)
         ax.set_xticks(class_positions_x)
         ax.set_xticklabels(class_labels)
-        ax.set_xlim(min(class_positions_x) - 0.8, max(class_positions_x) + 0.8)
+        ax.set_xlim(min(class_positions_x) - 0.48, max(class_positions_x) + 0.48)
 
     for patch, color in zip(box["boxes"], plot_colors[: len(box["boxes"])]):
         patch.set_facecolor(color)

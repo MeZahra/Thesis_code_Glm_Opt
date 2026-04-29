@@ -28,6 +28,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from group_analysis.main import prove_hypo as ph
 
+SELECTION_DISPLAY_LABELS = {
+    "control": "Motor reference",
+    "selected": "Target network",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -268,13 +273,11 @@ def _plot_subject_means(
     panel_stats = {
         "control": {
             "delta": float(paired_summary["D_ctl_mean_on_minus_off"]),
-            "delta_label": "D_ctl",
             "t": _safe_float(paired_summary["control_state_t"]),
             "p": _safe_float(paired_summary["control_state_p_two_sided"]),
         },
         "selected": {
             "delta": float(paired_summary["D_sel_mean_on_minus_off"]),
-            "delta_label": "D_sel",
             "t": _safe_float(paired_summary["selected_state_t"]),
             "p": _safe_float(paired_summary["selected_state_p_two_sided"]),
         },
@@ -299,19 +302,19 @@ def _plot_subject_means(
             ax.plot(
                 x_positions[finite_mask],
                 ys[finite_mask],
-                color="0.78",
-                alpha=0.9,
-                linewidth=1.0,
+                color="0.82",
+                alpha=0.65,
+                linewidth=0.9,
                 zorder=1,
             )
             ax.scatter(
                 x_positions[finite_mask],
                 ys[finite_mask],
-                s=24,
+                s=22,
                 facecolor="white",
                 edgecolor=colors[selection],
                 linewidth=0.9,
-                alpha=0.95,
+                alpha=0.9,
                 zorder=2,
             )
 
@@ -334,7 +337,7 @@ def _plot_subject_means(
         )
         ax.set_xticks(x_positions)
         ax.set_xticklabels(["OFF", "ON"])
-        ax.set_title(selection.capitalize(), fontsize=12, pad=8)
+        ax.set_title(SELECTION_DISPLAY_LABELS[selection], fontsize=12, pad=8)
         ax.set_xlabel("Medication state")
         ax.grid(axis="y", color="0.9", linewidth=0.8)
         ax.set_axisbelow(True)
@@ -345,10 +348,8 @@ def _plot_subject_means(
         if y_limits is not None:
             ax.set_ylim(*y_limits)
         stats_text = (
-            f"{panel_stats[selection]['delta_label']} = "
-            f"{_fmt_signed(panel_stats[selection]['delta'])}\n"
-            f"paired t = {_fmt_float(panel_stats[selection]['t'])}, "
-            f"p = {_fmt_float(panel_stats[selection]['p'])}"
+            f"ON - OFF = {_fmt_signed(panel_stats[selection]['delta'])}\n"
+            f"paired p = {_fmt_float(panel_stats[selection]['p'])}"
         )
         ax.text(
             0.04,
@@ -362,20 +363,24 @@ def _plot_subject_means(
         )
 
     axes[0].set_ylabel(metric_label)
-    fig.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
+    fig.tight_layout(rect=(0.0, 0.13, 1.0, 1.0))
+    selected_label = SELECTION_DISPLAY_LABELS["selected"].lower()
+    control_label = SELECTION_DISPLAY_LABELS["control"].lower()
     interaction_text = (
-        f"Interaction: D_sel - D_ctl = "
+        "Difference in ON - OFF change\n"
+        f"{selected_label} - {control_label} = "
         f"{_fmt_signed(paired_summary['interaction_mean_D_sel_minus_D_ctl'])}; "
-        f"p = {_fmt_float(_safe_float(paired_summary['interaction_p_two_sided']))}"
+        f"paired p = {_fmt_float(_safe_float(paired_summary['interaction_p_two_sided']))}"
     )
     fig.text(
         0.5,
-        0.015,
+        0.025,
         interaction_text,
         ha="center",
         va="bottom",
-        fontsize=8.5,
+        fontsize=9.0,
         color="0.25",
+        linespacing=1.25,
     )
     fig.savefig(figure_path, dpi=400, bbox_inches="tight")
     plt.close(fig)
@@ -411,7 +416,7 @@ def _plot_state_selection_comparison(
 
         ax.plot([0, 1], [control_mean, selected_mean], color="#111111", linewidth=2.2, marker="o", markersize=5, zorder=4)
         ax.set_xticks([0, 1])
-        ax.set_xticklabels(["Control", "Selected"])
+        ax.set_xticklabels([SELECTION_DISPLAY_LABELS["control"], SELECTION_DISPLAY_LABELS["selected"]])
         ax.set_title(metric_label)
         ax.set_xlabel("Voxel set")
         ax.set_ylabel("Metric value")
@@ -421,13 +426,13 @@ def _plot_state_selection_comparison(
             0.04,
             0.96,
             (
-                f"Control mean = {control_mean:.3f}\n"
-                f"Selected mean = {selected_mean:.3f}\n"
-                f"Selected - Control = {_fmt_signed(delta)}\n"
+                f"{SELECTION_DISPLAY_LABELS['control']} mean = {control_mean:.3f}\n"
+                f"{SELECTION_DISPLAY_LABELS['selected']} mean = {selected_mean:.3f}\n"
+                f"Target - reference = {_fmt_signed(delta)}\n"
                 f"p = {p_two_sided:.3f}" if p_two_sided is not None else
-                f"Control mean = {control_mean:.3f}\n"
-                f"Selected mean = {selected_mean:.3f}\n"
-                f"Selected - Control = {_fmt_signed(delta)}"
+                f"{SELECTION_DISPLAY_LABELS['control']} mean = {control_mean:.3f}\n"
+                f"{SELECTION_DISPLAY_LABELS['selected']} mean = {selected_mean:.3f}\n"
+                f"Target - reference = {_fmt_signed(delta)}"
             ),
             transform=ax.transAxes,
             ha="left",
@@ -450,7 +455,10 @@ def _plot_state_selection_comparison(
             }
         )
 
-    fig.suptitle(f"{state.upper()} sessions: Control vs Selected")
+    fig.suptitle(
+        f"{state.upper()} sessions: "
+        f"{SELECTION_DISPLAY_LABELS['control']} vs {SELECTION_DISPLAY_LABELS['selected']}"
+    )
     fig.savefig(figure_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return summary_rows
@@ -534,8 +542,8 @@ def main() -> None:
     session_df.to_csv(session_csv_path, index=False)
 
     metric_specs = [
-        ("cv_mean", "Coefficient of Variation (std/|mean|)"),
-        ("norm_diff_mean", "Normalized |Delta| (consecutive diff / |mean|)"),
+        ("cv_mean", "Coefficient of variation"),
+        ("norm_diff_mean", "Trial variability"),
     ]
     summary_rows: list[dict[str, object]] = []
     mixedlm_rows: list[dict[str, object]] = []
@@ -593,6 +601,13 @@ def main() -> None:
             figure_path=plot_path,
             paired_summary=paired_summary,
         )
+        if metric_name == "norm_diff_mean":
+            _plot_subject_means(
+                long_df=long_df,
+                metric_label=metric_label,
+                figure_path=args.output_dir / f"{metric_name}_subject_state_lines(main).pdf",
+                paired_summary=paired_summary,
+            )
 
         for state in ("off", "on"):
             subset = session_df.loc[:, ["subject", "session", "state", f"selected_{metric_name}", f"control_{metric_name}"]]
