@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -33,7 +35,51 @@ DEFAULT_BOLD = Path(
 DEFAULT_GO_TIMES = Path("/Data/zahra/go_times/PSPD004-ses-1-go-times.txt")
 DEFAULT_BRAIN_MASK = Path("/Data/zahra/anatomy_masks/MNI152_T1_2mm_brain_mask.nii.gz")
 DEFAULT_CSF_MASK = Path("/Data/zahra/anatomy_masks/MNI152_T1_2mm_brain_seg_csf.nii.gz")
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "results" / "single_run_task_glm" / "sub-pd004_ses-1_run-1"
+DEFAULT_OUTPUT_ROOT = REPO_ROOT / "results" / "single_run_task_glm"
+DEFAULT_OUTPUT_DIR = (
+    DEFAULT_OUTPUT_ROOT / "sub-pd004_ses-1_run-1"
+)
+BOLD_DIR = Path("/Data/zahra/bold_data")
+GO_TIMES_DIR = Path("/Data/zahra/go_times")
+BOLD_GLOB = "*_task-mv_bold_corrected_smoothed_mnireg-2mm.nii.gz"
+BOLD_FILENAME_RE = re.compile(
+    r"^(?P<subject>sub-pd(?P<subject_id>\d+))_"
+    r"(?P<session>ses-(?P<session_id>\d+))_"
+    r"(?P<run>run-(?P<run_id>\d+))_"
+    r"task-mv_bold_corrected_smoothed_mnireg-2mm\.nii\.gz$"
+)
+ORTHO_CUT_COORDS = (0, -20, 50)
+MULTI_SLICE_CUTS = {
+    "x": (-48, -36, -24, -12, 0, 12, 24, 36, 48),
+    "y": (-72, -56, -40, -24, -8, 8, 24, 40, 56),
+    "z": (-24, -12, 0, 12, 24, 36, 48, 60, 72),
+}
+
+
+def _parse_bold_filename(path: Path) -> dict[str, str | int]:
+    match = BOLD_FILENAME_RE.match(path.name)
+    if match is None:
+        raise ValueError(f"Cannot parse subject/session/run from BOLD filename: {path}")
+    label = "_".join(
+        (match.group("subject"), match.group("session"), match.group("run"))
+    )
+    return {
+        "subject": match.group("subject"),
+        "subject_id": match.group("subject_id"),
+        "session": match.group("session"),
+        "session_id": match.group("session_id"),
+        "run": match.group("run"),
+        "run_id": int(match.group("run_id")),
+        "label": label,
+    }
+
+
+def _go_times_for_bold(path: Path, go_times_dir: Path) -> Path:
+    info = _parse_bold_filename(path)
+    return (
+        go_times_dir
+        / f"PSPD{info['subject_id']}-ses-{info['session_id']}-go-times.txt"
+    )
 
 
 def _require_file(path: Path, label: str) -> Path:
@@ -227,44 +273,114 @@ def _save_figures(
     fdr_map_path: Path,
     output_dir: Path,
     contrast: str,
-) -> None:
+) -> dict[str, str]:
+    figure_paths = {}
+
     z_png = output_dir / f"{contrast}_z_score.png"
     display = plotting.plot_stat_map(
         z_map,
         title="Task > baseline z-score",
         threshold=3.09,
         display_mode="ortho",
-        cut_coords=(0, -20, 50),
+        cut_coords=ORTHO_CUT_COORDS,
         colorbar=True,
     )
     display.savefig(z_png, dpi=160)
     display.close()
+    figure_paths["z_score_ortho_png"] = str(z_png)
+
+    for axis, cut_coords in MULTI_SLICE_CUTS.items():
+        z_slices_png = output_dir / f"{contrast}_z_score_slices_{axis}.png"
+        display = plotting.plot_stat_map(
+            z_map,
+            title=f"Task > baseline z-score ({axis}-axis slices)",
+            threshold=3.09,
+            display_mode=axis,
+            cut_coords=cut_coords,
+            colorbar=True,
+            draw_cross=False,
+        )
+        display.savefig(z_slices_png, dpi=160)
+        display.close()
+        figure_paths[f"z_score_slices_{axis}_png"] = str(z_slices_png)
 
     fdr_png = output_dir / f"{contrast}_z_score_fdr05_pos.png"
     display = plotting.plot_stat_map(
         str(fdr_map_path),
         title="Task > baseline, FDR q<0.05",
         display_mode="ortho",
-        cut_coords=(0, -20, 50),
+        cut_coords=ORTHO_CUT_COORDS,
         colorbar=True,
+        cmap="hot",
+        symmetric_cbar=False,
     )
     display.savefig(fdr_png, dpi=160)
     display.close()
+    figure_paths["z_score_fdr05_pos_ortho_png"] = str(fdr_png)
+
+    for axis, cut_coords in MULTI_SLICE_CUTS.items():
+        fdr_slices_png = (
+            output_dir / f"{contrast}_z_score_fdr05_pos_slices_{axis}.png"
+        )
+        display = plotting.plot_stat_map(
+            str(fdr_map_path),
+            title=f"Task > baseline, FDR q<0.05 ({axis}-axis slices)",
+            display_mode=axis,
+            cut_coords=cut_coords,
+            colorbar=True,
+            cmap="hot",
+            symmetric_cbar=False,
+            draw_cross=False,
+        )
+        display.savefig(fdr_slices_png, dpi=160)
+        display.close()
+        figure_paths[f"z_score_fdr05_pos_slices_{axis}_png"] = str(fdr_slices_png)
 
     effect_png = output_dir / f"{contrast}_effect_size.png"
     display = plotting.plot_stat_map(
         effect_map,
         title="Task > baseline effect size",
         display_mode="ortho",
-        cut_coords=(0, -20, 50),
+        cut_coords=ORTHO_CUT_COORDS,
         colorbar=True,
     )
     display.savefig(effect_png, dpi=160)
     display.close()
+    figure_paths["effect_size_ortho_png"] = str(effect_png)
+
+    for axis, cut_coords in MULTI_SLICE_CUTS.items():
+        effect_slices_png = output_dir / f"{contrast}_effect_size_slices_{axis}.png"
+        display = plotting.plot_stat_map(
+            effect_map,
+            title=f"Task > baseline effect size ({axis}-axis slices)",
+            display_mode=axis,
+            cut_coords=cut_coords,
+            colorbar=True,
+            draw_cross=False,
+        )
+        display.savefig(effect_slices_png, dpi=160)
+        display.close()
+        figure_paths[f"effect_size_slices_{axis}_png"] = str(effect_slices_png)
 
     pdf_path = output_dir / f"{contrast}_glm_summary.pdf"
     with PdfPages(pdf_path) as pdf:
-        for png_path in (z_png, fdr_png, effect_png):
+        for png_path in (
+            z_png,
+            *(
+                output_dir / f"{contrast}_z_score_slices_{axis}.png"
+                for axis in ("z", "y", "x")
+            ),
+            fdr_png,
+            *(
+                output_dir / f"{contrast}_z_score_fdr05_pos_slices_{axis}.png"
+                for axis in ("z", "y", "x")
+            ),
+            effect_png,
+            *(
+                output_dir / f"{contrast}_effect_size_slices_{axis}.png"
+                for axis in ("z", "y", "x")
+            ),
+        ):
             img = plt.imread(png_path)
             fig, ax = plt.subplots(figsize=(11, 4.5))
             ax.imshow(img)
@@ -272,22 +388,115 @@ def _save_figures(
             fig.tight_layout(pad=0)
             pdf.savefig(fig)
             plt.close(fig)
+    figure_paths["glm_summary_pdf"] = str(pdf_path)
+    return figure_paths
+
+
+def _save_interactive_views(
+    z_map: nib.Nifti1Image,
+    effect_map: nib.Nifti1Image,
+    fdr_map_path: Path,
+    output_dir: Path,
+    contrast: str,
+) -> dict[str, str]:
+    html_paths = {}
+
+    z_html = output_dir / f"{contrast}_z_score_interactive.html"
+    view = plotting.view_img(
+        z_map,
+        title="Task > baseline z-score",
+        threshold=3.09,
+        colorbar=True,
+        symmetric_cmap=True,
+        cmap="RdBu_r",
+    )
+    view.save_as_html(z_html)
+    html_paths["z_score_interactive_html"] = str(z_html)
+
+    fdr_html = output_dir / f"{contrast}_z_score_fdr05_pos_interactive.html"
+    view = plotting.view_img(
+        str(fdr_map_path),
+        title="Task > baseline, FDR q<0.05",
+        threshold=1e-6,
+        colorbar=True,
+        symmetric_cmap=False,
+        cmap="hot",
+    )
+    view.save_as_html(fdr_html)
+    html_paths["z_score_fdr05_pos_interactive_html"] = str(fdr_html)
+
+    effect_html = output_dir / f"{contrast}_effect_size_interactive.html"
+    view = plotting.view_img(
+        effect_map,
+        title="Task > baseline effect size",
+        threshold=1e-6,
+        colorbar=True,
+        symmetric_cmap=True,
+        cmap="RdBu_r",
+    )
+    view.save_as_html(effect_html)
+    html_paths["effect_size_interactive_html"] = str(effect_html)
+
+    return html_paths
 
 
 def _save_html_report(
     model: FirstLevelModel,
     contrast: str,
     output_dir: Path,
-) -> None:
+    title: str,
+) -> str:
     report = model.generate_report(
         contrasts=contrast,
-        title="sub-pd004 ses-1 run-1 task GLM",
+        title=title,
         threshold=3.09,
         height_control=None,
         alpha=0.001,
         two_sided=False,
     )
-    report.save_as_html(output_dir / f"{contrast}_nilearn_report.html")
+    report_path = output_dir / f"{contrast}_nilearn_report.html"
+    report.save_as_html(report_path)
+    return str(report_path)
+
+
+def _regenerate_report_artifacts(output_dir: Path, contrast: str) -> dict[str, object]:
+    output_dir = output_dir.expanduser().resolve()
+    z_map_path = _require_file(output_dir / f"{contrast}_z_score.nii.gz", "z-score map")
+    effect_map_path = _require_file(
+        output_dir / f"{contrast}_effect_size.nii.gz",
+        "effect-size map",
+    )
+    fdr_map_path = _require_file(
+        output_dir / f"{contrast}_z_score_fdr05_pos.nii.gz",
+        "FDR-positive z-score map",
+    )
+
+    artifacts = {
+        "figures": _save_figures(
+            nib.load(str(z_map_path)),
+            nib.load(str(effect_map_path)),
+            fdr_map_path,
+            output_dir,
+            contrast,
+        ),
+        "interactive_html": _save_interactive_views(
+            nib.load(str(z_map_path)),
+            nib.load(str(effect_map_path)),
+            fdr_map_path,
+            output_dir,
+            contrast,
+        ),
+    }
+
+    summary_path = output_dir / "summary.json"
+    summary: dict[str, object] = {}
+    if summary_path.is_file():
+        with summary_path.open("r", encoding="utf-8") as f:
+            summary = json.load(f)
+    summary["report_artifacts"] = artifacts
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    return summary
 
 
 def run_glm(args: argparse.Namespace) -> dict[str, object]:
@@ -300,6 +509,11 @@ def run_glm(args: argparse.Namespace) -> dict[str, object]:
     csf_mask_path = _require_file(args.csf_mask, "CSF mask")
 
     bold_img = nib.load(str(bold_path))
+    try:
+        run_label = str(_parse_bold_filename(bold_path)["label"])
+    except ValueError:
+        run_label = bold_path.name.removesuffix(".nii.gz")
+
     brain_mask_img = nib.load(str(brain_mask_path))
     csf_mask_img = nib.load(str(csf_mask_path))
     _validate_compatibility(bold_img, brain_mask_img, csf_mask_img)
@@ -339,16 +553,31 @@ def run_glm(args: argparse.Namespace) -> dict[str, object]:
         output_dir,
         "task",
     )
-    _save_figures(
-        nib.load(str(saved_maps["z_score"])),
-        nib.load(str(saved_maps["effect_size"])),
-        Path(threshold_summary["fdr05_map"]),
-        output_dir,
+    report_artifacts = {
+        "figures": _save_figures(
+            nib.load(str(saved_maps["z_score"])),
+            nib.load(str(saved_maps["effect_size"])),
+            Path(threshold_summary["fdr05_map"]),
+            output_dir,
+            "task",
+        ),
+        "interactive_html": _save_interactive_views(
+            nib.load(str(saved_maps["z_score"])),
+            nib.load(str(saved_maps["effect_size"])),
+            Path(threshold_summary["fdr05_map"]),
+            output_dir,
+            "task",
+        ),
+    }
+    nilearn_report = _save_html_report(
+        model,
         "task",
+        output_dir,
+        title=f"{run_label} task GLM",
     )
-    _save_html_report(model, "task", output_dir)
 
     summary = {
+        "run_label": run_label,
         "bold": str(bold_path),
         "go_times": str(go_times_path),
         "brain_mask": str(brain_mask_path),
@@ -368,11 +597,153 @@ def run_glm(args: argparse.Namespace) -> dict[str, object]:
         "design_columns": list(design.columns),
         "contrast_maps": {k: str(v) for k, v in saved_maps.items()},
         "thresholds": threshold_summary,
+        "report_artifacts": report_artifacts,
+        "nilearn_report": nilearn_report,
         "warnings": warnings,
     }
     with (output_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
     return summary
+
+
+def _discover_batch_runs(args: argparse.Namespace) -> list[dict[str, object]]:
+    bold_dir = args.bold_dir.expanduser().resolve()
+    go_times_dir = args.go_times_dir.expanduser().resolve()
+    output_root = args.output_root.expanduser().resolve()
+
+    if not bold_dir.is_dir():
+        raise FileNotFoundError(f"Missing BOLD directory: {bold_dir}")
+    if not go_times_dir.is_dir():
+        raise FileNotFoundError(f"Missing go-times directory: {go_times_dir}")
+
+    runs = []
+    for bold_path in sorted(bold_dir.glob(args.bold_glob)):
+        info = _parse_bold_filename(bold_path)
+        go_times_path = _go_times_for_bold(bold_path, go_times_dir)
+        runs.append(
+            {
+                **info,
+                "bold": bold_path,
+                "go_times": go_times_path,
+                "run_row": info["run_id"],
+                "output_dir": output_root / str(info["label"]),
+            }
+        )
+    if not runs:
+        raise FileNotFoundError(
+            f"No BOLD files matched {args.bold_glob!r} in {bold_dir}"
+        )
+    return runs
+
+
+def run_batch(args: argparse.Namespace) -> dict[str, object]:
+    batch_runs = _discover_batch_runs(args)
+
+    if args.list_runs:
+        return {
+            "mode": "list_runs",
+            "n_runs": len(batch_runs),
+            "runs": [
+                {
+                    "label": run["label"],
+                    "bold": str(run["bold"]),
+                    "go_times": str(run["go_times"]),
+                    "run_row": int(run["run_row"]),
+                    "output_dir": str(run["output_dir"]),
+                }
+                for run in batch_runs
+            ],
+        }
+
+    output_root = args.output_root.expanduser().resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    completed = []
+    skipped = []
+    errors = []
+
+    total_runs = len(batch_runs)
+    for index, run in enumerate(batch_runs, start=1):
+        label = str(run["label"])
+        output_dir = Path(run["output_dir"])
+        summary_path = output_dir / "summary.json"
+        if args.skip_existing and summary_path.is_file():
+            print(
+                f"[{index}/{total_runs}] Skipping existing {label}",
+                file=sys.stderr,
+                flush=True,
+            )
+            skipped.append(
+                {
+                    "label": label,
+                    "summary": str(summary_path),
+                    "output_dir": str(output_dir),
+                }
+            )
+            continue
+
+        print(
+            f"[{index}/{total_runs}] Running {label}",
+            file=sys.stderr,
+            flush=True,
+        )
+        run_args = argparse.Namespace(**vars(args))
+        run_args.bold = Path(run["bold"])
+        run_args.go_times = Path(run["go_times"])
+        run_args.output_dir = output_dir
+        run_args.run_row = int(run["run_row"])
+
+        try:
+            summary = run_glm(run_args)
+        except Exception as exc:
+            error = {
+                "label": label,
+                "bold": str(run["bold"]),
+                "go_times": str(run["go_times"]),
+                "output_dir": str(output_dir),
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+            errors.append(error)
+            print(
+                f"[{index}/{total_runs}] Failed {label}: {error['error']}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if not args.continue_on_error:
+                raise
+        else:
+            print(
+                f"[{index}/{total_runs}] Completed {label}",
+                file=sys.stderr,
+                flush=True,
+            )
+            completed.append(
+                {
+                    "label": label,
+                    "summary": str(output_dir / "summary.json"),
+                    "output_dir": str(output_dir),
+                    "active_voxels_fdr05_positive": summary["thresholds"][
+                        "active_voxels_fdr05_positive"
+                    ],
+                    "max_z": summary["thresholds"]["max_z"],
+                }
+            )
+
+    batch_summary = {
+        "mode": "batch",
+        "bold_dir": str(args.bold_dir.expanduser().resolve()),
+        "go_times_dir": str(args.go_times_dir.expanduser().resolve()),
+        "output_root": str(output_root),
+        "n_discovered": len(batch_runs),
+        "n_completed": len(completed),
+        "n_skipped": len(skipped),
+        "n_errors": len(errors),
+        "completed": completed,
+        "skipped": skipped,
+        "errors": errors,
+    }
+    with (output_root / "batch_summary.json").open("w", encoding="utf-8") as f:
+        json.dump(batch_summary, f, indent=2)
+    return batch_summary
 
 
 def parse_args() -> argparse.Namespace:
@@ -384,6 +755,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--brain-mask", type=Path, default=DEFAULT_BRAIN_MASK)
     parser.add_argument("--csf-mask", type=Path, default=DEFAULT_CSF_MASK)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument(
         "--run-row",
         type=int,
@@ -406,11 +778,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--noise-model", choices=("ar1", "ols"), default="ar1")
     parser.add_argument("--n-jobs", type=int, default=1)
     parser.add_argument("--verbose", type=int, default=1)
+    parser.add_argument(
+        "--batch",
+        action="store_true",
+        help=(
+            "Run the GLM for every matching BOLD file in --bold-dir, saving each "
+            "run under --output-root/<sub>_<ses>_<run>/."
+        ),
+    )
+    parser.add_argument("--bold-dir", type=Path, default=BOLD_DIR)
+    parser.add_argument("--go-times-dir", type=Path, default=GO_TIMES_DIR)
+    parser.add_argument("--bold-glob", default=BOLD_GLOB)
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="In --batch mode, skip runs that already have summary.json.",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="In --batch mode, keep processing later runs if one run fails.",
+    )
+    parser.add_argument(
+        "--list-runs",
+        action="store_true",
+        help="In --batch mode, list discovered runs and exit without fitting GLMs.",
+    )
+    parser.add_argument(
+        "--figures-only",
+        action="store_true",
+        help=(
+            "Regenerate static PDF/PNG figures and interactive HTML from existing "
+            "contrast maps in --output-dir without refitting the GLM."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
-    summary = run_glm(parse_args())
+    args = parse_args()
+    if args.batch:
+        summary = run_batch(args)
+    elif args.figures_only:
+        summary = _regenerate_report_artifacts(args.output_dir, "task")
+    else:
+        summary = run_glm(args)
     print(json.dumps(summary, indent=2))
 
 
