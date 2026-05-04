@@ -9,7 +9,7 @@ from pathlib import Path
 
 import nibabel as nib
 import numpy as np
-from nilearn import plotting
+from nilearn import image, plotting
 from scipy import stats
 from statsmodels.stats.multitest import multipletests
 
@@ -36,6 +36,13 @@ DEFAULT_OUTPUT_DIR = (
     / "single_run_task_glm"
     / "sub-pd004_ses-1_run-1"
 )
+DEFAULT_OUTPUT_NIFTI = DEFAULT_OUTPUT_DIR / "glmsingle_beta_positive_z_fdr05.nii.gz"
+DEFAULT_OUTPUT_HTML = DEFAULT_OUTPUT_DIR / "glmsingle_beta_positive_z_fdr05_interactive.html"
+DEFAULT_STAT = "positive_z_fdr05"
+DEFAULT_FDR_ALPHA = 0.05
+DEFAULT_TOP_PERCENT = 5.0
+DEFAULT_VMAX_PERCENTILE = 99.5
+DEFAULT_SMOOTH_FWHM_MM = 2.0
 
 
 def _require_file(path: Path, label: str) -> Path:
@@ -60,73 +67,71 @@ def parse_args() -> argparse.Namespace:
         "--beta-path",
         type=Path,
         default=DEFAULT_BETA_PATH,
-        help=f"Input 4D beta .npy file. Default: {DEFAULT_BETA_PATH}",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--reference-img",
         type=Path,
         default=DEFAULT_REFERENCE_IMG,
-        help=(
-            "Reference NIfTI image used for affine/header information. "
-            f"Default: {DEFAULT_REFERENCE_IMG}"
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--output-html",
         type=Path,
-        default=None,
-        help=(
-            "Output interactive HTML file. Default: "
-            f"{DEFAULT_OUTPUT_DIR}/mean_abs_beta_volume_top{{top-percent}}_interactive.html"
-        ),
+        default=DEFAULT_OUTPUT_HTML,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--output-nifti",
         type=Path,
-        default=None,
-        help="Optional output NIfTI file for the displayed statistic.",
+        default=DEFAULT_OUTPUT_NIFTI,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--bg-img",
         type=Path,
         default=DEFAULT_BG_IMG,
-        help=f"Anatomical background image for the Nilearn view. Default: {DEFAULT_BG_IMG}",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--title",
         default=None,
-        help="Title shown in the interactive viewer. Default includes --top-percent.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--top-percent",
         type=float,
-        default=5.0,
-        help=(
-            "Show only this top percent of absolute mean-beta voxels. "
-            "Used by --stat abs_mean and --stat mean. "
-            "Use 100 to show all nonzero voxels. Default: 5."
-        ),
+        default=DEFAULT_TOP_PERCENT,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--stat",
         choices=("abs_mean", "mean", "positive_z_fdr05"),
-        default="abs_mean",
-        help=(
-            "Statistic to display. positive_z_fdr05 computes a one-sample, "
-            "positive, FDR-corrected z map across trial-wise betas."
-        ),
+        default=DEFAULT_STAT,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--fdr-alpha",
         type=float,
-        default=0.05,
-        help="FDR alpha used by --stat positive_z_fdr05. Default: 0.05.",
+        default=DEFAULT_FDR_ALPHA,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--percentile",
         "--vmax-percentile",
+        dest="vmax_percentile",
         type=float,
-        default=99.5,
-        help="Absolute-value percentile used for the colorbar maximum. Default: 99.5.",
+        default=DEFAULT_VMAX_PERCENTILE,
+        help=(
+            "Percentile used for the colorbar maximum. "
+            f"Default: {DEFAULT_VMAX_PERCENTILE:g}."
+        ),
+    )
+    parser.add_argument(
+        "--smooth-fwhm-mm",
+        type=float,
+        default=DEFAULT_SMOOTH_FWHM_MM,
+        help=argparse.SUPPRESS,
     )
     return parser.parse_args()
 
@@ -180,6 +185,8 @@ def main() -> None:
         raise ValueError("--vmax-percentile must be > 0 and <= 100.")
     if not 0 < args.fdr_alpha < 1:
         raise ValueError("--fdr-alpha must be > 0 and < 1.")
+    if args.smooth_fwhm_mm < 0:
+        raise ValueError("--smooth-fwhm-mm must be >= 0.")
 
     if args.output_html is None:
         if args.stat == "abs_mean":
@@ -241,7 +248,7 @@ def main() -> None:
         displayed_voxels = int(np.count_nonzero(display_data > 0))
         title = args.title or f"GLMsingle trial beta positive z, FDR q<{args.fdr_alpha:g}"
         symmetric_cmap = False
-        cmap = "hot"
+        cmap = "jet"
         vmin = 0
 
     reference_img = nib.load(str(reference_img_path))
@@ -257,8 +264,23 @@ def main() -> None:
     if output_nifti is not None:
         mean_beta_img.to_filename(output_nifti)
 
+    view_img = mean_beta_img
+    smooth_fwhm_mm = args.smooth_fwhm_mm if args.stat == "positive_z_fdr05" else 0.0
+    if smooth_fwhm_mm > 0:
+        view_img = image.smooth_img(mean_beta_img, fwhm=smooth_fwhm_mm)
+        view_data = view_img.get_fdata(dtype=np.float32)
+        view_data = np.nan_to_num(view_data, nan=0.0, posinf=0.0, neginf=0.0)
+        view_data[view_data < 0] = 0.0
+        view_data[display_data <= threshold] = 0.0
+        smoothed_values = view_data[view_data > threshold]
+        if smoothed_values.size == 0:
+            raise ValueError("Smoothed beta statistic has no voxels above display threshold.")
+        vmax = float(np.percentile(smoothed_values, args.vmax_percentile))
+        displayed_voxels = int(smoothed_values.size)
+        view_img = nib.Nifti1Image(view_data.astype(np.float32), reference_img.affine, header)
+
     view = plotting.view_img(
-        mean_beta_img,
+        view_img,
         bg_img=str(bg_img_path),
         title=title,
         threshold=threshold,
@@ -267,7 +289,7 @@ def main() -> None:
         cmap=cmap,
         vmin=vmin,
         vmax=vmax,
-        resampling_interpolation="nearest",
+        resampling_interpolation="continuous",
     )
     view.save_as_html(output_html)
 
@@ -279,6 +301,8 @@ def main() -> None:
     print(f"Display vmin: {vmin}")
     print(f"Display vmax: {vmax:.6g}")
     print(f"Displayed voxels: {displayed_voxels}")
+    if smooth_fwhm_mm > 0:
+        print(f"Display smoothing FWHM: {smooth_fwhm_mm:g} mm")
     for key, value in stat_summary.items():
         print(f"{key}: {value}")
     if output_nifti is not None:

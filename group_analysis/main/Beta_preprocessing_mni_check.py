@@ -58,7 +58,10 @@ missing_glm_count = 0
 skipped_existing_count = 0
 
 def _go_times_path(sub, ses):
-    return os.path.join(GO_TIMES_DIR, f"PSP{sub.upper()}-ses-{ses}-go-times.txt")
+    match = re.fullmatch(r"(?:pd)?(?P<digits>\d+)", sub, flags=re.IGNORECASE)
+    if not match:
+        raise ValueError(f"Unrecognized subject id for go-times file: {sub}")
+    return os.path.join(GO_TIMES_DIR, f"PSPD{match.group('digits')}-ses-{ses}-go-times.txt")
 
 def _load_run_onsets(sub, ses, run, num_trials):
     path = _go_times_path(sub, ses)
