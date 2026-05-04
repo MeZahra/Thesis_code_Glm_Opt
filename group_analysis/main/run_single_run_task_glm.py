@@ -35,6 +35,7 @@ DEFAULT_BOLD = Path(
 DEFAULT_GO_TIMES = Path("/Data/zahra/go_times/PSPD004-ses-1-go-times.txt")
 DEFAULT_BRAIN_MASK = Path("/Data/zahra/anatomy_masks/MNI152_T1_2mm_brain_mask.nii.gz")
 DEFAULT_CSF_MASK = Path("/Data/zahra/anatomy_masks/MNI152_T1_2mm_brain_seg_csf.nii.gz")
+DEFAULT_BG_IMG = Path("/Data/zahra/anatomy_masks/MNI152_T1_2mm_brain.nii.gz")
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "results" / "single_run_task_glm"
 DEFAULT_OUTPUT_DIR = (
     DEFAULT_OUTPUT_ROOT / "sub-pd004_ses-1_run-1"
@@ -396,6 +397,7 @@ def _save_interactive_views(
     z_map: nib.Nifti1Image,
     effect_map: nib.Nifti1Image,
     fdr_map_path: Path,
+    bg_img_path: Path,
     output_dir: Path,
     contrast: str,
 ) -> dict[str, str]:
@@ -406,9 +408,11 @@ def _save_interactive_views(
         z_map,
         title="Task > baseline z-score",
         threshold=3.09,
+        bg_img=str(bg_img_path),
         colorbar=True,
         symmetric_cmap=True,
         cmap="RdBu_r",
+        resampling_interpolation="continuous",
     )
     view.save_as_html(z_html)
     html_paths["z_score_interactive_html"] = str(z_html)
@@ -418,9 +422,11 @@ def _save_interactive_views(
         str(fdr_map_path),
         title="Task > baseline, FDR q<0.05",
         threshold=1e-6,
+        bg_img=str(bg_img_path),
         colorbar=True,
         symmetric_cmap=False,
         cmap="hot",
+        resampling_interpolation="continuous",
     )
     view.save_as_html(fdr_html)
     html_paths["z_score_fdr05_pos_interactive_html"] = str(fdr_html)
@@ -430,9 +436,11 @@ def _save_interactive_views(
         effect_map,
         title="Task > baseline effect size",
         threshold=1e-6,
+        bg_img=str(bg_img_path),
         colorbar=True,
         symmetric_cmap=True,
         cmap="RdBu_r",
+        resampling_interpolation="continuous",
     )
     view.save_as_html(effect_html)
     html_paths["effect_size_interactive_html"] = str(effect_html)
@@ -459,8 +467,13 @@ def _save_html_report(
     return str(report_path)
 
 
-def _regenerate_report_artifacts(output_dir: Path, contrast: str) -> dict[str, object]:
+def _regenerate_report_artifacts(
+    output_dir: Path,
+    contrast: str,
+    bg_img_path: Path,
+) -> dict[str, object]:
     output_dir = output_dir.expanduser().resolve()
+    bg_img_path = _require_file(bg_img_path, "background image")
     z_map_path = _require_file(output_dir / f"{contrast}_z_score.nii.gz", "z-score map")
     effect_map_path = _require_file(
         output_dir / f"{contrast}_effect_size.nii.gz",
@@ -483,6 +496,7 @@ def _regenerate_report_artifacts(output_dir: Path, contrast: str) -> dict[str, o
             nib.load(str(z_map_path)),
             nib.load(str(effect_map_path)),
             fdr_map_path,
+            bg_img_path,
             output_dir,
             contrast,
         ),
@@ -493,6 +507,7 @@ def _regenerate_report_artifacts(output_dir: Path, contrast: str) -> dict[str, o
     if summary_path.is_file():
         with summary_path.open("r", encoding="utf-8") as f:
             summary = json.load(f)
+    summary["bg_img"] = str(bg_img_path)
     summary["report_artifacts"] = artifacts
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -507,6 +522,7 @@ def run_glm(args: argparse.Namespace) -> dict[str, object]:
     go_times_path = _require_file(args.go_times, "go-times file")
     brain_mask_path = _require_file(args.brain_mask, "brain mask")
     csf_mask_path = _require_file(args.csf_mask, "CSF mask")
+    bg_img_path = _require_file(args.bg_img, "background image")
 
     bold_img = nib.load(str(bold_path))
     try:
@@ -565,6 +581,7 @@ def run_glm(args: argparse.Namespace) -> dict[str, object]:
             nib.load(str(saved_maps["z_score"])),
             nib.load(str(saved_maps["effect_size"])),
             Path(threshold_summary["fdr05_map"]),
+            bg_img_path,
             output_dir,
             "task",
         ),
@@ -582,6 +599,7 @@ def run_glm(args: argparse.Namespace) -> dict[str, object]:
         "go_times": str(go_times_path),
         "brain_mask": str(brain_mask_path),
         "csf_mask": str(csf_mask_path),
+        "bg_img": str(bg_img_path),
         "output_dir": str(output_dir),
         "n_scans": n_scans,
         "tr": float(args.tr),
@@ -754,6 +772,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--go-times", type=Path, default=DEFAULT_GO_TIMES)
     parser.add_argument("--brain-mask", type=Path, default=DEFAULT_BRAIN_MASK)
     parser.add_argument("--csf-mask", type=Path, default=DEFAULT_CSF_MASK)
+    parser.add_argument("--bg-img", type=Path, default=DEFAULT_BG_IMG)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument(
@@ -820,7 +839,7 @@ def main() -> None:
     if args.batch:
         summary = run_batch(args)
     elif args.figures_only:
-        summary = _regenerate_report_artifacts(args.output_dir, "task")
+        summary = _regenerate_report_artifacts(args.output_dir, "task", args.bg_img)
     else:
         summary = run_glm(args)
     print(json.dumps(summary, indent=2))

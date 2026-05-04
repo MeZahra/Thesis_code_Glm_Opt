@@ -5,6 +5,7 @@ import gc
 import os
 import time
 import re
+import sys
 from pathlib import Path
 import nibabel as nib
 import numpy as np
@@ -12,6 +13,10 @@ import numpy as np
 
 DATA_ROOT_DEFAULT = Path('/Data/zahra')
 RESULTS_GLM_ROOT_DEFAULT = Path('/Data/zahra/results_glm')
+REPO_ROOT = Path(__file__).resolve().parents[2]
+GLMSINGLE_SOURCE_DIR = REPO_ROOT / 'GLMsingle'
+if GLMSINGLE_SOURCE_DIR.is_dir() and str(GLMSINGLE_SOURCE_DIR) not in sys.path:
+    sys.path.insert(0, str(GLMSINGLE_SOURCE_DIR))
 
 BOLD_FILENAME_RE = re.compile(r'^sub-pd(?P<sub>\d+)_ses-(?P<ses>\d+)_run-(?P<run>\d+)_task-mv_bold_corrected_smoothed_mnireg-2mm\.nii\.gz$')
 
@@ -40,7 +45,7 @@ trial_metric = _env_override('GLM_TRIAL_METRIC', str, 'std')
 trial_z = _env_override('GLM_TRIAL_Z', float, 3)
 trial_fallback = _env_override('GLM_TRIAL_FALLBACK', float, 95)
 trial_max_drop = _env_override('GLM_TRIAL_MAX_DROP', float, 0.15)
-trial_onsets_source = _env_override('GLM_TRIAL_ONSETS', str, 'blocks').lower()
+trial_onsets_source = _env_override('GLM_TRIAL_ONSETS', str, 'go_times').lower()
 results_cache_name = 'results_glmsingle.npy'
 load_results_dir = _env_override('GLM_LOAD_DIR', str, '').strip()
 load_results_dir = Path(load_results_dir).expanduser().resolve() if load_results_dir else None
@@ -48,8 +53,8 @@ load_results_dir = Path(load_results_dir).expanduser().resolve() if load_results
 glmsingle_wantlibrary = 1
 glmsingle_wantglmdenoise = 1
 glmsingle_wantfracridge = 1
-glmsingle_wantfileoutputs = [0, 0, 0, 1]
-glmsingle_wantmemoryoutputs = [0, 0, 0, 1]
+glmsingle_wantfileoutputs = [1, 1, 1, 1]
+glmsingle_wantmemoryoutputs = [1, 1, 1, 1]
 
 def _resolve_zahra_paths():
     root = Path(os.getenv('ZAHRA_ROOT', str(DATA_ROOT_DEFAULT))).expanduser().resolve()
@@ -115,6 +120,14 @@ def _trial_onsets_from_blocks(num_trials, stimdur, trials_per_block, rest_tr):
             onset += rest_tr
     onsets = np.array(onsets, dtype=np.int32)
     return onsets
+
+def _standardize_regressor(values):
+    values = np.asarray(values, dtype=np.float32)
+    mean = float(np.nanmean(values))
+    std = float(np.nanstd(values))
+    if std > 0:
+        return (values - mean) / std
+    return values - mean
 
 def _trial_metrics(masked_bold, onsets, stimdur, metric):
     metrics = []
@@ -243,7 +256,7 @@ def _binary_mask_data(mask_img: nib.Nifti1Image, *, label: str) -> np.ndarray:
         raise ValueError(f'{label} mask is not binary (contains values between 0 and 1).')
     return data > 0.5
 
-def run_glmsingle_mni_for_subject_session(*, sub: str, ses: str, run_paths: list[Path], results_root: Path, masks_root: Path, go_times_root: Path, dry_run: bool):
+def run_glmsingle_mni_for_subject_session(*, sub: str, ses: str, run_paths: list[Path], results_root: Path, masks_root: Path, go_times_root: Path, dry_run: bool, force: bool):
     runs = [int(BOLD_FILENAME_RE.match(p.name).group('run')) for p in run_paths]
     run_labels = [str(r) for r in runs]
     print(f'\n=== sub-pd{sub} ses-{ses} runs={run_labels} ===')
@@ -266,7 +279,9 @@ def run_glmsingle_mni_for_subject_session(*, sub: str, ses: str, run_paths: list
         return
     outputdir_glmsingle.mkdir(parents=True, exist_ok=True)
 
-    active_load_results_dir = load_results_dir if load_results_dir is not None else outputdir_glmsingle
+    active_load_results_dir = None if force else (load_results_dir if load_results_dir is not None else outputdir_glmsingle)
+    if force:
+        print('Force enabled: ignoring cached GLMsingle results and refitting.')
 
     print('apply masking...')
     brain_mask_data = _binary_mask_data(brain_mask_img, label='brain_mask')
@@ -290,7 +305,7 @@ def run_glmsingle_mni_for_subject_session(*, sub: str, ses: str, run_paths: list
         bold_run = nib.load(str(bold_path)).get_fdata(dtype=np.float32)
         masked_bold, _ = apply_mask(anat_data, bold_run, mask_indices)
         data.append(masked_bold)
-        csf_ts = np.mean(bold_run[csf_mask_data], axis=0)
+        csf_ts = _standardize_regressor(np.mean(bold_run[csf_mask_data], axis=0))
         extraregressors.append(csf_ts[:, None])
         print(f'  run {run_label}: {bold_run.shape} -> {masked_bold.shape}')
 
@@ -331,6 +346,10 @@ def run_glmsingle_mni_for_subject_session(*, sub: str, ses: str, run_paths: list
                 raise ValueError(f'Invalid onset {onset} for run {run_label} with T={num_timepoints}')
             design[onset_idx, 0] = 1
         design_matrix.append(design)
+        print(
+            f'Run {run_label}: design onsets source={trial_onsets_source}, '
+            f'first onset TR={int(run_onsets_design[0])}, last onset TR={int(run_onsets_design[-1])}.'
+        )
 
     opt = {'wantlibrary': glmsingle_wantlibrary, 'wantglmdenoise': int(glmsingle_wantglmdenoise), 'wantfracridge': int(glmsingle_wantfracridge),
         'wantfileoutputs': glmsingle_wantfileoutputs, 'wantmemoryoutputs': glmsingle_wantmemoryoutputs, 'chunklen': 8000}
@@ -388,7 +407,7 @@ def main():
     print(f'Found {len(selected)} subject-session entries.')
 
     for sub, ses, run_paths in selected:
-        if _has_existing_results_glm(results_glm_root, sub, ses, trial_metric):
+        if not args.force and _has_existing_results_glm(results_glm_root, sub, ses, trial_metric):
             print(f'[skip] sub-pd{sub} ses-{ses}: existing results found in {results_glm_root}')
             continue
 
@@ -399,7 +418,8 @@ def main():
 
         t0 = time.time()
         run_glmsingle_mni_for_subject_session(sub=sub, ses=ses, run_paths=run_paths, results_root=results_root, 
-                                              masks_root=masks_root, go_times_root=go_times_root, dry_run=args.dry_run)
+                                              masks_root=masks_root, go_times_root=go_times_root, dry_run=args.dry_run,
+                                              force=args.force)
         gc.collect()
         print(f'Finished sub-pd{sub} ses-{ses} in {time.time() - t0:.1f}s')
 
