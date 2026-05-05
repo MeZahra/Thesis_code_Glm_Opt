@@ -349,13 +349,13 @@ def main() -> None:
 
     if zscore_glmsingle:
         x_values, x_z_mean, x_z_std = _zscore_values(x_raw_values)
-        x_label = "GLMsingle TYPEA_ONOFF betasmd positive saturated spatial z-score"
+        x_label = "GLMsingle_TypeA"
         x_csv_column = "glmsingle_zscore"
     else:
         x_values = x_raw_values
         x_z_mean = None
         x_z_std = None
-        x_label = "GLMsingle TYPEA_ONOFF betasmd positive saturated value"
+        x_label = "GLMsingle_TypeA"
         x_csv_column = "glmsingle_value"
 
     corr = _safe_corr(x_values, y_values)
@@ -433,9 +433,8 @@ def main() -> None:
         bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "alpha": 0.85, "edgecolor": "#dddddd"},
     )
 
-    ax.set_title("Voxel-wise GLMsingle vs standard GLM")
     ax.set_xlabel(x_label)
-    ax.set_ylabel("Standard GLM task z-score")
+    ax.set_ylabel("Standard GLM")
     fig.tight_layout()
     fig.savefig(output_png, dpi=220)
     fig.savefig(output_pdf)

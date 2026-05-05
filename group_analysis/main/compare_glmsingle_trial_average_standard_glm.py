@@ -51,6 +51,11 @@ MODEL_LABELS = {
     "TYPEC": "GLMsingle TYPEC FITHRF GLMDENOISE trial-mean beta",
     "TYPED": "GLMsingle TYPED FITHRF GLMDENOISE RR trial-mean beta",
 }
+PLOT_X_LABELS = {
+    "TYPEB": "GLMsingle_TypeB",
+    "TYPEC": "GLMsingle_TypeC",
+    "TYPED": "GLMsingle_TypeD",
+}
 DEFAULT_SATURATION_PERCENTILE = 99.5
 
 
@@ -626,22 +631,9 @@ def main() -> None:
             },
         )
 
-        if zscore_glmsingle:
-            if saturate_glmsingle:
-                x_label = f"{label} trial-mean beta saturated spatial z-score"
-            else:
-                x_label = f"{label} trial-mean beta spatial z-score"
-        else:
-            x_label = MODEL_LABELS.get(label, label)
-        ax.set_title(f"{label} vs standard GLM")
+        x_label = PLOT_X_LABELS.get(label, label)
         ax.set_xlabel(x_label)
-        ax.set_ylabel("Standard GLM task z-score")
-
-    fig.suptitle(
-        f"Voxel-wise GLMsingle {args.field} vs standard GLM after averaging over trials",
-        y=1.02,
-        fontsize=13,
-    )
+        ax.set_ylabel("Standard GLM")
     fig.tight_layout()
 
     suffix = args.voxel_mask
