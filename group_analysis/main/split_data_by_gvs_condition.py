@@ -18,7 +18,7 @@ REPO_ROOT = HERE.parents[1]
 DEFAULT_GVS_ORDER_PATH = (
     REPO_ROOT / "results" / "connectivity" / "GVS_effects" / "data" / "gvs_order_by_subject_session_run.tsv"
 )
-DEFAULT_BETA_DIR = REPO_ROOT / "results" / "connectivity" / "data"
+DEFAULT_BETA_DIR = REPO_ROOT / "results" / "connectivity" / "GVS_effects" / "session_splits_91601" / "data"
 DEFAULT_PROJECTION_PATH = (
     REPO_ROOT
     / "results"
@@ -28,7 +28,7 @@ DEFAULT_PROJECTION_PATH = (
     / "projection_voxel_foldavg_sub9_ses1_task0.8_bold0.8_beta0.5_smooth0.2_gamma1_bold_thr90.npy"
 )
 DEFAULT_MANIFEST_PATH = REPO_ROOT / "results" / "connectivity" / "GVS_effects" / "data" / "concat_manifest_group.tsv"
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "results" / "connectivity" / "GVS_effects" / "data" / "by_gvs"
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "results" / "connectivity" / "GVS_effects" / "data" / "by_gvs_91601"
 
 TRIALS_PER_GVS_BLOCK = 10
 BETA_FILE_RE = re.compile(r"^selected_beta_trials_(sub-pd\d+)_ses-(\d+)\.npy$")

@@ -134,6 +134,20 @@ def _parse_args() -> argparse.Namespace:
         help="Skip interactive HTML connectome outputs.",
     )
     parser.add_argument(
+        "--no-connectome-html",
+        action="store_true",
+        help="Skip interactive HTML connectome outputs for advanced ROI metrics.",
+    )
+    parser.add_argument(
+        "--skip-edge-correlation-network",
+        action="store_true",
+        help=(
+            "Skip edge-time-series and edge-by-edge correlation products. This is useful "
+            "for higher-resolution atlases where the number of ROI pairs is large; "
+            "advanced ROI metrics still run from ROI time series."
+        ),
+    )
+    parser.add_argument(
         "--run-advanced-metrics",
         action="store_true",
         default=True,
@@ -657,11 +671,14 @@ def main() -> None:
         node_conn = np.clip(node_conn, -1.0, 1.0, out=node_conn)
         np.fill_diagonal(node_conn, 1.0)
 
-        z_roi_ts = _zscore_rows_nan(roi_ts)
-        edge_ts = z_roi_ts[iu[0], :] * z_roi_ts[iu[1], :]
-        edge_corr = _safe_corrcoef_rows(edge_ts)
-        edge_corr = np.clip(edge_corr, -1.0, 1.0, out=edge_corr)
-        np.fill_diagonal(edge_corr, 1.0)
+        edge_ts = None
+        edge_corr = None
+        if not args.skip_edge_correlation_network:
+            z_roi_ts = _zscore_rows_nan(roi_ts)
+            edge_ts = z_roi_ts[iu[0], :] * z_roi_ts[iu[1], :]
+            edge_corr = _safe_corrcoef_rows(edge_ts)
+            edge_corr = np.clip(edge_corr, -1.0, 1.0, out=edge_corr)
+            np.fill_diagonal(edge_corr, 1.0)
 
         conn_vec = node_conn[iu]
         connectivity_vec_rows.append(conn_vec)
@@ -672,8 +689,9 @@ def main() -> None:
 
         np.save(cond_dir / f"roi_timeseries_{label}.npy", roi_ts.astype(np.float32, copy=False))
         np.save(cond_dir / f"roi_connectivity_corr_{label}.npy", node_conn.astype(np.float32, copy=False))
-        np.save(cond_dir / f"edge_timeseries_{label}.npy", edge_ts.astype(np.float32, copy=False))
-        np.save(cond_dir / f"edge_correlation_{label}.npy", edge_corr.astype(np.float32, copy=False))
+        if edge_ts is not None and edge_corr is not None:
+            np.save(cond_dir / f"edge_timeseries_{label}.npy", edge_ts.astype(np.float32, copy=False))
+            np.save(cond_dir / f"edge_correlation_{label}.npy", edge_corr.astype(np.float32, copy=False))
 
         # _write_matrix_csv(cond_dir / f"roi_connectivity_corr_{label}.csv", node_conn, row_labels=roi_labels, col_labels=roi_labels)
         # _write_matrix_csv(cond_dir / f"edge_correlation_{label}.csv", edge_corr, row_labels=edge_labels, col_labels=edge_labels)
@@ -693,12 +711,13 @@ def main() -> None:
                          out_html=connectome_html, percentile=float(args.edge_threshold_percentile), node_size=float(args.node_size),
                          edge_linewidth=float(args.edge_linewidth), title=f"ROI connectome ({label})")
 
-        _plot_heatmap(edge_corr, labels=edge_labels, out_png=cond_dir / f"edge_correlation_{label}.png", title=f"Edge correlation matrix ({label})")
-        edge_corr_by_label[label] = edge_corr.copy()
+        if edge_corr is not None:
+            _plot_heatmap(edge_corr, labels=edge_labels, out_png=cond_dir / f"edge_correlation_{label}.png", title=f"Edge correlation matrix ({label})")
+            edge_corr_by_label[label] = edge_corr.copy()
 
         per_file_summary.append({"label": label, "beta_file": str(beta_path), "n_trials": int(beta.shape[1]), "n_rois": n_rois, "n_edges": int(len(edge_pairs)),
              "roi_ts_finite_fraction": float(np.mean(np.isfinite(roi_ts))), "conn_finite_fraction": float(np.mean(np.isfinite(node_conn))),
-             "edge_corr_finite_fraction": float(np.mean(np.isfinite(edge_corr))),
+             "edge_corr_finite_fraction": float(np.mean(np.isfinite(edge_corr))) if edge_corr is not None else None,
              "voxel_weighting_applied": bool(selected_voxel_weights is not None)})
         print(f"Processed {label}: trials={beta.shape[1]}, rois={n_rois}, edges={len(edge_pairs)}", flush=True)
 
@@ -710,11 +729,14 @@ def main() -> None:
     np.save(out_dir / "file_similarity_from_edges.npy", file_similarity.astype(np.float32, copy=False))
     # _write_matrix_csv(out_dir / "file_similarity_from_edges.csv", file_similarity, row_labels=connectivity_vec_labels, col_labels=connectivity_vec_labels)
 
-    edge_strength_corr = _safe_corrcoef_rows(edge_strength.T)
-    np.save(out_dir / "edge_strength_correlation_across_files.npy", edge_strength_corr.astype(np.float32, copy=False))
-    # _write_matrix_csv(out_dir / "edge_strength_correlation_across_files.csv", edge_strength_corr, row_labels=edge_labels, col_labels=edge_labels)
-    _plot_heatmap(edge_strength_corr, edge_labels, out_png=out_dir / "edge_strength_correlation_across_files.png",
-                  title="Edge-strength correlation across selected_beta_trials_* files")
+    if args.skip_edge_correlation_network:
+        edge_strength_corr = None
+    else:
+        edge_strength_corr = _safe_corrcoef_rows(edge_strength.T)
+        np.save(out_dir / "edge_strength_correlation_across_files.npy", edge_strength_corr.astype(np.float32, copy=False))
+        # _write_matrix_csv(out_dir / "edge_strength_correlation_across_files.csv", edge_strength_corr, row_labels=edge_labels, col_labels=edge_labels)
+        _plot_heatmap(edge_strength_corr, edge_labels, out_png=out_dir / "edge_strength_correlation_across_files.png",
+                      title="Edge-strength correlation across selected_beta_trials_* files")
 
     if "sham" in edge_corr_by_label:
         sham_edge_corr = edge_corr_by_label["sham"]
@@ -776,6 +798,7 @@ def main() -> None:
         "node_size": float(args.node_size),
         "edge_linewidth": float(args.edge_linewidth),
         "edge_threshold_percentile": float(args.edge_threshold_percentile),
+        "edge_correlation_network_computed": not bool(args.skip_edge_correlation_network),
         "excluded_roi_patterns": exclude_lower,
         "n_files_processed": int(len(connectivity_vec_labels)),
         "file_labels": connectivity_vec_labels,
